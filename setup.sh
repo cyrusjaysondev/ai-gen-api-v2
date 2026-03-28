@@ -9,12 +9,29 @@
 #
 # Set as start command in template overrides:
 #   bash -c "wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh &"
+#
+# Required env var (set in RunPod template):
+#   HF_TOKEN = your Hugging Face token (needs access to black-forest-labs/FLUX.2-klein-9B)
 # =============================================================
 
 LOG="/workspace/api_setup.log"
 log() { echo "[$(date '+%H:%M:%S')] $1" | tee -a $LOG; }
 
+# ─────────────────────────────────────────────
+# HF Token (required for UNET download)
+# ─────────────────────────────────────────────
+TOKEN="${HF_TOKEN:-$HUGGING_FACE_HUB_TOKEN}"
+if [ -z "$TOKEN" ]; then
+  log "ERROR: HF_TOKEN env var is not set."
+  log "  Set it in your RunPod template environment variables."
+  log "  Get a token at: https://huggingface.co/settings/tokens"
+  log "  Then accept the license at: https://huggingface.co/black-forest-labs/FLUX.2-klein-9B"
+  exit 1
+fi
+
+# ─────────────────────────────────────────────
 # Auto-detect ComfyUI location
+# ─────────────────────────────────────────────
 if [ -d "/workspace/runpod-slim/ComfyUI" ]; then
   COMFY_ROOT="/workspace/runpod-slim/ComfyUI"
 elif [ -d "/workspace/ComfyUI" ]; then
@@ -28,7 +45,9 @@ else
   fi
 fi
 
+# ─────────────────────────────────────────────
 # Auto-detect Python
+# ─────────────────────────────────────────────
 if [ -f "$COMFY_ROOT/.venv-cu128/bin/python" ]; then
   PYTHON="$COMFY_ROOT/.venv-cu128/bin/python"
   PIP="$COMFY_ROOT/.venv-cu128/bin/pip"
@@ -50,6 +69,38 @@ log "ComfyUI: $COMFY_ROOT"
 log "Python: $PYTHON"
 log "=========================================="
 
+# Helper: download with size check and cleanup on failure
+# Usage: download_file <url> <dest_path> <label> [hf_token]
+download_file() {
+  local URL="$1"
+  local DEST="$2"
+  local LABEL="$3"
+  local AUTH_HEADER=""
+  [ -n "$4" ] && AUTH_HEADER="--header=Authorization: Bearer $4"
+
+  if [ -s "$DEST" ]; then
+    log "  $LABEL already exists, skipping"
+    return 0
+  fi
+
+  # Remove empty/partial file if present
+  [ -f "$DEST" ] && rm -f "$DEST"
+
+  log "  Downloading $LABEL..."
+  if [ -n "$AUTH_HEADER" ]; then
+    wget -q --show-progress --header="Authorization: Bearer $4" -O "$DEST" "$URL"
+  else
+    wget -q --show-progress -O "$DEST" "$URL"
+  fi
+
+  if [ ! -s "$DEST" ]; then
+    log "  ERROR: $LABEL download failed or produced empty file"
+    rm -f "$DEST"
+    return 1
+  fi
+  log "  $LABEL downloaded"
+}
+
 # ─────────────────────────────────────────────
 # 1. Pip dependencies
 # ─────────────────────────────────────────────
@@ -58,62 +109,54 @@ $PIP install -q fastapi uvicorn httpx websockets python-multipart 2>&1 | tail -1
 log "  Done"
 
 # ─────────────────────────────────────────────
-# 2. FLUX.2 Klein 9B UNET (~18GB)
+# 2. FLUX.2 Klein 9B UNET (~18GB) — requires HF token
 # ─────────────────────────────────────────────
+log "[2/6] FLUX.2 Klein 9B UNET..."
 mkdir -p "$MODELS/diffusion_models"
 FLUX_UNET="$MODELS/diffusion_models/flux2-klein-9b.safetensors"
-if [ ! -f "$FLUX_UNET" ]; then
-  log "[2/6] Downloading FLUX.2 Klein 9B UNET (18GB)..."
-  wget -q --show-progress -O "$FLUX_UNET" \
-    "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/flux2-klein-9b.safetensors"
-  log "  Downloaded"
-else
-  log "[2/6] FLUX Klein 9B already exists"
+download_file \
+  "https://huggingface.co/black-forest-labs/FLUX.2-klein-9B/resolve/main/flux-2-klein-9b.safetensors" \
+  "$FLUX_UNET" \
+  "FLUX Klein 9B UNET (18GB)" \
+  "$TOKEN"
+
+if [ $? -ne 0 ]; then
+  log "  FATAL: UNET download failed. Check your HF_TOKEN has access to black-forest-labs/FLUX.2-klein-9B"
+  exit 1
 fi
+
+# Symlink so both filenames work (workflow uses flux-2-klein-9b.safetensors)
 ln -sf "$FLUX_UNET" "$MODELS/diffusion_models/flux-2-klein-9b.safetensors"
 
 # ─────────────────────────────────────────────
 # 3. FLUX VAE + Qwen text encoder
 # ─────────────────────────────────────────────
+log "[3/6] FLUX VAE + Qwen text encoder..."
 mkdir -p "$MODELS/vae" "$MODELS/text_encoders"
 
-FLUX_VAE="$MODELS/vae/flux2-vae.safetensors"
-if [ ! -f "$FLUX_VAE" ]; then
-  log "[3/6] Downloading FLUX VAE (336MB)..."
-  wget -q --show-progress -O "$FLUX_VAE" \
-    "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/vae/flux2-vae.safetensors"
-  log "  Downloaded"
-else
-  log "[3/6] FLUX VAE already exists"
-fi
+download_file \
+  "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/vae/flux2-vae.safetensors" \
+  "$MODELS/vae/flux2-vae.safetensors" \
+  "FLUX VAE (321MB)"
 
-QWEN="$MODELS/text_encoders/qwen_3_8b_fp8mixed.safetensors"
-if [ ! -f "$QWEN" ]; then
-  log "[3/6] Downloading Qwen 3 8B text encoder (8.7GB)..."
-  wget -q --show-progress -O "$QWEN" \
-    "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors"
-  log "  Downloaded"
-else
-  log "[3/6] Qwen 3 8B already exists"
-fi
+download_file \
+  "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors" \
+  "$MODELS/text_encoders/qwen_3_8b_fp8mixed.safetensors" \
+  "Qwen 3 8B text encoder (8.1GB)"
 
 # ─────────────────────────────────────────────
 # 4. BFS Head Swap LoRA
 # ─────────────────────────────────────────────
+log "[4/6] BFS Head Swap LoRA..."
 mkdir -p "$MODELS/loras"
 
-BFS_HEAD="$MODELS/loras/bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors"
-if [ ! -f "$BFS_HEAD" ]; then
-  log "[4/6] Downloading BFS head swap LoRA (663MB)..."
-  wget -q --show-progress -O "$BFS_HEAD" \
-    "https://huggingface.co/Alissonerdx/BFS-Best-Face-Swap/resolve/main/bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors"
-  log "  Downloaded"
-else
-  log "[4/6] BFS head LoRA already exists"
-fi
+download_file \
+  "https://huggingface.co/Alissonerdx/BFS-Best-Face-Swap/resolve/main/bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors" \
+  "$MODELS/loras/bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors" \
+  "BFS head swap LoRA (633MB)"
 
 # ─────────────────────────────────────────────
-# 5. LanPaint custom node (FLUX head swap)
+# 5. LanPaint custom node (required for face swap)
 # ─────────────────────────────────────────────
 mkdir -p "$NODES"
 if [ ! -d "$NODES/LanPaint" ]; then
@@ -137,35 +180,37 @@ mkdir -p /workspace/api
 wget -q -O /workspace/api/main.py \
   "https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/main.py"
 
-if [ ! -f "/workspace/api/main.py" ] || [ ! -s "/workspace/api/main.py" ]; then
-  log "  WARNING: Failed to download main.py — download manually"
+if [ ! -s "/workspace/api/main.py" ]; then
+  log "  ERROR: Failed to download main.py"
+  exit 1
 fi
+log "  main.py downloaded"
 
-# Write detected paths into a config file so main.py and start_api.sh can use them
+# Write detected paths so start_api.sh can use the correct Python
 cat > /workspace/api/config.env << CONFEOF
 COMFY_ROOT=$COMFY_ROOT
 PYTHON=$PYTHON
 PIP=$PIP
 CONFEOF
 
-# Create startup script
+# Create startup script (runs on every pod restart)
 cat > /workspace/start_api.sh << 'EOF'
 #!/bin/bash
 LOG="/workspace/api_setup.log"
 log() { echo "[$(date '+%H:%M:%S')] $1" | tee -a $LOG; }
 
-# Load config
+# Load detected Python/pip paths
 source /workspace/api/config.env
 
-# Reinstall pip deps (lost on restart)
+# Reinstall pip deps (lost on pod restart)
 $PIP install -q fastapi uvicorn httpx websockets python-multipart 2>&1 | tail -1
 
-# Wait for ComfyUI
+# Wait for ComfyUI to be ready
 log "Waiting for ComfyUI..."
 MAX_WAIT=300; WAITED=0
 until curl -s http://localhost:8188/system_stats > /dev/null 2>&1; do
   sleep 3; WAITED=$((WAITED + 3))
-  if [ $WAITED -ge $MAX_WAIT ]; then log "ComfyUI timeout"; exit 1; fi
+  if [ $WAITED -ge $MAX_WAIT ]; then log "ERROR: ComfyUI did not start within 5 min"; exit 1; fi
 done
 log "ComfyUI ready after ${WAITED}s"
 
@@ -180,6 +225,7 @@ nohup bash /workspace/start_api.sh >> /workspace/api_setup.log 2>&1 & disown
 
 log "=========================================="
 log "Setup Complete!"
-log "  API: https://${RUNPOD_POD_ID}-7860.proxy.runpod.net/docs"
-log "  Logs: tail -f /workspace/api.log"
+log "  API docs: https://${RUNPOD_POD_ID}-7860.proxy.runpod.net/docs"
+log "  Setup log: tail -f /workspace/api_setup.log"
+log "  API log:   tail -f /workspace/api.log"
 log "=========================================="
