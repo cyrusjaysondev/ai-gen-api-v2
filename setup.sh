@@ -104,7 +104,7 @@ download_file() {
 # 1. Pip dependencies
 # ─────────────────────────────────────────────
 log "[1/6] Installing pip dependencies..."
-$PIP install -q fastapi uvicorn httpx websockets python-multipart 2>&1 | tail -1
+$PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | tail -1
 log "  Done"
 
 # ─────────────────────────────────────────────
@@ -202,7 +202,7 @@ log() { echo "[$(date '+%H:%M:%S')] $1" | tee -a $LOG; }
 source /workspace/api/config.env
 
 # Reinstall pip deps (lost on pod restart)
-$PIP install -q fastapi uvicorn httpx websockets python-multipart 2>&1 | tail -1
+$PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | tail -1
 
 # Wait for ComfyUI to be ready
 log "Waiting for ComfyUI..."
@@ -214,7 +214,8 @@ done
 log "ComfyUI ready after ${WAITED}s"
 
 # Kill any stale API process on port 7860
-fuser -k 7860/tcp 2>/dev/null || true
+pkill -f "uvicorn main:app" 2>/dev/null || true
+sleep 1
 
 # Start API
 cd /workspace/api || exit 1
