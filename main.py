@@ -1,9 +1,10 @@
-import uuid, json, httpx, os
+import uuid, json, httpx, os, math, io
 from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from PIL import Image
 import websockets
 
 app = FastAPI(title="AI Gen API v2")
@@ -270,6 +271,52 @@ async def text_to_image(req: T2IRequest, background_tasks: BackgroundTasks):
 # FLUX.2 Klein 9B Head/Face Swap
 # ─────────────────────────────────────────────
 
+ASPECT_RATIOS = {
+    "1:1":  (1, 1),
+    "4:3":  (4, 3),
+    "3:4":  (3, 4),
+    "16:9": (16, 9),
+    "9:16": (9, 16),
+    "3:2":  (3, 2),
+    "2:3":  (2, 3),
+    "21:9": (21, 9),
+    "9:21": (9, 21),
+}
+
+def compute_dimensions(w_ratio: int, h_ratio: int, megapixels: float) -> tuple[int, int]:
+    """Calculate width/height from aspect ratio and megapixels, snapped to multiples of 16."""
+    total = megapixels * 1_000_000
+    h = math.sqrt(total / (w_ratio / h_ratio))
+    w = h * (w_ratio / h_ratio)
+    # Snap to nearest multiple of 16 (VAE requirement)
+    w = max(16, round(w / 16) * 16)
+    h = max(16, round(h / 16) * 16)
+    return int(w), int(h)
+
+def crop_to_aspect(img_bytes: bytes, width: int, height: int) -> bytes:
+    """Center-crop and resize image to exact width x height."""
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    src_w, src_h = img.size
+    target_ratio = width / height
+    src_ratio = src_w / src_h
+
+    if src_ratio > target_ratio:
+        # Source is wider — crop width
+        new_w = int(src_h * target_ratio)
+        left = (src_w - new_w) // 2
+        img = img.crop((left, 0, left + new_w, src_h))
+    elif src_ratio < target_ratio:
+        # Source is taller — crop height
+        new_h = int(src_w / target_ratio)
+        top = (src_h - new_h) // 2
+        img = img.crop((0, top, src_w, top + new_h))
+
+    img = img.resize((width, height), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 DEFAULT_FLUX_PROMPT = """head_swap: Use image 1 as the base image, preserving its environment, background, camera perspective, framing, exposure, contrast, and lighting. Remove the head and hair from image 1 and seamlessly replace it with the head from image 2.
 Match the original head size, face-to-body ratio, neck thickness, shoulder alignment, and camera distance so proportions remain natural and unchanged.
 Adapt the inserted head to the lighting of image 1 by matching light direction, intensity, softness, color temperature, shadows, and highlights, with no independent relighting.
@@ -321,7 +368,8 @@ async def flux_face_swap(
     target_image: UploadFile = File(..., description="Base/template image — body stays, head gets replaced"),
     face_image: UploadFile = File(..., description="Source face — identity to transfer"),
     seed: int = Form(-1),
-    megapixels: float = Form(2.0),
+    megapixels: float = Form(2.0, description="Total output resolution in megapixels (0.5–4.0)"),
+    aspect_ratio: str = Form("original", description="Output aspect ratio: original | 1:1 | 16:9 | 9:16 | 4:3 | 3:4 | 3:2 | 2:3 | 21:9 | 9:21"),
     steps: int = Form(4),
     cfg: float = Form(1.0),
     guidance: float = Form(4.0),
@@ -329,12 +377,26 @@ async def flux_face_swap(
 ):
     seed = seed if seed != -1 else uuid.uuid4().int % 2**32
 
+    # Validate aspect_ratio
+    if aspect_ratio != "original" and aspect_ratio not in ASPECT_RATIOS:
+        raise HTTPException(400, f"Invalid aspect_ratio '{aspect_ratio}'. Valid values: original, {', '.join(ASPECT_RATIOS)}")
+
+    target_bytes = await target_image.read()
+    face_bytes = await face_image.read()
+
+    # If aspect ratio is specified, crop target image to that ratio before sending to ComfyUI.
+    # The workflow's ImageScaleToTotalPixels + GetImageSize will then produce output at that AR.
+    if aspect_ratio != "original":
+        w_ratio, h_ratio = ASPECT_RATIOS[aspect_ratio]
+        target_w, target_h = compute_dimensions(w_ratio, h_ratio, megapixels)
+        target_bytes = crop_to_aspect(target_bytes, target_w, target_h)
+
     target_filename = f"flux_target_{uuid.uuid4().hex}.png"
     face_filename = f"flux_face_{uuid.uuid4().hex}.png"
     target_path = str(INPUT_DIR / target_filename)
     face_path = str(INPUT_DIR / face_filename)
-    Path(target_path).write_bytes(await target_image.read())
-    Path(face_path).write_bytes(await face_image.read())
+    Path(target_path).write_bytes(target_bytes)
+    Path(face_path).write_bytes(face_bytes)
 
     workflow = get_flux_face_swap_workflow(target_filename, face_filename, seed, megapixels=megapixels, steps=steps, cfg=cfg, guidance=guidance, lora_strength=lora_strength)
 
