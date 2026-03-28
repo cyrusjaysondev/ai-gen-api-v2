@@ -35,7 +35,7 @@ jobs = {}
 # ─────────────────────────────────────────────
 
 async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None):
-    jobs[job_id] = {**jobs.get(job_id, {}), "status": "processing", "workflow": workflow, "started_at": datetime.now(timezone.utc).isoformat()}
+    jobs[job_id] = {**jobs.get(job_id, {}), "status": "processing", "started_at": datetime.now(timezone.utc).isoformat()}
     try:
         client_id = str(uuid.uuid4())
         async with httpx.AsyncClient() as client:
@@ -139,6 +139,37 @@ async def delete_job(job_id: str):
     del jobs[job_id]
     return result
 
+@app.delete("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(404, "Job not found")
+    job = jobs[job_id]
+    if job.get("status") == "completed":
+        raise HTTPException(400, "Job already completed")
+    if job.get("status") == "failed":
+        raise HTTPException(400, "Job already failed")
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(f"{COMFYUI_URL}/queue", json={"delete": [job_id]})
+    except:
+        pass
+    jobs[job_id] = {"status": "cancelled"}
+    return {"job_id": job_id, "status": "cancelled"}
+
+@app.post("/jobs/{job_id}/retry")
+async def retry_job(job_id: str, background_tasks: BackgroundTasks):
+    if job_id not in jobs:
+        raise HTTPException(404, "Job not found")
+    job = jobs[job_id]
+    if job.get("status") not in ["failed", "cancelled"]:
+        raise HTTPException(400, f"Can only retry failed/cancelled jobs. Current: {job.get('status')}")
+    if "workflow" not in job:
+        raise HTTPException(400, "No workflow stored — submit a new request")
+    new_job_id = str(uuid.uuid4())
+    jobs[new_job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
+    background_tasks.add_task(run_job, new_job_id, job["workflow"])
+    return {"new_job_id": new_job_id, "original_job_id": job_id, "status": "queued", "poll_url": f"{BASE_URL}/status/{new_job_id}"}
+
 @app.delete("/jobs")
 async def delete_all_jobs(completed_only: bool = True):
     deleted_jobs = deleted_files = 0
@@ -174,6 +205,28 @@ async def serve_video(filename: str):
         if path.exists():
             return FileResponse(str(path), media_type="video/mp4", filename=filename)
     raise HTTPException(404, f"Not found: {filename}")
+
+@app.delete("/video/{filename}")
+async def delete_video(filename: str):
+    for path in [OUTPUT_DIR / "video" / filename, OUTPUT_DIR / filename]:
+        if path.exists():
+            path.unlink()
+            for job_id, info in list(jobs.items()):
+                if info.get("filename") == filename:
+                    del jobs[job_id]
+            return {"status": "deleted", "filename": filename}
+    raise HTTPException(404, f"File not found: {filename}")
+
+@app.get("/videos")
+async def list_videos():
+    video_dir = OUTPUT_DIR / "video"
+    if not video_dir.exists():
+        return {"total": 0, "videos": []}
+    videos = []
+    for f in sorted(video_dir.glob("*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True):
+        stat = f.stat()
+        videos.append({"filename": f.name, "size_mb": round(stat.st_size / 1024 / 1024, 2), "url": f"{BASE_URL}/video/{f.name}", "created_at": stat.st_mtime})
+    return {"total": len(videos), "videos": videos}
 
 
 # ─────────────────────────────────────────────
@@ -252,7 +305,7 @@ def get_flux_face_swap_workflow(target_filename, face_filename, seed, prompt=Non
             "control_after_generate": "randomize", "steps": steps, "cfg": cfg,
             "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0,
             "LanPaint_NumSteps": 2, "LanPaint_PromptMode": "Image First",
-            "Inpainting_mode": "\ud83d\uddbc\ufe0f Image Inpainting",
+            "Inpainting_mode": "Image Inpainting",
             "LanPaint_Info": "LanPaint KSampler"
         }},
         "104": {"class_type": "VAEDecode", "inputs": {"samples": ["156", 0], "vae": ["102", 0]}},
