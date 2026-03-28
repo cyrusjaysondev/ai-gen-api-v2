@@ -381,11 +381,26 @@ def compute_ltx_dimensions(width: int, height: int, aspect_ratio: str) -> tuple[
     height = max(32, round(height / 32) * 32)
     return width, height
 
-def _ltx_base_nodes(prompt, negative_prompt, width, height, length, fps, seed, low_res_video_src, high_res_video_src, prefix):
+LTX_PRESETS = {
+    "fast": {
+        "low_res_sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0",
+        "high_res_sigmas": "0.85, 0.7250, 0.4219, 0.0",
+        "lora_strength": 0.5,
+    },
+    "quality": {
+        "low_res_sigmas": "1.0, 0.99688, 0.99375, 0.990625, 0.9875, 0.984375, 0.98125, 0.978125, 0.975, 0.96875, 0.9625, 0.95, 0.9375, 0.909375, 0.875, 0.84375, 0.78125, 0.725, 0.5625, 0.421875, 0.0",
+        "high_res_sigmas": "0.85, 0.7875, 0.7250, 0.5734, 0.4219, 0.0",
+        "lora_strength": 0.35,
+    },
+}
+
+def _ltx_base_nodes(prompt, negative_prompt, width, height, length, fps, seed, low_res_video_src, high_res_video_src, prefix, preset="fast"):
     """Return the shared LTX workflow nodes (model loaders, text, sampling, decode, save).
     low_res_video_src / high_res_video_src are [node_id, slot] references for the video latent
     going into the low-res and high-res LTXVConcatAVLatent nodes respectively.
+    preset: "fast" (~8 steps, <12s) or "quality" (~20 steps, better detail).
     """
+    p = LTX_PRESETS.get(preset, LTX_PRESETS["fast"])
     half_w = max(32, (width // 2 // 32) * 32)
     half_h = max(32, (height // 2 // 32) * 32)
     return {
@@ -405,7 +420,7 @@ def _ltx_base_nodes(prompt, negative_prompt, width, height, length, fps, seed, l
         "232": {"class_type": "LoraLoaderModelOnly", "inputs": { # distilled lora → modified MODEL
             "model": ["236", 0],
             "lora_name": "ltx-2.3-22b-distilled-lora-384.safetensors",
-            "strength_model": 0.5
+            "strength_model": p["lora_strength"]
         }},
         "233": {"class_type": "LatentUpscaleModelLoader", "inputs": {"model_name": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"}},
 
@@ -429,7 +444,7 @@ def _ltx_base_nodes(prompt, negative_prompt, width, height, length, fps, seed, l
         "231": {"class_type": "CFGGuider",               "inputs": {"model": ["232", 0], "positive": ["239", 0], "negative": ["239", 1], "cfg": 1.0}},
         "209": {"class_type": "KSamplerSelect",          "inputs": {"sampler_name": "euler_ancestral_cfg_pp"}},
         "237": {"class_type": "RandomNoise",             "inputs": {"noise_seed": seed}},
-        "252": {"class_type": "ManualSigmas",            "inputs": {"sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"}},
+        "252": {"class_type": "ManualSigmas",            "inputs": {"sigmas": p["low_res_sigmas"]}},
         "215": {"class_type": "SamplerCustomAdvanced",  "inputs": {
             "noise": ["237", 0], "guider": ["231", 0], "sampler": ["209", 0],
             "sigmas": ["252", 0], "latent_image": ["222", 0]
@@ -447,7 +462,7 @@ def _ltx_base_nodes(prompt, negative_prompt, width, height, length, fps, seed, l
         "213": {"class_type": "CFGGuider",               "inputs": {"model": ["232", 0], "positive": ["212", 0], "negative": ["212", 1], "cfg": 1.0}},
         "246": {"class_type": "KSamplerSelect",          "inputs": {"sampler_name": "euler_cfg_pp"}},
         "216": {"class_type": "RandomNoise",             "inputs": {"noise_seed": (seed + 1) % 2**32}},
-        "211": {"class_type": "ManualSigmas",            "inputs": {"sigmas": "0.85, 0.7250, 0.4219, 0.0"}},
+        "211": {"class_type": "ManualSigmas",            "inputs": {"sigmas": p["high_res_sigmas"]}},
         "219": {"class_type": "SamplerCustomAdvanced",  "inputs": {
             "noise": ["216", 0], "guider": ["213", 0], "sampler": ["246", 0],
             "sigmas": ["211", 0], "latent_image": ["229", 0]
@@ -468,6 +483,14 @@ def _ltx_base_nodes(prompt, negative_prompt, width, height, length, fps, seed, l
 
 LTX_DEFAULT_NEGATIVE = "low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly"
 
+@app.get("/ltx/presets")
+async def get_ltx_presets():
+    return {
+        "presets": {k: {"low_res_steps": v["low_res_sigmas"].count(","), "high_res_steps": v["high_res_sigmas"].count(","), "lora_strength": v["lora_strength"]} for k, v in LTX_PRESETS.items()},
+        "default": "fast",
+        "endpoints": ["/ltx/i2v", "/ltx/t2v", "/face-animate"],
+    }
+
 
 # ─────────────────────────────────────────────
 # LTX-2.3 Image to Video
@@ -479,6 +502,7 @@ async def ltx_image_to_video(
     image: UploadFile = File(..., description="Input image to animate"),
     prompt: str = Form("", description="What should happen in the video"),
     negative_prompt: str = Form(LTX_DEFAULT_NEGATIVE),
+    preset: str = Form("fast", description="Speed/quality preset: fast (~8 steps, <12s) or quality (~20 steps)"),
     aspect_ratio: str = Form("original", description="Output aspect ratio: original | 16:9 | 9:16 | 1:1 | 4:3 | 3:4 | 3:2 | 2:3 | 21:9 | 9:21"),
     width: int = Form(1280, description="Output width in pixels (height auto-computed if aspect_ratio set)"),
     height: int = Form(720, description="Output height in pixels (ignored if aspect_ratio set)"),
@@ -486,6 +510,8 @@ async def ltx_image_to_video(
     fps: int = Form(24, description="Frames per second"),
     seed: int = Form(-1),
 ):
+    if preset not in LTX_PRESETS:
+        raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
     if aspect_ratio != "original" and aspect_ratio not in LTX_ASPECT_RATIOS:
         raise HTTPException(400, f"Invalid aspect_ratio. Valid: original, {', '.join(LTX_ASPECT_RATIOS)}")
 
@@ -531,7 +557,7 @@ async def ltx_image_to_video(
 
     workflow = _ltx_base_nodes(
         prompt, negative_prompt, width, height, length, fps, seed,
-        low_res_video_src=["249", 0], high_res_video_src=["230", 0], prefix="ltx_i2v"
+        low_res_video_src=["249", 0], high_res_video_src=["230", 0], prefix="ltx_i2v", preset=preset
     )
     workflow.update(img_nodes)
 
@@ -550,6 +576,7 @@ async def ltx_text_to_video(
     background_tasks: BackgroundTasks,
     prompt: str = Form(..., description="What should appear/happen in the video"),
     negative_prompt: str = Form(LTX_DEFAULT_NEGATIVE),
+    preset: str = Form("fast", description="Speed/quality preset: fast (~8 steps, <12s) or quality (~20 steps)"),
     aspect_ratio: str = Form("16:9", description="Output aspect ratio: 16:9 | 9:16 | 1:1 | 4:3 | 3:4 | 3:2 | 2:3 | 21:9 | 9:21"),
     width: int = Form(1280, description="Output width in pixels (height auto-computed from aspect_ratio)"),
     height: int = Form(720, description="Output height in pixels (ignored if aspect_ratio set, default used for 'original')"),
@@ -557,6 +584,8 @@ async def ltx_text_to_video(
     fps: int = Form(24, description="Frames per second"),
     seed: int = Form(-1),
 ):
+    if preset not in LTX_PRESETS:
+        raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
     if aspect_ratio not in LTX_ASPECT_RATIOS and aspect_ratio != "original":
         raise HTTPException(400, f"Invalid aspect_ratio. Valid: {', '.join(LTX_ASPECT_RATIOS)}")
 
@@ -568,7 +597,7 @@ async def ltx_text_to_video(
         prompt, negative_prompt, width, height, length, fps, seed,
         low_res_video_src=["228", 0],   # empty latent straight to low-res concat
         high_res_video_src=["253", 0],  # upscaled latent straight to high-res concat
-        prefix="ltx_t2v"
+        prefix="ltx_t2v", preset=preset
     )
 
     job_id = str(uuid.uuid4())
@@ -637,6 +666,7 @@ async def run_face_animate_pipeline(
     fps: int,
     seed: int,
     swap_cleanup_paths: list,
+    preset: str = "fast",
 ):
     jobs[job_id]["status"] = "processing"
     jobs[job_id]["started_at"] = datetime.now(timezone.utc).isoformat()
@@ -682,7 +712,7 @@ async def run_face_animate_pipeline(
 
         ltx_workflow = _ltx_base_nodes(
             animate_prompt, negative_prompt, width, height, length, fps, seed,
-            low_res_video_src=["249", 0], high_res_video_src=["230", 0], prefix="face_animate"
+            low_res_video_src=["249", 0], high_res_video_src=["230", 0], prefix="face_animate", preset=preset
         )
         ltx_workflow.update(img_nodes)
 
@@ -721,6 +751,7 @@ async def face_animate(
     animate_prompt: str = Form(..., description="Describes the motion/scene for the video"),
     swap_prompt: str = Form("", description="Prompt for the face swap step (uses smart default if empty)"),
     negative_prompt: str = Form(LTX_DEFAULT_NEGATIVE),
+    preset: str = Form("fast", description="Speed/quality preset for video: fast (~8 steps, <12s) or quality (~20 steps)"),
     aspect_ratio: str = Form("16:9", description="Output video aspect ratio: 16:9 | 9:16 | 1:1 | 4:3 | 3:4 | 3:2 | 2:3 | 21:9 | 9:21 | original"),
     width: int = Form(1280, description="Output width in pixels (height auto-derived from aspect_ratio)"),
     height: int = Form(720, description="Output height — used only when aspect_ratio=original"),
@@ -732,6 +763,8 @@ async def face_animate(
     swap_steps: int = Form(4),
     swap_guidance: float = Form(4.0),
 ):
+    if preset not in LTX_PRESETS:
+        raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
     if aspect_ratio != "original" and aspect_ratio not in LTX_ASPECT_RATIOS:
         raise HTTPException(400, f"Invalid aspect_ratio. Valid: original, {', '.join(LTX_ASPECT_RATIOS)}")
 
@@ -768,7 +801,7 @@ async def face_animate(
         run_face_animate_pipeline,
         job_id, face_swap_workflow, animate_prompt, negative_prompt,
         width, height, length, fps, seed,
-        [target_path, face_path],
+        [target_path, face_path], preset,
     )
     return {
         "job_id": job_id,

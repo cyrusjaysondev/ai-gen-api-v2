@@ -16,6 +16,7 @@ Interactive docs (Swagger UI): `https://YOUR_POD_ID-7860.proxy.runpod.net/docs`
 | POST | `/ltx/i2v` | Image to video (LTX 2.3) |
 | POST | `/ltx/t2v` | Text to video (LTX 2.3) |
 | POST | `/face-animate` | Face swap + animate pipeline |
+| GET | `/ltx/presets` | List available speed/quality presets |
 | GET | `/status/{job_id}` | Poll job status |
 | GET | `/jobs` | List all jobs |
 | GET | `/queue` | Active queue |
@@ -182,6 +183,7 @@ Generate a video from an input image using LTX 2.3 (22B, two-pass latent upscale
 | `image` | file | **required** | Source image — first frame of the video |
 | `prompt` | string | `""` | Description of the desired motion/scene (auto-enhanced via Gemma) |
 | `negative_prompt` | string | *see below* | What to avoid in the output |
+| `preset` | string | `fast` | Speed/quality preset: `fast` (~8 steps, <12s) or `quality` (~20 steps) |
 | `aspect_ratio` | string | `original` | Output aspect ratio (see options below) |
 | `width` | int | `1280` | Output width in pixels (ignored if `aspect_ratio` != `original`) |
 | `height` | int | `720` | Output height in pixels (ignored if `aspect_ratio` != `original`) |
@@ -274,6 +276,7 @@ Generate a video from a text prompt using LTX 2.3 (22B, two-pass latent upscale)
 |-------|------|---------|-------------|
 | `prompt` | string | **required** | Description of the video to generate |
 | `negative_prompt` | string | *see below* | What to avoid in the output |
+| `preset` | string | `fast` | Speed/quality preset: `fast` (~8 steps, <12s) or `quality` (~20 steps) |
 | `aspect_ratio` | string | `16:9` | Output aspect ratio (see options below) |
 | `width` | int | `1280` | Output width in pixels (used when `aspect_ratio` is `original`) |
 | `height` | int | `720` | Output height in pixels (used when `aspect_ratio` is `original`) |
@@ -352,6 +355,7 @@ Two-step pipeline: replaces the head/face in a template image with the user's fa
 | `animate_prompt` | string | **required** | Describes the motion/scene for the video |
 | `swap_prompt` | string | `""` | Prompt for the face swap step (uses smart default if empty) |
 | `negative_prompt` | string | *see below* | What to avoid in the video |
+| `preset` | string | `fast` | Speed/quality preset for video: `fast` (~8 steps, <12s) or `quality` (~20 steps) |
 | `aspect_ratio` | string | `16:9` | Output video aspect ratio (see options below) |
 | `width` | int | `1280` | Output width in pixels (height derived from aspect ratio) |
 | `height` | int | `720` | Output height — used only when `aspect_ratio=original` |
