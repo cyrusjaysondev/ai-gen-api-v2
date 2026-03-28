@@ -15,6 +15,7 @@ Interactive docs (Swagger UI): `https://YOUR_POD_ID-7860.proxy.runpod.net/docs`
 | POST | `/flux/face-swap` | Head / face swap (FLUX.2 Klein 9B) |
 | POST | `/ltx/i2v` | Image to video (LTX 2.3) |
 | POST | `/ltx/t2v` | Text to video (LTX 2.3) |
+| POST | `/face-animate` | Face swap + animate pipeline |
 | GET | `/status/{job_id}` | Poll job status |
 | GET | `/jobs` | List all jobs |
 | GET | `/queue` | Active queue |
@@ -338,6 +339,154 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/ltx/t2v \
 
 ---
 
+## POST /face-animate — Face Swap + Animate (Pipeline)
+
+Two-step pipeline: replaces the head/face in a template image with the user's face (FLUX.2 Klein 9B), then animates the result into a video (LTX 2.3).
+
+### Parameters
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `target_image` | file | **required** | Template/body photo — head gets replaced |
+| `face_image` | file | **required** | User's face photo — identity to transfer |
+| `animate_prompt` | string | **required** | Describes the motion/scene for the video |
+| `swap_prompt` | string | `""` | Prompt for the face swap step (uses smart default if empty) |
+| `negative_prompt` | string | *see below* | What to avoid in the video |
+| `aspect_ratio` | string | `16:9` | Output video aspect ratio (see options below) |
+| `width` | int | `1280` | Output width in pixels (height derived from aspect ratio) |
+| `height` | int | `720` | Output height — used only when `aspect_ratio=original` |
+| `length_seconds` | float | `5.0` | Video duration in seconds (3–10) |
+| `fps` | int | `24` | Frames per second |
+| `seed` | int | `-1` (random) | Set for reproducible results |
+| `megapixels` | float | `2.0` | Face swap resolution in megapixels (0.5–4.0) |
+| `lora_strength` | float | `1.0` | BFS LoRA strength for face swap (0.5–1.0) |
+| `swap_steps` | int | `4` | Face swap inference steps |
+| `swap_guidance` | float | `4.0` | Face swap guidance strength |
+
+Default negative prompt: `"low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly"`
+
+### Aspect Ratio Options
+
+All LTX video dimensions are snapped to multiples of 32.
+
+| Value | Ratio | Approx resolution | Use case |
+|-------|-------|-------------------|----------|
+| `16:9` | Widescreen | 1280×720 | YouTube, landscape video (default) |
+| `9:16` | Vertical | 720×1280 | Instagram / TikTok Reels |
+| `1:1` | Square | 1024×1024 | Social media posts |
+| `4:3` | Standard | 1024×768 | Presentations |
+| `3:4` | Portrait | 768×1024 | Profile / portrait |
+| `3:2` | Classic photo | 1152×768 | Landscape |
+| `2:3` | Classic portrait | 768×1152 | Portrait |
+| `21:9` | Cinematic | 1280×544 | Ultra-wide |
+| `9:21` | Tall cinematic | 544×1280 | Ultra-tall |
+| `original` | Custom | width × height | Manual width/height |
+
+### How It Works
+
+```
+face_image + target_image
+        ↓
+  [Step 1] FLUX.2 Klein 9B face swap
+        ↓
+  swapped image
+        ↓
+  [Step 2] LTX 2.3 image-to-video animation
+        ↓
+  output video
+```
+
+Poll `/status/{job_id}` — the `step` field shows current progress: `face_swap` or `animating`.
+
+### Basic example
+
+```bash
+curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/face-animate \
+  -F "target_image=@template_body.jpg" \
+  -F "face_image=@user_face.jpg" \
+  -F "animate_prompt=the person smiles and looks at the camera, gentle head movement"
+```
+
+### Instagram Reel (9:16, 8 seconds)
+
+```bash
+curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/face-animate \
+  -F "target_image=@template_body.jpg" \
+  -F "face_image=@user_face.jpg" \
+  -F "animate_prompt=person walks confidently forward, cinematic lighting" \
+  -F "aspect_ratio=9:16" \
+  -F "length_seconds=8"
+```
+
+### YouTube thumbnail animation (16:9, 5 seconds)
+
+```bash
+curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/face-animate \
+  -F "target_image=@template_body.jpg" \
+  -F "face_image=@user_face.jpg" \
+  -F "animate_prompt=person turns head slowly and smiles" \
+  -F "aspect_ratio=16:9" \
+  -F "length_seconds=5" \
+  -F "seed=42"
+```
+
+### Full control
+
+```bash
+curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/face-animate \
+  -F "target_image=@template_body.jpg" \
+  -F "face_image=@user_face.jpg" \
+  -F "swap_prompt=head_swap: seamlessly replace head from image 1 with face from image 2" \
+  -F "animate_prompt=person waves hello and smiles warmly, natural lighting" \
+  -F "aspect_ratio=9:16" \
+  -F "width=1080" \
+  -F "length_seconds=6" \
+  -F "fps=24" \
+  -F "megapixels=2.0" \
+  -F "lora_strength=1.0" \
+  -F "seed=99"
+```
+
+**Response**
+```json
+{
+  "job_id": "c3d4e5f6-...",
+  "status": "queued",
+  "model": "flux2-klein-9b + ltx-2.3-22b",
+  "pipeline": ["face_swap", "image_to_video"],
+  "poll_url": "https://YOUR_POD_ID-7860.proxy.runpod.net/status/c3d4e5f6-..."
+}
+```
+
+**Processing status** (poll `/status/{job_id}`)
+```json
+{ "status": "processing", "step": "face_swap", "started_at": "..." }
+```
+```json
+{ "status": "processing", "step": "animating", "started_at": "..." }
+```
+
+**Completed**
+```json
+{
+  "status": "completed",
+  "url": "https://YOUR_POD_ID-7860.proxy.runpod.net/video/face_animate_42_00001_.mp4",
+  "filename": "face_animate_42_00001_.mp4",
+  "swap_filename": "flux_swap_42_00001_.png",
+  "duration_seconds": 142.3
+}
+```
+
+### Typical Times
+
+| Operation | Cold start | Warm |
+|-----------|-----------|------|
+| Face swap (2MP) | ~3–5 min | ~20–30 sec |
+| Animation (1280×720, 5s) | (models already loaded) | ~60–90 sec |
+| **Total pipeline** | **~5–8 min** | **~90–120 sec** |
+
+---
+
 ## GET /status/{job_id} — Poll Job Status
 
 ```bash
@@ -525,6 +674,7 @@ done
 | Face swap (2MP, 4 steps) | ~3–5 min | ~20–30 sec |
 | LTX i2v / t2v (1280×720, 121 frames) | ~5–8 min | ~60–90 sec |
 | LTX i2v / t2v (1280×720, 257 frames) | ~8–12 min | ~2–3 min |
+| Face swap + animate (1280×720, 5s) | ~5–8 min | ~90–120 sec |
 
 > Cold start loads ~50 GB of models into VRAM. All subsequent jobs are fast.
 

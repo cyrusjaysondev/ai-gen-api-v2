@@ -577,6 +577,208 @@ async def ltx_text_to_video(
     return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
 
+# ─────────────────────────────────────────────
+# Face Swap + Animate Pipeline
+# ─────────────────────────────────────────────
+
+async def _submit_and_wait_comfyui(workflow: dict) -> tuple[str, str]:
+    """Submit a workflow to ComfyUI, wait for completion, return (filename, full_path)."""
+    client_id = str(uuid.uuid4())
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(f"{COMFYUI_URL}/prompt", json={"prompt": workflow, "client_id": client_id})
+        if resp.status_code != 200:
+            raise RuntimeError(f"ComfyUI rejected workflow: {resp.text}")
+        prompt_id = resp.json()["prompt_id"]
+
+    ws_url = f"ws://127.0.0.1:8188/ws?clientId={client_id}"
+    async with websockets.connect(ws_url) as ws:
+        while True:
+            raw = await ws.recv()
+            if isinstance(raw, bytes):
+                continue
+            msg = json.loads(raw)
+            if msg.get("type") == "executing":
+                data = msg.get("data", {})
+                if data.get("node") is None and data.get("prompt_id") == prompt_id:
+                    break
+
+    async with httpx.AsyncClient() as client:
+        history = await client.get(f"{COMFYUI_URL}/history/{prompt_id}")
+        job_data = history.json().get(prompt_id, {})
+
+    status = job_data.get("status", {}).get("status_str", "")
+    if status == "error":
+        for m in job_data.get("status", {}).get("messages", []):
+            if m[0] == "execution_error":
+                raise RuntimeError(m[1].get("exception_message", "ComfyUI execution error"))
+        raise RuntimeError("ComfyUI execution error")
+
+    for node_output in job_data.get("outputs", {}).values():
+        for key in ["images", "videos", "gifs"]:
+            if key in node_output:
+                item = node_output[key][0]
+                filename = item["filename"]
+                subfolder = item.get("subfolder", "")
+                path = OUTPUT_DIR / subfolder / filename if subfolder else OUTPUT_DIR / filename
+                if path.exists():
+                    return filename, str(path)
+
+    raise RuntimeError("No output file found in ComfyUI history")
+
+
+async def run_face_animate_pipeline(
+    job_id: str,
+    face_swap_workflow: dict,
+    animate_prompt: str,
+    negative_prompt: str,
+    width: int,
+    height: int,
+    length: int,
+    fps: int,
+    seed: int,
+    swap_cleanup_paths: list,
+):
+    jobs[job_id]["status"] = "processing"
+    jobs[job_id]["started_at"] = datetime.now(timezone.utc).isoformat()
+    ltx_img_path = None
+
+    try:
+        # ── Step 1: Face swap ──
+        jobs[job_id]["step"] = "face_swap"
+        swap_filename, swap_img_path = await _submit_and_wait_comfyui(face_swap_workflow)
+
+        # ── Step 2: Animate the swapped image ──
+        jobs[job_id]["step"] = "animating"
+
+        img_bytes = Path(swap_img_path).read_bytes()
+        ltx_input_filename = f"face_animate_{uuid.uuid4().hex}.png"
+        ltx_img_path = str(INPUT_DIR / ltx_input_filename)
+        Path(ltx_img_path).write_bytes(img_bytes)
+
+        img_nodes = {
+            "269": {"class_type": "LoadImage", "inputs": {"image": ltx_input_filename}},
+            "238": {"class_type": "ResizeImageMaskNode", "inputs": {
+                "input": ["269", 0], "resize_type": "scale dimensions",
+                "resize_type.width": width, "resize_type.height": height,
+                "resize_type.crop": "center", "scale_method": "lanczos"
+            }},
+            "235": {"class_type": "ResizeImagesByLongerEdge", "inputs": {"images": ["238", 0], "longer_edge": 1536}},
+            "248": {"class_type": "LTXVPreprocess",           "inputs": {"image": ["235", 0], "img_compression": 18}},
+            "274": {"class_type": "TextGenerateLTX2Prompt", "inputs": {
+                "clip": ["272", 1], "image": ["269", 0], "prompt": animate_prompt,
+                "max_length": 256, "sampling_mode": "on",
+                "sampling_mode.temperature": 0.7, "sampling_mode.top_k": 64,
+                "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
+                "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": seed
+            }},
+            "249": {"class_type": "LTXVImgToVideoInplace", "inputs": {
+                "vae": ["236", 2], "image": ["248", 0], "latent": ["228", 0], "strength": 0.7, "bypass": False
+            }},
+            "230": {"class_type": "LTXVImgToVideoInplace", "inputs": {
+                "vae": ["236", 2], "image": ["248", 0], "latent": ["253", 0], "strength": 1.0, "bypass": False
+            }},
+            "240": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["243", 0], "text": ["274", 0]}},
+        }
+
+        ltx_workflow = _ltx_base_nodes(
+            animate_prompt, negative_prompt, width, height, length, fps, seed,
+            low_res_video_src=["249", 0], high_res_video_src=["230", 0], prefix="face_animate"
+        )
+        ltx_workflow.update(img_nodes)
+
+        video_filename, _ = await _submit_and_wait_comfyui(ltx_workflow)
+
+        ext = Path(video_filename).suffix.lower()
+        url = f"{BASE_URL}/video/{video_filename}" if ext not in [".png", ".jpg", ".jpeg", ".webp"] else f"{BASE_URL}/image/{video_filename}"
+
+        completed_at = datetime.now(timezone.utc)
+        created_at_str = jobs[job_id].get("created_at")
+        duration_seconds = round((completed_at - datetime.fromisoformat(created_at_str)).total_seconds(), 1) if created_at_str else None
+
+        jobs[job_id] = {
+            "status": "completed",
+            "url": url,
+            "filename": video_filename,
+            "swap_filename": swap_filename,
+            "completed_at": completed_at.isoformat(),
+            "duration_seconds": duration_seconds,
+        }
+
+    except Exception as e:
+        jobs[job_id] = {**jobs[job_id], "status": "failed", "error": str(e), "failed_at": datetime.now(timezone.utc).isoformat()}
+    finally:
+        for p in (swap_cleanup_paths or []):
+            Path(p).unlink(missing_ok=True)
+        if ltx_img_path:
+            Path(ltx_img_path).unlink(missing_ok=True)
+
+
+@app.post("/face-animate")
+async def face_animate(
+    background_tasks: BackgroundTasks,
+    target_image: UploadFile = File(..., description="Template/body photo — head gets replaced"),
+    face_image: UploadFile = File(..., description="User's face photo — identity to transfer"),
+    animate_prompt: str = Form(..., description="Describes the motion/scene for the video"),
+    swap_prompt: str = Form("", description="Prompt for the face swap step (uses smart default if empty)"),
+    negative_prompt: str = Form(LTX_DEFAULT_NEGATIVE),
+    aspect_ratio: str = Form("16:9", description="Output video aspect ratio: 16:9 | 9:16 | 1:1 | 4:3 | 3:4 | 3:2 | 2:3 | 21:9 | 9:21 | original"),
+    width: int = Form(1280, description="Output width in pixels (height auto-derived from aspect_ratio)"),
+    height: int = Form(720, description="Output height — used only when aspect_ratio=original"),
+    length_seconds: float = Form(5.0, description="Video duration in seconds"),
+    fps: int = Form(24, description="Frames per second"),
+    seed: int = Form(-1),
+    megapixels: float = Form(2.0, description="Face swap resolution in megapixels (0.5–4.0)"),
+    lora_strength: float = Form(1.0, description="BFS LoRA strength for face swap (0.5–1.0)"),
+    swap_steps: int = Form(4),
+    swap_guidance: float = Form(4.0),
+):
+    if aspect_ratio != "original" and aspect_ratio not in LTX_ASPECT_RATIOS:
+        raise HTTPException(400, f"Invalid aspect_ratio. Valid: original, {', '.join(LTX_ASPECT_RATIOS)}")
+
+    seed = seed if seed != -1 else uuid.uuid4().int % 2**32
+    width, height = compute_ltx_dimensions(width, height, aspect_ratio)
+    length = max(25, round(length_seconds * fps))
+
+    target_bytes = await target_image.read()
+    face_bytes = await face_image.read()
+
+    # Pre-crop target image to match output aspect ratio for face swap
+    if aspect_ratio != "original":
+        w_r, h_r = LTX_ASPECT_RATIOS[aspect_ratio]
+        swap_w, swap_h = compute_dimensions(w_r, h_r, megapixels)
+        target_bytes = crop_to_aspect(target_bytes, swap_w, swap_h)
+
+    target_filename = f"fa_target_{uuid.uuid4().hex}.png"
+    face_filename = f"fa_face_{uuid.uuid4().hex}.png"
+    target_path = str(INPUT_DIR / target_filename)
+    face_path = str(INPUT_DIR / face_filename)
+    Path(target_path).write_bytes(target_bytes)
+    Path(face_path).write_bytes(face_bytes)
+
+    face_swap_workflow = get_flux_face_swap_workflow(
+        target_filename, face_filename, seed,
+        prompt=swap_prompt or None,
+        megapixels=megapixels, steps=swap_steps, cfg=1.0,
+        guidance=swap_guidance, lora_strength=lora_strength,
+    )
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
+    background_tasks.add_task(
+        run_face_animate_pipeline,
+        job_id, face_swap_workflow, animate_prompt, negative_prompt,
+        width, height, length, fps, seed,
+        [target_path, face_path],
+    )
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "model": "flux2-klein-9b + ltx-2.3-22b",
+        "pipeline": ["face_swap", "image_to_video"],
+        "poll_url": f"{BASE_URL}/status/{job_id}",
+    }
+
+
 @app.post("/flux/face-swap")
 async def flux_face_swap(
     background_tasks: BackgroundTasks,
