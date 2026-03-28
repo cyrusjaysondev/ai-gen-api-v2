@@ -103,14 +103,14 @@ download_file() {
 # ─────────────────────────────────────────────
 # 1. Pip dependencies
 # ─────────────────────────────────────────────
-log "[1/6] Installing pip dependencies..."
+log "[1/9] Installing pip dependencies..."
 $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | tail -1
 log "  Done"
 
 # ─────────────────────────────────────────────
 # 2. FLUX.2 Klein 9B UNET (~18GB) — requires HF token
 # ─────────────────────────────────────────────
-log "[2/6] FLUX.2 Klein 9B UNET..."
+log "[2/9] FLUX.2 Klein 9B UNET..."
 mkdir -p "$MODELS/diffusion_models"
 FLUX_UNET="$MODELS/diffusion_models/flux2-klein-9b.safetensors"
 download_file \
@@ -130,7 +130,7 @@ ln -sf "$FLUX_UNET" "$MODELS/diffusion_models/flux-2-klein-9b.safetensors"
 # ─────────────────────────────────────────────
 # 3. FLUX VAE + Qwen text encoder
 # ─────────────────────────────────────────────
-log "[3/6] FLUX VAE + Qwen text encoder..."
+log "[3/9] FLUX VAE + Qwen text encoder..."
 mkdir -p "$MODELS/vae" "$MODELS/text_encoders"
 
 download_file \
@@ -146,7 +146,7 @@ download_file \
 # ─────────────────────────────────────────────
 # 4. BFS Head Swap LoRA
 # ─────────────────────────────────────────────
-log "[4/6] BFS Head Swap LoRA..."
+log "[4/9] BFS Head Swap LoRA..."
 mkdir -p "$MODELS/loras"
 
 download_file \
@@ -159,7 +159,7 @@ download_file \
 # ─────────────────────────────────────────────
 mkdir -p "$NODES"
 if [ ! -d "$NODES/LanPaint" ]; then
-  log "[5/6] Installing LanPaint custom node..."
+  log "[5/9] Installing LanPaint custom node..."
   cd "$NODES"
   git clone -q https://github.com/scraed/LanPaint
   if [ -f "$NODES/LanPaint/requirements.txt" ]; then
@@ -167,13 +167,66 @@ if [ ! -d "$NODES/LanPaint" ]; then
   fi
   log "  LanPaint installed"
 else
-  log "[5/6] LanPaint already exists"
+  log "[5/9] LanPaint already exists"
 fi
 
 # ─────────────────────────────────────────────
-# 6. Download main.py + start API
+# 6. LTX-2.3 Checkpoint (27GB) — requires HF token
 # ─────────────────────────────────────────────
-log "[6/6] Setting up API..."
+log "[6/9] LTX-2.3 checkpoint..."
+mkdir -p "$MODELS/checkpoints"
+download_file \
+  "https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors" \
+  "$MODELS/checkpoints/ltx-2.3-22b-dev-fp8.safetensors" \
+  "LTX-2.3 22B dev fp8 (27GB)" \
+  "$TOKEN"
+
+# ─────────────────────────────────────────────
+# 7. LTX-2.3 LoRAs + text encoder
+# ─────────────────────────────────────────────
+log "[7/9] LTX-2.3 LoRAs + text encoder..."
+mkdir -p "$MODELS/loras" "$MODELS/text_encoders" "$MODELS/latent_upscale_models"
+
+download_file \
+  "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384.safetensors" \
+  "$MODELS/loras/ltx-2.3-22b-distilled-lora-384.safetensors" \
+  "LTX-2.3 distilled LoRA (7.1GB)"
+
+download_file \
+  "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors" \
+  "$MODELS/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors" \
+  "Gemma abliterated LoRA (599MB)"
+
+download_file \
+  "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors" \
+  "$MODELS/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors" \
+  "Gemma 3 12B text encoder (8.8GB)"
+
+download_file \
+  "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.0.safetensors" \
+  "$MODELS/latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.0.safetensors" \
+  "LTX-2.3 spatial upscaler (950MB)"
+
+# ─────────────────────────────────────────────
+# 8. ComfyUI-KJNodes (required for LTX 2.3 nodes)
+# ─────────────────────────────────────────────
+mkdir -p "$NODES"
+if [ ! -d "$NODES/ComfyUI-KJNodes" ]; then
+  log "[8/9] Installing ComfyUI-KJNodes..."
+  cd "$NODES"
+  git clone -q https://github.com/kijai/ComfyUI-KJNodes
+  if [ -f "$NODES/ComfyUI-KJNodes/requirements.txt" ]; then
+    cd ComfyUI-KJNodes && $PIP install -q -r requirements.txt 2>&1 | tail -1
+  fi
+  log "  ComfyUI-KJNodes installed"
+else
+  log "[8/9] ComfyUI-KJNodes already exists"
+fi
+
+# ─────────────────────────────────────────────
+# 9. Download main.py + start API
+# ─────────────────────────────────────────────
+log "[9/9] Setting up API..."
 mkdir -p /workspace/api
 
 wget -q -O /workspace/api/main.py \

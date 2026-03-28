@@ -362,6 +362,175 @@ def get_flux_face_swap_workflow(target_filename, face_filename, seed, prompt=Non
         "9": {"class_type": "SaveImage", "inputs": {"images": ["104", 0], "filename_prefix": f"images/flux_swap_{seed}"}}
     }
 
+@app.post("/ltx/i2v")
+async def ltx_image_to_video(
+    background_tasks: BackgroundTasks,
+    image: UploadFile = File(..., description="Input image to animate"),
+    prompt: str = Form("", description="What should happen in the video"),
+    negative_prompt: str = Form("low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly", description="What to avoid"),
+    width: int = Form(1280, description="Output width in pixels (multiple of 32, will be doubled by upscaler)"),
+    height: int = Form(720, description="Output height in pixels (multiple of 32, will be doubled by upscaler)"),
+    length: int = Form(121, description="Number of frames (e.g. 97, 121, 161). More = longer video"),
+    fps: int = Form(24, description="Frames per second"),
+    seed: int = Form(-1, description="Seed for reproducibility (-1 = random)"),
+):
+    seed = seed if seed != -1 else uuid.uuid4().int % 2**32
+
+    # Snap dimensions to multiples of 32
+    width = max(32, round(width / 32) * 32)
+    height = max(32, round(height / 32) * 32)
+    # Half-res for low-res pass (also snapped)
+    half_w = max(32, (width // 2 // 32) * 32)
+    half_h = max(32, (height // 2 // 32) * 32)
+
+    img_bytes = await image.read()
+    img_filename = f"ltx_i2v_{uuid.uuid4().hex}.png"
+    img_path = str(INPUT_DIR / img_filename)
+    Path(img_path).write_bytes(img_bytes)
+
+    workflow = {
+        # ── Model loaders ──
+        "236": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "ltx-2.3-22b-dev-fp8.safetensors"}},
+        "221": {"class_type": "LTXVAudioVAELoader",     "inputs": {"ckpt_name": "ltx-2.3-22b-dev-fp8.safetensors"}},
+        "243": {"class_type": "LTXAVTextEncoderLoader", "inputs": {
+            "text_encoder": "gemma_3_12B_it_fp4_mixed.safetensors",
+            "ckpt_name":    "ltx-2.3-22b-dev-fp8.safetensors",
+            "device": "default"
+        }},
+        # Apply gemma abliterated lora to CLIP (model output not used)
+        "272": {"class_type": "LoraLoader", "inputs": {
+            "model":          ["236", 0],
+            "clip":           ["243", 0],
+            "lora_name":      "gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors",
+            "strength_model": 1.0,
+            "strength_clip":  1.0
+        }},
+        # Apply distilled lora to MODEL
+        "232": {"class_type": "LoraLoaderModelOnly", "inputs": {
+            "model":          ["236", 0],
+            "lora_name":      "ltx-2.3-22b-distilled-lora-384.safetensors",
+            "strength_model": 0.5
+        }},
+        "233": {"class_type": "LatentUpscaleModelLoader", "inputs": {"model_name": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"}},
+
+        # ── Image load + preprocess ──
+        "269": {"class_type": "LoadImage", "inputs": {"image": img_filename}},
+        "238": {"class_type": "ResizeImageMaskNode", "inputs": {
+            "input":              ["269", 0],
+            "resize_type":        "scale dimensions",
+            "resize_type.width":  width,
+            "resize_type.height": height,
+            "resize_type.crop":   "center",
+            "scale_method":       "lanczos"
+        }},
+        "235": {"class_type": "ResizeImagesByLongerEdge", "inputs": {"images": ["238", 0], "longer_edge": 1536}},
+        "248": {"class_type": "LTXVPreprocess",           "inputs": {"image": ["235", 0], "img_compression": 18}},
+
+        # ── Text encoding ──
+        "274": {"class_type": "TextGenerateLTX2Prompt", "inputs": {
+            "clip":                          ["272", 1],
+            "image":                         ["269", 0],
+            "prompt":                        prompt,
+            "max_length":                    256,
+            "sampling_mode":                 "on",
+            "sampling_mode.temperature":     0.7,
+            "sampling_mode.top_k":           64,
+            "sampling_mode.top_p":           0.95,
+            "sampling_mode.min_p":           0.05,
+            "sampling_mode.repetition_penalty": 1.05,
+            "sampling_mode.seed":            seed
+        }},
+        "240": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["243", 0], "text": ["274", 0]}},
+        "247": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["272", 1], "text": negative_prompt}},
+        "239": {"class_type": "LTXVConditioning", "inputs": {
+            "positive":   ["240", 0],
+            "negative":   ["247", 0],
+            "frame_rate": float(fps)
+        }},
+
+        # ── Low-res empty latents ──
+        "228": {"class_type": "EmptyLTXVLatentVideo", "inputs": {
+            "width": half_w, "height": half_h, "length": length, "batch_size": 1
+        }},
+        "214": {"class_type": "LTXVEmptyLatentAudio", "inputs": {
+            "frames_number": length, "frame_rate": fps, "batch_size": 1, "audio_vae": ["221", 0]
+        }},
+
+        # ── Low-res i2v conditioning + concat ──
+        "249": {"class_type": "LTXVImgToVideoInplace", "inputs": {
+            "vae": ["236", 2], "image": ["248", 0], "latent": ["228", 0], "strength": 0.7, "bypass": False
+        }},
+        "222": {"class_type": "LTXVConcatAVLatent", "inputs": {
+            "video_latent": ["249", 0], "audio_latent": ["214", 0]
+        }},
+
+        # ── Low-res sampling ──
+        "231": {"class_type": "CFGGuider", "inputs": {
+            "model": ["232", 0], "positive": ["239", 0], "negative": ["239", 1], "cfg": 1.0
+        }},
+        "209": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler_ancestral_cfg_pp"}},
+        "237": {"class_type": "RandomNoise",   "inputs": {"noise_seed": seed}},
+        "252": {"class_type": "ManualSigmas",  "inputs": {"sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"}},
+        "215": {"class_type": "SamplerCustomAdvanced", "inputs": {
+            "noise": ["237", 0], "guider": ["231", 0], "sampler": ["209", 0],
+            "sigmas": ["252", 0], "latent_image": ["222", 0]
+        }},
+        "217": {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["215", 0]}},
+
+        # ── Latent upscale 2× ──
+        "253": {"class_type": "LTXVLatentUpsampler", "inputs": {
+            "samples": ["217", 0], "upscale_model": ["233", 0], "vae": ["236", 2]
+        }},
+
+        # ── High-res crop guides + i2v conditioning ──
+        "212": {"class_type": "LTXVCropGuides", "inputs": {
+            "positive": ["239", 0], "negative": ["239", 1], "latent": ["217", 0]
+        }},
+        "230": {"class_type": "LTXVImgToVideoInplace", "inputs": {
+            "vae": ["236", 2], "image": ["248", 0], "latent": ["253", 0], "strength": 1.0, "bypass": False
+        }},
+        "229": {"class_type": "LTXVConcatAVLatent", "inputs": {
+            "video_latent": ["230", 0], "audio_latent": ["217", 1]
+        }},
+
+        # ── High-res sampling ──
+        "213": {"class_type": "CFGGuider", "inputs": {
+            "model": ["232", 0], "positive": ["212", 0], "negative": ["212", 1], "cfg": 1.0
+        }},
+        "246": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler_cfg_pp"}},
+        "216": {"class_type": "RandomNoise",   "inputs": {"noise_seed": (seed + 1) % 2**32}},
+        "211": {"class_type": "ManualSigmas",  "inputs": {"sigmas": "0.85, 0.7250, 0.4219, 0.0"}},
+        "219": {"class_type": "SamplerCustomAdvanced", "inputs": {
+            "noise": ["216", 0], "guider": ["213", 0], "sampler": ["246", 0],
+            "sigmas": ["211", 0], "latent_image": ["229", 0]
+        }},
+        "218": {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["219", 0]}},
+
+        # ── Decode + save ──
+        "220": {"class_type": "LTXVAudioVAEDecode", "inputs": {
+            "samples": ["218", 1], "audio_vae": ["221", 0]
+        }},
+        "251": {"class_type": "VAEDecodeTiled", "inputs": {
+            "samples": ["218", 0], "vae": ["236", 2],
+            "tile_size": 768, "overlap": 64, "temporal_size": 4096, "temporal_overlap": 4
+        }},
+        "242": {"class_type": "CreateVideo", "inputs": {
+            "images": ["251", 0], "audio": ["220", 0], "fps": float(fps)
+        }},
+        "75": {"class_type": "SaveVideo", "inputs": {
+            "video":           ["242", 0],
+            "filename_prefix": f"video/ltx_i2v_{seed}",
+            "format":          "auto",
+            "codec":           "auto"
+        }},
+    }
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
+    background_tasks.add_task(run_job, job_id, workflow, [img_path])
+    return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", "poll_url": f"{BASE_URL}/status/{job_id}"}
+
+
 @app.post("/flux/face-swap")
 async def flux_face_swap(
     background_tasks: BackgroundTasks,
