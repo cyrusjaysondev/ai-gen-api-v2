@@ -305,7 +305,7 @@ def get_flux_face_swap_workflow(target_filename, face_filename, seed, prompt=Non
             "control_after_generate": "randomize", "steps": steps, "cfg": cfg,
             "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0,
             "LanPaint_NumSteps": 2, "LanPaint_PromptMode": "Image First",
-            "Inpainting_mode": "Image Inpainting",
+            "Inpainting_mode": "\U0001f5bc\ufe0f Image Inpainting",
             "LanPaint_Info": "LanPaint KSampler"
         }},
         "104": {"class_type": "VAEDecode", "inputs": {"samples": ["156", 0], "vae": ["102", 0]}},
