@@ -75,8 +75,7 @@ download_file() {
   local URL="$1"
   local DEST="$2"
   local LABEL="$3"
-  local AUTH_HEADER=""
-  [ -n "$4" ] && AUTH_HEADER="--header=Authorization: Bearer $4"
+  local TOKEN="$4"
 
   if [ -s "$DEST" ]; then
     log "  $LABEL already exists, skipping"
@@ -87,8 +86,8 @@ download_file() {
   [ -f "$DEST" ] && rm -f "$DEST"
 
   log "  Downloading $LABEL..."
-  if [ -n "$AUTH_HEADER" ]; then
-    wget -q --show-progress --header="Authorization: Bearer $4" -O "$DEST" "$URL"
+  if [ -n "$TOKEN" ]; then
+    wget -q --show-progress --header="Authorization: Bearer $TOKEN" -O "$DEST" "$URL"
   else
     wget -q --show-progress -O "$DEST" "$URL"
   fi
@@ -213,6 +212,9 @@ until curl -s http://localhost:8188/system_stats > /dev/null 2>&1; do
   if [ $WAITED -ge $MAX_WAIT ]; then log "ERROR: ComfyUI did not start within 5 min"; exit 1; fi
 done
 log "ComfyUI ready after ${WAITED}s"
+
+# Kill any stale API process on port 7860
+fuser -k 7860/tcp 2>/dev/null || true
 
 # Start API
 cd /workspace/api || exit 1
