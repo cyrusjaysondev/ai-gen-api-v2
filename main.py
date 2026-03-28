@@ -12,14 +12,19 @@ COMFYUI_URL = "http://127.0.0.1:8188"
 POD_ID = os.environ.get("RUNPOD_POD_ID", "RUNPOD_POD_ID_PLACEHOLDER")
 BASE_URL = f"https://{POD_ID}-7860.proxy.runpod.net"
 
-# Auto-detect ComfyUI output directory
-for _p in ["/workspace/runpod-slim/ComfyUI/output", "/workspace/ComfyUI/output"]:
-    if Path(_p).parent.exists():
-        OUTPUT_DIR = Path(_p)
+# Auto-detect ComfyUI root
+COMFY_ROOT = None
+for _p in ["/workspace/runpod-slim/ComfyUI", "/workspace/ComfyUI"]:
+    if Path(_p).exists():
+        COMFY_ROOT = Path(_p)
         break
-else:
-    OUTPUT_DIR = Path("/workspace/ComfyUI/output")
+if not COMFY_ROOT:
+    COMFY_ROOT = Path("/workspace/ComfyUI")
+
+OUTPUT_DIR = COMFY_ROOT / "output"
+INPUT_DIR = COMFY_ROOT / "input"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+INPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # In-memory job store
 jobs = {}
@@ -270,8 +275,8 @@ async def flux_face_swap(
 
     target_filename = f"flux_target_{uuid.uuid4().hex}.png"
     face_filename = f"flux_face_{uuid.uuid4().hex}.png"
-    target_path = str(Path("/workspace/ComfyUI/input") / target_filename)
-    face_path = str(Path("/workspace/ComfyUI/input") / face_filename)
+    target_path = str(INPUT_DIR / target_filename)
+    face_path = str(INPUT_DIR / face_filename)
     Path(target_path).write_bytes(await target_image.read())
     Path(face_path).write_bytes(await face_image.read())
 
