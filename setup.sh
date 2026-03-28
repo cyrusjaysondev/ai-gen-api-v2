@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================
 # AI Gen API v2 — Minimal Setup
-# FLUX.2 Klein 9B (head swap) + JuggernautXL (image gen)
+# FLUX.2 Klein 9B (head swap + image gen)
 #
 # Set in RunPod template env vars:
 #   SETUP_SCRIPT_URL = https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh
@@ -97,9 +97,9 @@ else
 fi
 
 # ─────────────────────────────────────────────
-# 7. Download main.py + start API
+# 6. Download main.py + start API
 # ─────────────────────────────────────────────
-log "[7/6] Setting up API..."
+log "[6/6] Setting up API..."
 mkdir -p /workspace/api
 
 wget -q -O /workspace/api/main.py \
