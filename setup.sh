@@ -1,7 +1,8 @@
 #!/bin/bash
 # =============================================================
-# AI Gen API v2 — Minimal Setup
-# FLUX.2 Klein 9B (head swap + image gen)
+# AI Gen API v2 — Setup
+# FLUX.2 Klein 9B (face swap + text-to-image)
+# LTX 2.3 22B (image-to-video, text-to-video, face-animate pipeline)
 #
 # Works with RunPod ComfyUI template (runpod/comfyui:latest)
 # ComfyUI location: /workspace/runpod-slim/ComfyUI/
@@ -11,21 +12,28 @@
 #   bash -c "wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh &"
 #
 # Required env var (set in RunPod template):
-#   HF_TOKEN = your Hugging Face token (needs access to black-forest-labs/FLUX.2-klein-9B)
+#   HF_TOKEN = your Hugging Face token
+#     - needs access to: black-forest-labs/FLUX.2-klein-9B
+#     - needs access to: Lightricks/LTX-2.3-fp8
+#   Accept licenses at:
+#     https://huggingface.co/black-forest-labs/FLUX.2-klein-9B
+#     https://huggingface.co/Lightricks/LTX-2.3-fp8
 # =============================================================
 
 LOG="/workspace/api_setup.log"
 log() { echo "[$(date '+%H:%M:%S')] $1" | tee -a $LOG; }
 
 # ─────────────────────────────────────────────
-# HF Token (required for UNET download)
+# HF Token (required for gated model downloads)
 # ─────────────────────────────────────────────
 TOKEN="${HF_TOKEN:-$HUGGING_FACE_HUB_TOKEN}"
 if [ -z "$TOKEN" ]; then
   log "ERROR: HF_TOKEN env var is not set."
   log "  Set it in your RunPod template environment variables."
   log "  Get a token at: https://huggingface.co/settings/tokens"
-  log "  Then accept the license at: https://huggingface.co/black-forest-labs/FLUX.2-klein-9B"
+  log "  Then accept licenses at:"
+  log "    https://huggingface.co/black-forest-labs/FLUX.2-klein-9B"
+  log "    https://huggingface.co/Lightricks/LTX-2.3-fp8"
   exit 1
 fi
 
@@ -75,7 +83,7 @@ download_file() {
   local URL="$1"
   local DEST="$2"
   local LABEL="$3"
-  local TOKEN="$4"
+  local HF_TOKEN="$4"
 
   if [ -s "$DEST" ]; then
     log "  $LABEL already exists, skipping"
@@ -86,8 +94,8 @@ download_file() {
   [ -f "$DEST" ] && rm -f "$DEST"
 
   log "  Downloading $LABEL..."
-  if [ -n "$TOKEN" ]; then
-    wget -q --show-progress --header="Authorization: Bearer $TOKEN" -O "$DEST" "$URL"
+  if [ -n "$HF_TOKEN" ]; then
+    wget -q --show-progress --header="Authorization: Bearer $HF_TOKEN" -O "$DEST" "$URL"
   else
     wget -q --show-progress -O "$DEST" "$URL"
   fi
@@ -103,14 +111,14 @@ download_file() {
 # ─────────────────────────────────────────────
 # 1. Pip dependencies
 # ─────────────────────────────────────────────
-log "[1/9] Installing pip dependencies..."
+log "[1/8] Installing pip dependencies..."
 $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | tail -1
 log "  Done"
 
 # ─────────────────────────────────────────────
-# 2. FLUX.2 Klein 9B UNET (~18GB) — requires HF token
+# 2. FLUX.2 Klein 9B UNET (~18GB) — requires HF token + license
 # ─────────────────────────────────────────────
-log "[2/9] FLUX.2 Klein 9B UNET..."
+log "[2/8] FLUX.2 Klein 9B UNET..."
 mkdir -p "$MODELS/diffusion_models"
 FLUX_UNET="$MODELS/diffusion_models/flux2-klein-9b.safetensors"
 download_file \
@@ -120,17 +128,17 @@ download_file \
   "$TOKEN"
 
 if [ $? -ne 0 ]; then
-  log "  FATAL: UNET download failed. Check your HF_TOKEN has access to black-forest-labs/FLUX.2-klein-9B"
+  log "  FATAL: FLUX UNET download failed. Check your HF_TOKEN has access to black-forest-labs/FLUX.2-klein-9B"
   exit 1
 fi
 
-# Symlink so both filenames work (workflow uses flux-2-klein-9b.safetensors)
+# Symlink so both filenames resolve (workflow references flux-2-klein-9b.safetensors)
 ln -sf "$FLUX_UNET" "$MODELS/diffusion_models/flux-2-klein-9b.safetensors"
 
 # ─────────────────────────────────────────────
 # 3. FLUX VAE + Qwen text encoder
 # ─────────────────────────────────────────────
-log "[3/9] FLUX VAE + Qwen text encoder..."
+log "[3/8] FLUX VAE + Qwen text encoder..."
 mkdir -p "$MODELS/vae" "$MODELS/text_encoders"
 
 download_file \
@@ -146,7 +154,7 @@ download_file \
 # ─────────────────────────────────────────────
 # 4. BFS Head Swap LoRA
 # ─────────────────────────────────────────────
-log "[4/9] BFS Head Swap LoRA..."
+log "[4/8] BFS Head Swap LoRA..."
 mkdir -p "$MODELS/loras"
 
 download_file \
@@ -159,21 +167,23 @@ download_file \
 # ─────────────────────────────────────────────
 mkdir -p "$NODES"
 if [ ! -d "$NODES/LanPaint" ]; then
-  log "[5/9] Installing LanPaint custom node..."
-  cd "$NODES"
-  git clone -q https://github.com/scraed/LanPaint
-  if [ -f "$NODES/LanPaint/requirements.txt" ]; then
-    cd LanPaint && $PIP install -q -r requirements.txt 2>&1 | tail -1
-  fi
+  log "[5/8] Installing LanPaint custom node..."
+  (
+    cd "$NODES"
+    git clone -q https://github.com/scraed/LanPaint
+    if [ -f "LanPaint/requirements.txt" ]; then
+      $PIP install -q -r LanPaint/requirements.txt 2>&1 | tail -1
+    fi
+  )
   log "  LanPaint installed"
 else
-  log "[5/9] LanPaint already exists"
+  log "[5/8] LanPaint already exists"
 fi
 
 # ─────────────────────────────────────────────
-# 6. LTX-2.3 Checkpoint (27GB) — requires HF token
+# 6. LTX-2.3 Checkpoint (~27GB) — requires HF token + license
 # ─────────────────────────────────────────────
-log "[6/9] LTX-2.3 checkpoint..."
+log "[6/8] LTX-2.3 checkpoint..."
 mkdir -p "$MODELS/checkpoints"
 download_file \
   "https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors" \
@@ -181,10 +191,15 @@ download_file \
   "LTX-2.3 22B dev fp8 (27GB)" \
   "$TOKEN"
 
+if [ $? -ne 0 ]; then
+  log "  FATAL: LTX-2.3 checkpoint download failed. Check your HF_TOKEN has access to Lightricks/LTX-2.3-fp8"
+  exit 1
+fi
+
 # ─────────────────────────────────────────────
-# 7. LTX-2.3 LoRAs + text encoder
+# 7. LTX-2.3 LoRAs + text encoder + spatial upscaler
 # ─────────────────────────────────────────────
-log "[7/9] LTX-2.3 LoRAs + text encoder..."
+log "[7/8] LTX-2.3 LoRAs + text encoder + upscaler..."
 mkdir -p "$MODELS/loras" "$MODELS/text_encoders" "$MODELS/latent_upscale_models"
 
 download_file \
@@ -208,25 +223,9 @@ download_file \
   "LTX-2.3 spatial upscaler (950MB)"
 
 # ─────────────────────────────────────────────
-# 8. ComfyUI-KJNodes (required for LTX 2.3 nodes)
+# 8. Download main.py + start API
 # ─────────────────────────────────────────────
-mkdir -p "$NODES"
-if [ ! -d "$NODES/ComfyUI-KJNodes" ]; then
-  log "[8/9] Installing ComfyUI-KJNodes..."
-  cd "$NODES"
-  git clone -q https://github.com/kijai/ComfyUI-KJNodes
-  if [ -f "$NODES/ComfyUI-KJNodes/requirements.txt" ]; then
-    cd ComfyUI-KJNodes && $PIP install -q -r requirements.txt 2>&1 | tail -1
-  fi
-  log "  ComfyUI-KJNodes installed"
-else
-  log "[8/9] ComfyUI-KJNodes already exists"
-fi
-
-# ─────────────────────────────────────────────
-# 9. Download main.py + start API
-# ─────────────────────────────────────────────
-log "[9/9] Setting up API..."
+log "[8/8] Setting up API..."
 mkdir -p /workspace/api
 
 wget -q -O /workspace/api/main.py \
