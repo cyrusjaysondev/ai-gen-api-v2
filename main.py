@@ -9,9 +9,17 @@ import websockets
 app = FastAPI(title="AI Gen API v2")
 
 COMFYUI_URL = "http://127.0.0.1:8188"
-OUTPUT_DIR = Path("/workspace/ComfyUI/output")
 POD_ID = os.environ.get("RUNPOD_POD_ID", "RUNPOD_POD_ID_PLACEHOLDER")
 BASE_URL = f"https://{POD_ID}-7860.proxy.runpod.net"
+
+# Auto-detect ComfyUI output directory
+for _p in ["/workspace/runpod-slim/ComfyUI/output", "/workspace/ComfyUI/output"]:
+    if Path(_p).parent.exists():
+        OUTPUT_DIR = Path(_p)
+        break
+else:
+    OUTPUT_DIR = Path("/workspace/ComfyUI/output")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # In-memory job store
 jobs = {}

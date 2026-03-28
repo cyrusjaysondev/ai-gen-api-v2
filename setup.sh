@@ -3,26 +3,58 @@
 # AI Gen API v2 — Minimal Setup
 # FLUX.2 Klein 9B (head swap + image gen)
 #
-# Set in RunPod template env vars:
-#   SETUP_SCRIPT_URL = https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh
+# Works with RunPod ComfyUI template (runpod/comfyui:latest)
+# ComfyUI location: /workspace/runpod-slim/ComfyUI/
+# Python venv: /workspace/runpod-slim/ComfyUI/.venv-cu128/
+#
+# Set as start command in template overrides:
+#   bash -c "wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh &"
 # =============================================================
 
 LOG="/workspace/api_setup.log"
 log() { echo "[$(date '+%H:%M:%S')] $1" | tee -a $LOG; }
 
+# Auto-detect ComfyUI location
+if [ -d "/workspace/runpod-slim/ComfyUI" ]; then
+  COMFY_ROOT="/workspace/runpod-slim/ComfyUI"
+elif [ -d "/workspace/ComfyUI" ]; then
+  COMFY_ROOT="/workspace/ComfyUI"
+else
+  log "ERROR: ComfyUI not found. Searching..."
+  COMFY_ROOT=$(find /workspace -name "main.py" -path "*/ComfyUI/*" -exec dirname {} \; 2>/dev/null | head -1)
+  if [ -z "$COMFY_ROOT" ]; then
+    log "ERROR: ComfyUI not found anywhere. Exiting."
+    exit 1
+  fi
+fi
+
+# Auto-detect Python
+if [ -f "$COMFY_ROOT/.venv-cu128/bin/python" ]; then
+  PYTHON="$COMFY_ROOT/.venv-cu128/bin/python"
+  PIP="$COMFY_ROOT/.venv-cu128/bin/pip"
+elif [ -f "/opt/venv/bin/python" ]; then
+  PYTHON="/opt/venv/bin/python"
+  PIP="/opt/venv/bin/pip"
+else
+  PYTHON=$(which python3)
+  PIP=$(which pip3)
+fi
+
+MODELS="$COMFY_ROOT/models"
+NODES="$COMFY_ROOT/custom_nodes"
+
 log "=========================================="
 log "AI Gen API v2 Setup Started"
 log "Pod ID: $RUNPOD_POD_ID"
+log "ComfyUI: $COMFY_ROOT"
+log "Python: $PYTHON"
 log "=========================================="
-
-MODELS="/workspace/ComfyUI/models"
-NODES="/workspace/ComfyUI/custom_nodes"
 
 # ─────────────────────────────────────────────
 # 1. Pip dependencies
 # ─────────────────────────────────────────────
 log "[1/6] Installing pip dependencies..."
-pip install -q fastapi uvicorn httpx websockets python-multipart 2>&1 | tail -1
+$PIP install -q fastapi uvicorn httpx websockets python-multipart 2>&1 | tail -1
 log "  Done"
 
 # ─────────────────────────────────────────────
@@ -38,7 +70,6 @@ if [ ! -f "$FLUX_UNET" ]; then
 else
   log "[2/6] FLUX Klein 9B already exists"
 fi
-# Symlink (workflow references flux-2-klein-9b with dash)
 ln -sf "$FLUX_UNET" "$MODELS/diffusion_models/flux-2-klein-9b.safetensors"
 
 # ─────────────────────────────────────────────
@@ -84,12 +115,13 @@ fi
 # ─────────────────────────────────────────────
 # 5. LanPaint custom node (FLUX head swap)
 # ─────────────────────────────────────────────
+mkdir -p "$NODES"
 if [ ! -d "$NODES/LanPaint" ]; then
   log "[5/6] Installing LanPaint custom node..."
   cd "$NODES"
   git clone -q https://github.com/scraed/LanPaint
   if [ -f "$NODES/LanPaint/requirements.txt" ]; then
-    cd LanPaint && pip install -q -r requirements.txt 2>&1 | tail -1
+    cd LanPaint && $PIP install -q -r requirements.txt 2>&1 | tail -1
   fi
   log "  LanPaint installed"
 else
@@ -109,14 +141,24 @@ if [ ! -f "/workspace/api/main.py" ] || [ ! -s "/workspace/api/main.py" ]; then
   log "  WARNING: Failed to download main.py — download manually"
 fi
 
-# Create startup script (survives SSH disconnect + pod restart)
+# Write detected paths into a config file so main.py and start_api.sh can use them
+cat > /workspace/api/config.env << CONFEOF
+COMFY_ROOT=$COMFY_ROOT
+PYTHON=$PYTHON
+PIP=$PIP
+CONFEOF
+
+# Create startup script
 cat > /workspace/start_api.sh << 'EOF'
 #!/bin/bash
 LOG="/workspace/api_setup.log"
 log() { echo "[$(date '+%H:%M:%S')] $1" | tee -a $LOG; }
 
+# Load config
+source /workspace/api/config.env
+
 # Reinstall pip deps (lost on restart)
-pip install -q fastapi uvicorn httpx websockets python-multipart 2>&1 | tail -1
+$PIP install -q fastapi uvicorn httpx websockets python-multipart 2>&1 | tail -1
 
 # Wait for ComfyUI
 log "Waiting for ComfyUI..."
@@ -130,7 +172,7 @@ log "ComfyUI ready after ${WAITED}s"
 # Start API
 cd /workspace/api || exit 1
 log "Starting API on port 7860..."
-exec /opt/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 7860 >> /workspace/api.log 2>&1
+exec $PYTHON -m uvicorn main:app --host 0.0.0.0 --port 7860 >> /workspace/api.log 2>&1
 EOF
 
 chmod +x /workspace/start_api.sh
