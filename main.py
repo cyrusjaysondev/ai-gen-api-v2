@@ -383,27 +383,28 @@ def compute_ltx_dimensions(width: int, height: int, aspect_ratio: str) -> tuple[
 
 LTX_PRESETS = {
     "fast": {
-        "low_res_sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0",
-        "high_res_sigmas": "0.85, 0.7250, 0.4219, 0.0",
+        # Single pass at full resolution — no upscale second pass
+        "sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0",
         "lora_strength": 0.5,
+        "two_pass": False,
     },
     "quality": {
+        # Two-pass: low-res generate → upscale → high-res refine
         "low_res_sigmas": "1.0, 0.99688, 0.99375, 0.990625, 0.9875, 0.984375, 0.98125, 0.978125, 0.975, 0.96875, 0.9625, 0.95, 0.9375, 0.909375, 0.875, 0.84375, 0.78125, 0.725, 0.5625, 0.421875, 0.0",
         "high_res_sigmas": "0.85, 0.7875, 0.7250, 0.5734, 0.4219, 0.0",
         "lora_strength": 0.35,
+        "two_pass": True,
     },
 }
 
 def _ltx_base_nodes(prompt, negative_prompt, width, height, length, fps, seed, low_res_video_src, high_res_video_src, prefix, preset="fast"):
-    """Return the shared LTX workflow nodes (model loaders, text, sampling, decode, save).
-    low_res_video_src / high_res_video_src are [node_id, slot] references for the video latent
-    going into the low-res and high-res LTXVConcatAVLatent nodes respectively.
-    preset: "fast" (~8 steps, <12s) or "quality" (~20 steps, better detail).
+    """Return the shared LTX workflow nodes.
+    fast preset: single pass at full resolution — fast, no upscale overhead.
+    quality preset: two-pass (half-res → upscale → refine at full-res) — slower, sharper.
     """
     p = LTX_PRESETS.get(preset, LTX_PRESETS["fast"])
-    half_w = max(32, (width // 2 // 32) * 32)
-    half_h = max(32, (height // 2 // 32) * 32)
-    return {
+
+    nodes = {
         # ── Model loaders ──
         "236": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "ltx-2.3-22b-dev-fp8.safetensors"}},
         "221": {"class_type": "LTXVAudioVAELoader",     "inputs": {"ckpt_name": "ltx-2.3-22b-dev-fp8.safetensors"}},
@@ -412,17 +413,16 @@ def _ltx_base_nodes(prompt, negative_prompt, width, height, length, fps, seed, l
             "ckpt_name":    "ltx-2.3-22b-dev-fp8.safetensors",
             "device": "default"
         }},
-        "272": {"class_type": "LoraLoader", "inputs": {          # gemma abliterated lora → modified CLIP
+        "272": {"class_type": "LoraLoader", "inputs": {
             "model": ["236", 0], "clip": ["243", 0],
             "lora_name": "gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors",
             "strength_model": 1.0, "strength_clip": 1.0
         }},
-        "232": {"class_type": "LoraLoaderModelOnly", "inputs": { # distilled lora → modified MODEL
+        "232": {"class_type": "LoraLoaderModelOnly", "inputs": {
             "model": ["236", 0],
             "lora_name": "ltx-2.3-22b-distilled-lora-384.safetensors",
             "strength_model": p["lora_strength"]
         }},
-        "233": {"class_type": "LatentUpscaleModelLoader", "inputs": {"model_name": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"}},
 
         # ── Text conditioning ──
         "240": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["243", 0], "text": prompt}},
@@ -431,65 +431,111 @@ def _ltx_base_nodes(prompt, negative_prompt, width, height, length, fps, seed, l
             "positive": ["240", 0], "negative": ["247", 0], "frame_rate": float(fps)
         }},
 
-        # ── Low-res empty latents ──
-        "228": {"class_type": "EmptyLTXVLatentVideo", "inputs": {
-            "width": half_w, "height": half_h, "length": length, "batch_size": 1
-        }},
+        # ── Audio latent ──
         "214": {"class_type": "LTXVEmptyLatentAudio", "inputs": {
             "frames_number": length, "frame_rate": fps, "batch_size": 1, "audio_vae": ["221", 0]
         }},
+    }
 
-        # ── Low-res concat + sampling ──
-        "222": {"class_type": "LTXVConcatAVLatent",     "inputs": {"video_latent": low_res_video_src, "audio_latent": ["214", 0]}},
-        "231": {"class_type": "CFGGuider",               "inputs": {"model": ["232", 0], "positive": ["239", 0], "negative": ["239", 1], "cfg": 1.0}},
-        "209": {"class_type": "KSamplerSelect",          "inputs": {"sampler_name": "euler_ancestral_cfg_pp"}},
-        "237": {"class_type": "RandomNoise",             "inputs": {"noise_seed": seed}},
-        "252": {"class_type": "ManualSigmas",            "inputs": {"sigmas": p["low_res_sigmas"]}},
-        "215": {"class_type": "SamplerCustomAdvanced",  "inputs": {
-            "noise": ["237", 0], "guider": ["231", 0], "sampler": ["209", 0],
-            "sigmas": ["252", 0], "latent_image": ["222", 0]
-        }},
-        "217": {"class_type": "LTXVSeparateAVLatent",   "inputs": {"av_latent": ["215", 0]}},
+    if p["two_pass"]:
+        # ── QUALITY: two-pass pipeline ──
+        half_w = max(32, (width // 2 // 32) * 32)
+        half_h = max(32, (height // 2 // 32) * 32)
 
-        # ── Latent upscale 2× ──
-        "253": {"class_type": "LTXVLatentUpsampler",    "inputs": {
-            "samples": ["217", 0], "upscale_model": ["233", 0], "vae": ["236", 2]
-        }},
+        nodes.update({
+            "233": {"class_type": "LatentUpscaleModelLoader", "inputs": {"model_name": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"}},
 
-        # ── High-res crop guides + concat + sampling ──
-        "212": {"class_type": "LTXVCropGuides",          "inputs": {"positive": ["239", 0], "negative": ["239", 1], "latent": ["217", 0]}},
-        "229": {"class_type": "LTXVConcatAVLatent",      "inputs": {"video_latent": high_res_video_src, "audio_latent": ["217", 1]}},
-        "213": {"class_type": "CFGGuider",               "inputs": {"model": ["232", 0], "positive": ["212", 0], "negative": ["212", 1], "cfg": 1.0}},
-        "246": {"class_type": "KSamplerSelect",          "inputs": {"sampler_name": "euler_cfg_pp"}},
-        "216": {"class_type": "RandomNoise",             "inputs": {"noise_seed": (seed + 1) % 2**32}},
-        "211": {"class_type": "ManualSigmas",            "inputs": {"sigmas": p["high_res_sigmas"]}},
-        "219": {"class_type": "SamplerCustomAdvanced",  "inputs": {
-            "noise": ["216", 0], "guider": ["213", 0], "sampler": ["246", 0],
-            "sigmas": ["211", 0], "latent_image": ["229", 0]
-        }},
-        "218": {"class_type": "LTXVSeparateAVLatent",   "inputs": {"av_latent": ["219", 0]}},
+            # Low-res latent
+            "228": {"class_type": "EmptyLTXVLatentVideo", "inputs": {
+                "width": half_w, "height": half_h, "length": length, "batch_size": 1
+            }},
 
-        # ── Decode + save ──
-        "220": {"class_type": "LTXVAudioVAEDecode",     "inputs": {"samples": ["218", 1], "audio_vae": ["221", 0]}},
-        "251": {"class_type": "VAEDecodeTiled",          "inputs": {
-            "samples": ["218", 0], "vae": ["236", 2],
-            "tile_size": 768, "overlap": 64, "temporal_size": 4096, "temporal_overlap": 4
-        }},
-        "242": {"class_type": "CreateVideo",             "inputs": {"images": ["251", 0], "audio": ["220", 0], "fps": float(fps)}},
-        "75":  {"class_type": "SaveVideo",               "inputs": {
+            # Low-res sampling
+            "222": {"class_type": "LTXVConcatAVLatent",    "inputs": {"video_latent": low_res_video_src, "audio_latent": ["214", 0]}},
+            "231": {"class_type": "CFGGuider",              "inputs": {"model": ["232", 0], "positive": ["239", 0], "negative": ["239", 1], "cfg": 1.0}},
+            "209": {"class_type": "KSamplerSelect",         "inputs": {"sampler_name": "euler_ancestral_cfg_pp"}},
+            "237": {"class_type": "RandomNoise",            "inputs": {"noise_seed": seed}},
+            "252": {"class_type": "ManualSigmas",           "inputs": {"sigmas": p["low_res_sigmas"]}},
+            "215": {"class_type": "SamplerCustomAdvanced", "inputs": {
+                "noise": ["237", 0], "guider": ["231", 0], "sampler": ["209", 0],
+                "sigmas": ["252", 0], "latent_image": ["222", 0]
+            }},
+            "217": {"class_type": "LTXVSeparateAVLatent",  "inputs": {"av_latent": ["215", 0]}},
+
+            # Upscale 2×
+            "253": {"class_type": "LTXVLatentUpsampler",   "inputs": {
+                "samples": ["217", 0], "upscale_model": ["233", 0], "vae": ["236", 2]
+            }},
+
+            # High-res refinement
+            "212": {"class_type": "LTXVCropGuides",         "inputs": {"positive": ["239", 0], "negative": ["239", 1], "latent": ["217", 0]}},
+            "229": {"class_type": "LTXVConcatAVLatent",     "inputs": {"video_latent": high_res_video_src, "audio_latent": ["217", 1]}},
+            "213": {"class_type": "CFGGuider",              "inputs": {"model": ["232", 0], "positive": ["212", 0], "negative": ["212", 1], "cfg": 1.0}},
+            "246": {"class_type": "KSamplerSelect",         "inputs": {"sampler_name": "euler_cfg_pp"}},
+            "216": {"class_type": "RandomNoise",            "inputs": {"noise_seed": (seed + 1) % 2**32}},
+            "211": {"class_type": "ManualSigmas",           "inputs": {"sigmas": p["high_res_sigmas"]}},
+            "219": {"class_type": "SamplerCustomAdvanced", "inputs": {
+                "noise": ["216", 0], "guider": ["213", 0], "sampler": ["246", 0],
+                "sigmas": ["211", 0], "latent_image": ["229", 0]
+            }},
+            "218": {"class_type": "LTXVSeparateAVLatent",  "inputs": {"av_latent": ["219", 0]}},
+
+            # Decode from high-res output
+            "220": {"class_type": "LTXVAudioVAEDecode",    "inputs": {"samples": ["218", 1], "audio_vae": ["221", 0]}},
+            "251": {"class_type": "VAEDecodeTiled",         "inputs": {
+                "samples": ["218", 0], "vae": ["236", 2],
+                "tile_size": 768, "overlap": 64, "temporal_size": 4096, "temporal_overlap": 4
+            }},
+        })
+    else:
+        # ── FAST: single pass at full resolution — no upscale ──
+        nodes.update({
+            # Full-res latent directly
+            "228": {"class_type": "EmptyLTXVLatentVideo", "inputs": {
+                "width": width, "height": height, "length": length, "batch_size": 1
+            }},
+
+            # Single sampling pass
+            "222": {"class_type": "LTXVConcatAVLatent",    "inputs": {"video_latent": low_res_video_src, "audio_latent": ["214", 0]}},
+            "231": {"class_type": "CFGGuider",              "inputs": {"model": ["232", 0], "positive": ["239", 0], "negative": ["239", 1], "cfg": 1.0}},
+            "209": {"class_type": "KSamplerSelect",         "inputs": {"sampler_name": "euler_ancestral_cfg_pp"}},
+            "237": {"class_type": "RandomNoise",            "inputs": {"noise_seed": seed}},
+            "252": {"class_type": "ManualSigmas",           "inputs": {"sigmas": p["sigmas"]}},
+            "215": {"class_type": "SamplerCustomAdvanced", "inputs": {
+                "noise": ["237", 0], "guider": ["231", 0], "sampler": ["209", 0],
+                "sigmas": ["252", 0], "latent_image": ["222", 0]
+            }},
+            "217": {"class_type": "LTXVSeparateAVLatent",  "inputs": {"av_latent": ["215", 0]}},
+
+            # Decode directly from single pass output
+            "220": {"class_type": "LTXVAudioVAEDecode",    "inputs": {"samples": ["217", 1], "audio_vae": ["221", 0]}},
+            "251": {"class_type": "VAEDecodeTiled",         "inputs": {
+                "samples": ["217", 0], "vae": ["236", 2],
+                "tile_size": 768, "overlap": 64, "temporal_size": 4096, "temporal_overlap": 4
+            }},
+        })
+
+    # ── Output (shared) ──
+    nodes.update({
+        "242": {"class_type": "CreateVideo",  "inputs": {"images": ["251", 0], "audio": ["220", 0], "fps": float(fps)}},
+        "75":  {"class_type": "SaveVideo",    "inputs": {
             "video": ["242", 0], "filename_prefix": f"video/{prefix}_{seed}", "format": "auto", "codec": "auto"
         }},
-    }
+    })
+
+    return nodes
 
 LTX_DEFAULT_NEGATIVE = "low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly"
 
 @app.get("/ltx/presets")
 async def get_ltx_presets():
-    return {
-        "presets": {k: {"low_res_steps": v["low_res_sigmas"].count(","), "high_res_steps": v["high_res_sigmas"].count(","), "lora_strength": v["lora_strength"]} for k, v in LTX_PRESETS.items()},
-        "default": "fast",
-        "endpoints": ["/ltx/i2v", "/ltx/t2v", "/face-animate"],
-    }
+    info = {}
+    for k, v in LTX_PRESETS.items():
+        if v["two_pass"]:
+            info[k] = {"mode": "two_pass", "low_res_steps": v["low_res_sigmas"].count(","), "high_res_steps": v["high_res_sigmas"].count(","), "lora_strength": v["lora_strength"]}
+        else:
+            info[k] = {"mode": "single_pass", "steps": v["sigmas"].count(","), "lora_strength": v["lora_strength"]}
+    return {"presets": info, "default": "fast", "endpoints": ["/ltx/i2v", "/ltx/t2v", "/face-animate"]}
 
 
 # ─────────────────────────────────────────────
@@ -517,15 +563,15 @@ async def ltx_image_to_video(
 
     seed = seed if seed != -1 else uuid.uuid4().int % 2**32
     width, height = compute_ltx_dimensions(width, height, aspect_ratio)
-    half_w = max(32, (width // 2 // 32) * 32)
-    half_h = max(32, (height // 2 // 32) * 32)
 
     img_bytes = await image.read()
     img_filename = f"ltx_i2v_{uuid.uuid4().hex}.png"
     img_path = str(INPUT_DIR / img_filename)
     Path(img_path).write_bytes(img_bytes)
 
-    # Image-specific nodes: load → resize → preprocess → i2v inplace (low + high res)
+    two_pass = LTX_PRESETS[preset]["two_pass"]
+
+    # Image-specific nodes: load → resize → preprocess → i2v inplace
     img_nodes = {
         "269": {"class_type": "LoadImage", "inputs": {"image": img_filename}},
         "238": {"class_type": "ResizeImageMaskNode", "inputs": {
@@ -543,21 +589,28 @@ async def ltx_image_to_video(
             "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
             "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": seed
         }},
-        # Low-res i2v inplace (strength=0.7 — partial conditioning)
+        # I2V inplace for the generation pass (feeds into latent "228")
         "249": {"class_type": "LTXVImgToVideoInplace", "inputs": {
-            "vae": ["236", 2], "image": ["248", 0], "latent": ["228", 0], "strength": 0.7, "bypass": False
-        }},
-        # High-res i2v inplace (strength=1.0 — full conditioning)
-        "230": {"class_type": "LTXVImgToVideoInplace", "inputs": {
-            "vae": ["236", 2], "image": ["248", 0], "latent": ["253", 0], "strength": 1.0, "bypass": False
+            "vae": ["236", 2], "image": ["248", 0], "latent": ["228", 0],
+            "strength": 0.7 if two_pass else 1.0, "bypass": False
         }},
     }
+
+    # High-res i2v inplace only needed for quality two-pass
+    if two_pass:
+        img_nodes["230"] = {"class_type": "LTXVImgToVideoInplace", "inputs": {
+            "vae": ["236", 2], "image": ["248", 0], "latent": ["253", 0], "strength": 1.0, "bypass": False
+        }}
+        high_res_src = ["230", 0]
+    else:
+        high_res_src = None  # not used in single-pass
+
     # Override CLIPTextEncode to use enhanced prompt
     img_nodes["240"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["243", 0], "text": ["274", 0]}}
 
     workflow = _ltx_base_nodes(
         prompt, negative_prompt, width, height, length, fps, seed,
-        low_res_video_src=["249", 0], high_res_video_src=["230", 0], prefix="ltx_i2v", preset=preset
+        low_res_video_src=["249", 0], high_res_video_src=high_res_src, prefix="ltx_i2v", preset=preset
     )
     workflow.update(img_nodes)
 
@@ -685,6 +738,8 @@ async def run_face_animate_pipeline(
         ltx_img_path = str(INPUT_DIR / ltx_input_filename)
         Path(ltx_img_path).write_bytes(img_bytes)
 
+        two_pass = LTX_PRESETS[preset]["two_pass"]
+
         img_nodes = {
             "269": {"class_type": "LoadImage", "inputs": {"image": ltx_input_filename}},
             "238": {"class_type": "ResizeImageMaskNode", "inputs": {
@@ -702,17 +757,23 @@ async def run_face_animate_pipeline(
                 "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": seed
             }},
             "249": {"class_type": "LTXVImgToVideoInplace", "inputs": {
-                "vae": ["236", 2], "image": ["248", 0], "latent": ["228", 0], "strength": 0.7, "bypass": False
-            }},
-            "230": {"class_type": "LTXVImgToVideoInplace", "inputs": {
-                "vae": ["236", 2], "image": ["248", 0], "latent": ["253", 0], "strength": 1.0, "bypass": False
+                "vae": ["236", 2], "image": ["248", 0], "latent": ["228", 0],
+                "strength": 0.7 if two_pass else 1.0, "bypass": False
             }},
             "240": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["243", 0], "text": ["274", 0]}},
         }
 
+        if two_pass:
+            img_nodes["230"] = {"class_type": "LTXVImgToVideoInplace", "inputs": {
+                "vae": ["236", 2], "image": ["248", 0], "latent": ["253", 0], "strength": 1.0, "bypass": False
+            }}
+            high_res_src = ["230", 0]
+        else:
+            high_res_src = None
+
         ltx_workflow = _ltx_base_nodes(
             animate_prompt, negative_prompt, width, height, length, fps, seed,
-            low_res_video_src=["249", 0], high_res_video_src=["230", 0], prefix="face_animate", preset=preset
+            low_res_video_src=["249", 0], high_res_video_src=high_res_src, prefix="face_animate", preset=preset
         )
         ltx_workflow.update(img_nodes)
 
