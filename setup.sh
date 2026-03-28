@@ -23,6 +23,8 @@
 LOG="/workspace/api_setup.log"
 log() { echo "[$(date '+%H:%M:%S')] $1" | tee -a $LOG; }
 
+API_REPO="https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main"
+
 # ─────────────────────────────────────────────
 # HF Token (required for gated model downloads)
 # ─────────────────────────────────────────────
@@ -78,7 +80,6 @@ log "Python: $PYTHON"
 log "=========================================="
 
 # Helper: download with size check and cleanup on failure
-# Usage: download_file <url> <dest_path> <label> [hf_token]
 download_file() {
   local URL="$1"
   local DEST="$2"
@@ -223,64 +224,89 @@ download_file \
   "LTX-2.3 spatial upscaler (950MB)"
 
 # ─────────────────────────────────────────────
-# 8. Download main.py + start API
+# 8. Download API + create startup scripts
 # ─────────────────────────────────────────────
 log "[8/8] Setting up API..."
 mkdir -p /workspace/api
 
-wget -q -O /workspace/api/main.py \
-  "https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/main.py"
-
+# Always fetch latest main.py from repo
+wget -q -O /workspace/api/main.py "${API_REPO}/main.py"
 if [ ! -s "/workspace/api/main.py" ]; then
   log "  ERROR: Failed to download main.py"
   exit 1
 fi
-log "  main.py downloaded"
+log "  main.py downloaded (latest)"
 
-# Write detected paths so start_api.sh can use the correct Python
+# Save detected paths for start_api.sh
 cat > /workspace/api/config.env << CONFEOF
 COMFY_ROOT=$COMFY_ROOT
 PYTHON=$PYTHON
 PIP=$PIP
+API_REPO=$API_REPO
 CONFEOF
 
-# Create startup script (runs on every pod restart)
-cat > /workspace/start_api.sh << 'EOF'
+# Create startup script (runs on every pod start/restart)
+cat > /workspace/start_api.sh << 'STARTEOF'
 #!/bin/bash
 LOG="/workspace/api_setup.log"
 log() { echo "[$(date '+%H:%M:%S')] $1" | tee -a $LOG; }
 
+# Truncate old logs on restart
+tail -500 "$LOG" > "${LOG}.tmp" 2>/dev/null && mv "${LOG}.tmp" "$LOG"
+tail -500 /workspace/api.log > /workspace/api.log.tmp 2>/dev/null && mv /workspace/api.log.tmp /workspace/api.log
+
 # Load detected Python/pip paths
 source /workspace/api/config.env
 
-# Reinstall pip deps (lost on pod restart)
+# Reinstall pip deps (can be lost on pod restart)
+log "Installing pip deps..."
 $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | tail -1
+
+# Always fetch latest main.py from repo on restart
+log "Fetching latest API code..."
+wget -q -O /workspace/api/main.py "${API_REPO}/main.py"
+if [ ! -s "/workspace/api/main.py" ]; then
+  log "ERROR: Failed to download main.py — using existing version"
+fi
 
 # Wait for ComfyUI to be ready
 log "Waiting for ComfyUI..."
-MAX_WAIT=300; WAITED=0
+MAX_WAIT=600; WAITED=0
 until curl -s http://localhost:8188/system_stats > /dev/null 2>&1; do
   sleep 3; WAITED=$((WAITED + 3))
-  if [ $WAITED -ge $MAX_WAIT ]; then log "ERROR: ComfyUI did not start within 5 min"; exit 1; fi
+  if [ $WAITED -ge $MAX_WAIT ]; then log "ERROR: ComfyUI did not start within 10 min"; exit 1; fi
 done
 log "ComfyUI ready after ${WAITED}s"
 
-# Kill any stale API process on port 7860
+# Kill any stale API process
 pkill -f "uvicorn main:app" 2>/dev/null || true
 sleep 1
 
-# Start API
+# Start API with auto-restart on crash
 cd /workspace/api || exit 1
 log "Starting API on port 7860..."
-exec $PYTHON -m uvicorn main:app --host 0.0.0.0 --port 7860 >> /workspace/api.log 2>&1
-EOF
+while true; do
+  $PYTHON -m uvicorn main:app --host 0.0.0.0 --port 7860 >> /workspace/api.log 2>&1
+  EXIT_CODE=$?
+  log "API exited with code $EXIT_CODE — restarting in 5s..."
+  sleep 5
+done
+STARTEOF
 
 chmod +x /workspace/start_api.sh
+
+# Start the API now
 nohup bash /workspace/start_api.sh >> /workspace/api_setup.log 2>&1 & disown
 
 log "=========================================="
 log "Setup Complete!"
 log "  API docs: https://${RUNPOD_POD_ID}-7860.proxy.runpod.net/docs"
+log "  Swagger:  https://${RUNPOD_POD_ID}-7860.proxy.runpod.net/docs"
+log "  Health:   https://${RUNPOD_POD_ID}-7860.proxy.runpod.net/health"
 log "  Setup log: tail -f /workspace/api_setup.log"
 log "  API log:   tail -f /workspace/api.log"
+log ""
+log "  On pod restart, run: bash /workspace/start_api.sh &"
+log "  Or set template start command to:"
+log "    bash -c 'bash /workspace/start_api.sh &'"
 log "=========================================="
