@@ -48,7 +48,10 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None):
         ws_url = f"ws://127.0.0.1:8188/ws?clientId={client_id}"
         async with websockets.connect(ws_url) as ws:
             while True:
-                msg = json.loads(await ws.recv())
+                raw = await ws.recv()
+                if isinstance(raw, bytes):
+                    continue  # Skip binary preview frames
+                msg = json.loads(raw)
                 if msg.get("type") == "executing":
                     data = msg.get("data", {})
                     if data.get("node") is None and data.get("prompt_id") == prompt_id:
