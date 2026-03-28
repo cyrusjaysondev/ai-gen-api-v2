@@ -383,8 +383,8 @@ def compute_ltx_dimensions(width: int, height: int, aspect_ratio: str) -> tuple[
 
 LTX_PRESETS = {
     "fast": {
-        # Single pass at full resolution — no upscale second pass
-        "sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0",
+        # Single pass at full resolution — 5 steps, no upscale
+        "sigmas": "1.0, 0.975, 0.909375, 0.725, 0.421875, 0.0",
         "lora_strength": 0.5,
         "two_pass": False,
     },
@@ -488,40 +488,50 @@ def _ltx_base_nodes(prompt, negative_prompt, width, height, length, fps, seed, l
             }},
         })
     else:
-        # ── FAST: single pass at full resolution — no upscale ──
+        # ── FAST: single pass, no upscale, no audio — maximum speed ──
+        # Remove audio nodes to skip audio VAE loading overhead
+        del nodes["214"]  # LTXVEmptyLatentAudio
+        del nodes["221"]  # LTXVAudioVAELoader
+
         nodes.update({
             # Full-res latent directly
             "228": {"class_type": "EmptyLTXVLatentVideo", "inputs": {
                 "width": width, "height": height, "length": length, "batch_size": 1
             }},
 
-            # Single sampling pass
-            "222": {"class_type": "LTXVConcatAVLatent",    "inputs": {"video_latent": low_res_video_src, "audio_latent": ["214", 0]}},
+            # Single sampling pass — no AV concat, sample video latent directly
             "231": {"class_type": "CFGGuider",              "inputs": {"model": ["232", 0], "positive": ["239", 0], "negative": ["239", 1], "cfg": 1.0}},
             "209": {"class_type": "KSamplerSelect",         "inputs": {"sampler_name": "euler_ancestral_cfg_pp"}},
             "237": {"class_type": "RandomNoise",            "inputs": {"noise_seed": seed}},
             "252": {"class_type": "ManualSigmas",           "inputs": {"sigmas": p["sigmas"]}},
             "215": {"class_type": "SamplerCustomAdvanced", "inputs": {
                 "noise": ["237", 0], "guider": ["231", 0], "sampler": ["209", 0],
-                "sigmas": ["252", 0], "latent_image": ["222", 0]
+                "sigmas": ["252", 0], "latent_image": low_res_video_src
             }},
-            "217": {"class_type": "LTXVSeparateAVLatent",  "inputs": {"av_latent": ["215", 0]}},
 
-            # Decode directly from single pass output
-            "220": {"class_type": "LTXVAudioVAEDecode",    "inputs": {"samples": ["217", 1], "audio_vae": ["221", 0]}},
+            # Decode video directly — no audio
             "251": {"class_type": "VAEDecodeTiled",         "inputs": {
-                "samples": ["217", 0], "vae": ["236", 2],
+                "samples": ["215", 0], "vae": ["236", 2],
                 "tile_size": 768, "overlap": 64, "temporal_size": 4096, "temporal_overlap": 4
             }},
         })
 
-    # ── Output (shared) ──
-    nodes.update({
-        "242": {"class_type": "CreateVideo",  "inputs": {"images": ["251", 0], "audio": ["220", 0], "fps": float(fps)}},
-        "75":  {"class_type": "SaveVideo",    "inputs": {
-            "video": ["242", 0], "filename_prefix": f"video/{prefix}_{seed}", "format": "auto", "codec": "auto"
-        }},
-    })
+    if p["two_pass"]:
+        # Quality: output with audio
+        nodes.update({
+            "242": {"class_type": "CreateVideo",  "inputs": {"images": ["251", 0], "audio": ["220", 0], "fps": float(fps)}},
+            "75":  {"class_type": "SaveVideo",    "inputs": {
+                "video": ["242", 0], "filename_prefix": f"video/{prefix}_{seed}", "format": "auto", "codec": "auto"
+            }},
+        })
+    else:
+        # Fast: output without audio
+        nodes.update({
+            "242": {"class_type": "CreateVideo",  "inputs": {"images": ["251", 0], "fps": float(fps)}},
+            "75":  {"class_type": "SaveVideo",    "inputs": {
+                "video": ["242", 0], "filename_prefix": f"video/{prefix}_{seed}", "format": "auto", "codec": "auto"
+            }},
+        })
 
     return nodes
 
