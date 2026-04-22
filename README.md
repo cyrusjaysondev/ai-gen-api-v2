@@ -1,44 +1,72 @@
 # AI Gen API v2
 
-Minimal API for FLUX.2 Klein 9B on RunPod — text-to-image + AI head swap.
+API on RunPod for:
+- **FLUX.2 Klein 9B** — text-to-image + AI head/face swap
+- **LTX 2.3 22B** — image-to-video, text-to-video, face-animate pipeline
+
+Full step-by-step setup: [SETUP.md](SETUP.md). Full API reference: [API.md](API.md).
+
+---
+
+## Prerequisites
+
+You need both of these before the pod can install:
+
+1. **HuggingFace token** with Read access — https://huggingface.co/settings/tokens
+2. **Accept model licenses** (click "Agree and access repository" on each):
+   - https://huggingface.co/black-forest-labs/FLUX.2-klein-9B
+   - https://huggingface.co/Lightricks/LTX-2.3-fp8
 
 ---
 
 ## Quick Deploy (new pod)
 
-### 1. Create Pod
-- Go to **runpod.io** > **Pods** > **+ Deploy**
-- GPU: **RTX 5090** (32GB) or similar
-- Template: Any **ComfyUI** template
-- Volume: **150GB** at `/workspace`
-- Ports: `7860`, `8188`, `8888`
+### 1. Create Template
+- **runpod.io** → **Templates** → **+ New Template**
+- **Container Image:** `runpod/comfyui:latest`
+- **Volume:** `200 GB` mounted at `/workspace`
+- **Expose Ports:** `7860, 8188, 8888`
 
 ### 2. Set Environment Variables
-In the template settings, add:
+In the template, add:
 
 ```
-SETUP_SCRIPT_URL = https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh
+HF_TOKEN = hf_your_token_here
 ```
 
-### 3. Deploy and Wait
-Click Deploy. The setup script will automatically:
+> Setting `SETUP_SCRIPT_URL` as an env var alone does **not** trigger the installer — nothing in the stock image reads it. You must set the Start Command (next step).
+
+### 3. Set the Start Command
+In the template, paste this as the **Container Start Command**:
+
+```bash
+bash -c "wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh &"
+```
+
+### 4. Deploy and Wait
+Click Deploy. The setup script will download models and start the API:
+
 1. Install pip dependencies
-2. Download FLUX Klein 9B UNET (18GB)
-3. Download FLUX VAE + Qwen text encoder (9GB)
-4. Download BFS head swap LoRA (663MB)
+2. Download FLUX.2 Klein 9B UNET (18 GB)
+3. Download FLUX VAE + Qwen 3 8B text encoder (~8.4 GB)
+4. Download BFS head swap LoRA (633 MB)
 5. Install LanPaint custom node
-6. Download `main.py` and start the API
+6. Download LTX-2.3 22B checkpoint (27 GB)
+7. Download LTX-2.3 LoRAs + Gemma text encoder + upscaler (~17 GB)
+8. Download `main.py` and start the API on port 7860
 
-**First deploy: ~10-15 min** (downloading ~28GB of models).
-**Subsequent restarts: ~1 min** (models cached on volume).
+**First deploy: ~30–45 min** (downloading ~72 GB of models).
+**Subsequent restarts: ~1–2 min** (models cached on volume).
 
-### 4. Monitor Progress
+### 5. Monitor Progress
 Open the Jupyter terminal (port 8888) and run:
 ```bash
 tail -f /workspace/api_setup.log
 ```
 
-### 5. Verify
+If the file doesn't exist, the start command never ran — verify step 3 above.
+
+### 6. Verify
 ```
 https://YOUR_POD_ID-7860.proxy.runpod.net/health
 https://YOUR_POD_ID-7860.proxy.runpod.net/docs
@@ -204,14 +232,19 @@ cd /workspace/ComfyUI && nohup /opt/venv/bin/python main.py \
 
 ---
 
-## Models (~28GB total)
+## Models (~72 GB total)
 
-| Model | Size | Purpose |
-|-------|------|---------|
-| flux2-klein-9b | 18GB | FLUX UNET (image gen + head swap) |
-| qwen_3_8b_fp8mixed | 8.7GB | Text encoder |
-| bfs_head_v1 LoRA | 663MB | Head swap LoRA |
-| flux2-vae | 336MB | VAE decoder |
+| Model | Size | Purpose | HF token |
+|-------|------|---------|----------|
+| FLUX.2 Klein 9B UNET | 18 GB | Image gen + head swap | Yes (gated) |
+| FLUX VAE | 321 MB | VAE decoder | No |
+| Qwen 3 8B text encoder | 8.1 GB | FLUX text encoder | No |
+| BFS Head Swap LoRA | 633 MB | Head swap LoRA | No |
+| LTX-2.3 22B checkpoint | 27 GB | Video gen | Yes (gated) |
+| LTX-2.3 distilled LoRA | 7.1 GB | LTX speed LoRA | No |
+| Gemma abliterated LoRA | 599 MB | LTX prompt LoRA | No |
+| Gemma 3 12B text encoder | 8.8 GB | LTX text encoder | No |
+| LTX-2.3 spatial upscaler | 950 MB | 2× spatial upscaler | No |
 
 ## File Structure on Pod
 
