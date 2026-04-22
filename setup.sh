@@ -23,6 +23,18 @@
 LOG="/workspace/api_setup.log"
 log() { echo "[$(date '+%H:%M:%S')] $1" | tee -a $LOG; }
 
+# ─────────────────────────────────────────────
+# Single-instance lock. Prevents two setups colliding on aria2 partial
+# files, duplicate /start.sh patches, or racing supervisor launches when
+# e.g. an SSH session re-runs setup.sh while the template boot is still
+# running. Exits 0 (no-op) if another setup is already in progress.
+# ─────────────────────────────────────────────
+exec 8>/var/lock/ai-gen-api-v2-setup.lock
+if ! flock -n 8; then
+  log "setup.sh: another setup already in progress — exiting"
+  exit 0
+fi
+
 API_REPO="https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main"
 
 # ─────────────────────────────────────────────
@@ -314,8 +326,14 @@ patch_start_sh() {
   # Insert hook right after ComfyUI is launched (line: `python main.py $FIXED_ARGS &`),
   # before the `wait $COMFY_PID` call. setsid + nohup + </dev/null fully detaches so
   # the supervisor survives SSH disconnect, shell exit, and session teardown.
+  #
+  # Use atomic rename (write-new-then-mv) so the currently-running /start.sh
+  # (which may still be reading the script — it's `bash /start.sh` under the
+  # container CMD) isn't truncated mid-read. Processes holding the old inode
+  # via their open fd continue reading the old content; new invocations see
+  # the new file.
   python3 - "$f" <<'PYEOF'
-import sys, re
+import os, sys, re
 p = sys.argv[1]
 src = open(p).read()
 hook = '''
@@ -333,23 +351,38 @@ m = re.search(r'^(python main\.py \$FIXED_ARGS &\s*\nCOMFY_PID=\$!\s*\n)', src, 
 if not m:
     sys.exit("could not locate ComfyUI launch block in /start.sh")
 out = src[:m.end()] + hook + src[m.end():]
-open(p, 'w').write(out)
+tmp = p + ".new"
+with open(tmp, "w") as fh:
+    fh.write(out)
+os.chmod(tmp, os.stat(p).st_mode)
+os.rename(tmp, p)
 PYEOF
   log "  /start.sh patched with API restart hook"
 }
 patch_start_sh
 
 # ─────────────────────────────────────────────
-# Start the API now (fully detached: setsid + nohup + closed stdin)
+# Start the API — but only if it isn't already healthy.
+#
+# On a pod restart, the /start.sh hook already launched start_api.sh in
+# parallel with setup.sh. If that supervisor is up and the health probe
+# passes, don't tear it down — a pointless relaunch would cause a ~10s
+# outage where uvicorn isn't bound to :7860.
+# Otherwise: kill any stale supervisor and start fresh.
 # ─────────────────────────────────────────────
-# Kill any stale supervisor so we don't race two while-loops over :7860.
-# Use -xf (exact-match on full cmdline) so we only kill processes whose
-# argv is literally "bash /workspace/start_api.sh" — never a caller shell
-# that merely mentions the string in its own command line.
-pkill -xf "bash /workspace/start_api.sh" 2>/dev/null || true
-sleep 1
-setsid nohup bash /workspace/start_api.sh </dev/null >>/workspace/api_setup.log 2>&1 &
-disown 2>/dev/null || true
+if pgrep -xf "bash /workspace/start_api.sh" >/dev/null 2>&1 && \
+   curl -s -m 3 http://localhost:7860/health 2>/dev/null | grep -q '"status":"ok"'; then
+  log "API supervisor already healthy — leaving it alone"
+else
+  # Use -xf (exact full-argv match) so we only kill processes whose argv
+  # is literally "bash /workspace/start_api.sh" — never a caller shell
+  # that merely mentions the string in its own command line.
+  pkill -xf "bash /workspace/start_api.sh" 2>/dev/null || true
+  sleep 1
+  setsid nohup bash /workspace/start_api.sh </dev/null >>/workspace/api_setup.log 2>&1 &
+  disown 2>/dev/null || true
+  log "API supervisor launched"
+fi
 
 log "=========================================="
 log "Setup Complete!"
