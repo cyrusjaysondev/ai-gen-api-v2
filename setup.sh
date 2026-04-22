@@ -214,14 +214,34 @@ CONFEOF
 # Create startup script (runs on every pod start/restart)
 cat > /workspace/start_api.sh << 'STARTEOF'
 #!/bin/bash
+# =============================================================
+# AI Gen API v2 — supervisor for uvicorn on :7860
+#
+# Safe to invoke multiple times: a flock guards the while-loop so
+# a second invocation (e.g. setup.sh re-running on pod restart)
+# exits immediately instead of racing the first supervisor.
+# =============================================================
 LOG="/workspace/api_setup.log"
-log() { echo "[$(date '+%H:%M:%S')] $1" | tee -a $LOG; }
+log() { echo "[$(date '+%H:%M:%S')] $1" | tee -a "$LOG"; }
 
-# Truncate old logs on restart
+# ─── single-instance guard ───
+# Hold an exclusive lock for the lifetime of this process. If another
+# supervisor is already running, exit 0 (not an error — it's a no-op).
+exec 9>/var/lock/ai-gen-api-v2.lock
+if ! flock -n 9; then
+  log "start_api.sh: another supervisor already running — exiting"
+  exit 0
+fi
+
+# Truncate old logs on restart (cap at last 500 lines each)
 tail -500 "$LOG" > "${LOG}.tmp" 2>/dev/null && mv "${LOG}.tmp" "$LOG"
 tail -500 /workspace/api.log > /workspace/api.log.tmp 2>/dev/null && mv /workspace/api.log.tmp /workspace/api.log
 
 # Load detected Python/pip paths
+if [ ! -f /workspace/api/config.env ]; then
+  log "ERROR: /workspace/api/config.env missing — setup.sh did not complete"
+  exit 1
+fi
 source /workspace/api/config.env
 
 # Reinstall pip deps (can be lost on pod restart)
@@ -230,9 +250,12 @@ $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | 
 
 # Always fetch latest main.py from repo on restart
 log "Fetching latest API code..."
-wget -q -O /workspace/api/main.py "${API_REPO}/main.py"
-if [ ! -s "/workspace/api/main.py" ]; then
-  log "ERROR: Failed to download main.py — using existing version"
+wget -q -O /workspace/api/main.py.new "${API_REPO}/main.py"
+if [ -s "/workspace/api/main.py.new" ]; then
+  mv /workspace/api/main.py.new /workspace/api/main.py
+else
+  log "WARN: Failed to download main.py — using existing version"
+  rm -f /workspace/api/main.py.new
 fi
 
 # Wait for ComfyUI to be ready
@@ -244,7 +267,7 @@ until curl -s http://localhost:8188/system_stats > /dev/null 2>&1; do
 done
 log "ComfyUI ready after ${WAITED}s"
 
-# Kill any stale API process
+# Kill any stale uvicorn (previous supervisor exited but child survived)
 pkill -f "uvicorn main:app" 2>/dev/null || true
 sleep 1
 
@@ -261,8 +284,61 @@ STARTEOF
 
 chmod +x /workspace/start_api.sh
 
-# Start the API now
-nohup bash /workspace/start_api.sh >> /workspace/api_setup.log 2>&1 & disown
+# ─────────────────────────────────────────────
+# Patch /start.sh (idempotent) so pod RESTARTS also auto-launch the API.
+#
+# /start.sh is the image's CMD — RunPod runs it on every pod start.
+# Without this hook, a restart would bring up ComfyUI but not the API,
+# forcing manual `bash /workspace/start_api.sh` each time.
+#
+# The patch is injected on the container layer (/start.sh is not on the
+# /workspace volume). It survives pod restarts but is lost on pod
+# recreate/rebuild — setup.sh re-applies it on every run, so as long as
+# setup.sh is in the template Start Command, the hook self-heals.
+# ─────────────────────────────────────────────
+patch_start_sh() {
+  local f="/start.sh"
+  [ -f "$f" ] || { log "  /start.sh not found — skipping restart hook"; return; }
+  if grep -q "AI Gen API v2 auto-start hook" "$f"; then
+    log "  /start.sh already has restart hook"
+    return
+  fi
+  # Insert hook right after ComfyUI is launched (line: `python main.py $FIXED_ARGS &`),
+  # before the `wait $COMFY_PID` call. setsid + nohup + </dev/null fully detaches so
+  # the supervisor survives SSH disconnect, shell exit, and session teardown.
+  python3 - "$f" <<'PYEOF'
+import sys, re
+p = sys.argv[1]
+src = open(p).read()
+hook = '''
+# === AI Gen API v2 auto-start hook ===
+# Launches /workspace/start_api.sh in a detached session so the API
+# supervisor survives shell exit, SSH disconnect, and /start.sh teardown.
+# start_api.sh itself waits for ComfyUI before binding :7860.
+if [ -x /workspace/start_api.sh ]; then
+    echo "AI Gen API v2: launching /workspace/start_api.sh"
+    setsid nohup bash /workspace/start_api.sh </dev/null >>/workspace/api_setup.log 2>&1 &
+fi
+# === end AI Gen API v2 auto-start hook ===
+'''
+m = re.search(r'^(python main\.py \$FIXED_ARGS &\s*\nCOMFY_PID=\$!\s*\n)', src, re.M)
+if not m:
+    sys.exit("could not locate ComfyUI launch block in /start.sh")
+out = src[:m.end()] + hook + src[m.end():]
+open(p, 'w').write(out)
+PYEOF
+  log "  /start.sh patched with API restart hook"
+}
+patch_start_sh
+
+# ─────────────────────────────────────────────
+# Start the API now (fully detached: setsid + nohup + closed stdin)
+# ─────────────────────────────────────────────
+# Kill any stale supervisor so we don't race two while-loops over :7860.
+pkill -f "bash /workspace/start_api.sh" 2>/dev/null || true
+sleep 1
+setsid nohup bash /workspace/start_api.sh </dev/null >>/workspace/api_setup.log 2>&1 &
+disown 2>/dev/null || true
 
 log "=========================================="
 log "Setup Complete!"
@@ -272,7 +348,7 @@ log "  Health:   https://${RUNPOD_POD_ID}-7860.proxy.runpod.net/health"
 log "  Setup log: tail -f /workspace/api_setup.log"
 log "  API log:   tail -f /workspace/api.log"
 log ""
-log "  On pod restart, run: bash /workspace/start_api.sh &"
-log "  Or set template start command to:"
-log "    bash -c 'bash /workspace/start_api.sh &'"
+log "  Pod restarts auto-launch the API via /start.sh hook."
+log "  Manual relaunch (if needed):"
+log "    setsid nohup bash /workspace/start_api.sh </dev/null >>/workspace/api_setup.log 2>&1 &"
 log "=========================================="

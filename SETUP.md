@@ -29,10 +29,18 @@ Before starting, you need:
    ```
    HF_TOKEN = hf_your_token_here
    ```
-4. Under **Start Command**, paste:
+4. Under **Container Start Command**, paste:
    ```bash
-   bash -c "wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh &"
+   bash -c "/start.sh & sleep 3 && wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh; wait"
    ```
+
+   **Why this form:** the `runpod/comfyui:latest` image ships `/start.sh` as its entrypoint
+   (starts SSH, JupyterLab, FileBrowser, and ComfyUI). Setting a **Container Start Command**
+   in the template replaces that entrypoint, so you must re-invoke `/start.sh` yourself —
+   otherwise only `setup.sh` runs and SSH/ComfyUI never come up. This command runs
+   `/start.sh` in the background, waits briefly, then fetches and runs `setup.sh`. The
+   trailing `wait` keeps the container alive after `setup.sh` returns so `/start.sh`
+   (which ends in `sleep infinity`) continues supervising ComfyUI.
 5. Save the template.
 
 ---
@@ -192,29 +200,36 @@ All LTX video endpoints (`/ltx/i2v`, `/ltx/t2v`, `/face-animate`) support `prese
 
 ## Pod Restart Behavior
 
-When a pod restarts, you need to start the API again. The setup script creates `/workspace/start_api.sh` which handles everything:
+**You don't have to do anything on pod restart** — the API comes back automatically.
 
-```bash
-bash /workspace/start_api.sh &
-```
+`setup.sh` patches the image's `/start.sh` with an idempotent hook that launches
+`/workspace/start_api.sh` (detached via `setsid nohup`) right after ComfyUI boots.
+So the boot chain on every pod restart is:
 
-**Or set your RunPod template start command to:**
-```bash
-bash -c "bash /workspace/start_api.sh &"
-```
+1. RunPod runs the template Start Command → invokes `/start.sh`
+2. `/start.sh` starts SSH, Jupyter, FileBrowser, and ComfyUI
+3. Patched hook in `/start.sh` launches `start_api.sh` in a detached session
+4. `start_api.sh` fetches the latest `main.py`, waits for ComfyUI, then starts uvicorn on :7860
+5. `start_api.sh` auto-restarts uvicorn if it crashes; `flock` prevents duplicate supervisors
 
-What `start_api.sh` does on every restart:
-1. Reinstalls pip dependencies (can be lost on restart)
-2. **Fetches the latest `main.py` from GitHub** — push to repo = deploy to all pods
-3. Waits for ComfyUI to be ready (up to 10 minutes)
-4. Starts the FastAPI server on port 7860
-5. **Auto-restarts the API if it crashes**
+The patch lives on the container layer (not `/workspace`), so it survives pod
+**restart** but is lost on pod **recreate/rebuild**. That's fine: the template Start
+Command always re-runs `setup.sh`, which re-applies the patch. Self-healing.
 
 ### Deploying API updates
 
 1. Push changes to `main.py` on GitHub
-2. Restart the pod (or run `bash /workspace/start_api.sh &`)
-3. The latest code is fetched automatically — no manual SSH needed
+2. Restart the pod — `start_api.sh` fetches the latest `main.py` automatically
+3. No SSH, no manual redeploy step
+
+### Manually relaunching (only if you skipped the restart)
+
+```bash
+setsid nohup bash /workspace/start_api.sh </dev/null >>/workspace/api_setup.log 2>&1 &
+```
+
+Plain `bash /workspace/start_api.sh &` also works from an interactive shell, but will
+die if the shell exits. `setsid nohup … </dev/null &` fully detaches.
 
 ---
 
@@ -233,7 +248,7 @@ What `start_api.sh` does on every restart:
 | GPU | RTX 5090 (32 GB) or A100 (80 GB) |
 | Volume | 200 GB (persistent across restarts) |
 | Ports | 7860 (API), 8188 (ComfyUI), 8888 (Jupyter) |
-| Start command | `bash -c "bash /workspace/start_api.sh &"` |
+| Start command | `bash -c "/start.sh & sleep 3 && wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh; wait"` |
 
 ---
 
@@ -286,11 +301,21 @@ Make sure you have accepted both model licenses (see Prerequisites above).
 Ensure you've accepted the license at https://huggingface.co/Lightricks/LTX-2.3-fp8
 
 **API crashed and not restarting**
-The `start_api.sh` has an auto-restart loop. Check if the script is running:
+The `start_api.sh` has an auto-restart loop. Check if the supervisor is running:
 ```bash
-ps aux | grep start_api
+ps aux | grep -v grep | grep start_api
 # If not running:
-bash /workspace/start_api.sh &
+setsid nohup bash /workspace/start_api.sh </dev/null >>/workspace/api_setup.log 2>&1 &
+```
+
+**API didn't come back after pod restart**
+Confirm the `/start.sh` hook is in place (it should be, after `setup.sh` ran once):
+```bash
+grep -A2 "AI Gen API v2 auto-start" /start.sh
+```
+If the hook is missing, re-run setup to re-apply it:
+```bash
+wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh
 ```
 
 ---
