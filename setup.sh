@@ -79,96 +79,104 @@ log "ComfyUI: $COMFY_ROOT"
 log "Python: $PYTHON"
 log "=========================================="
 
-# Helper: download with size check and cleanup on failure
-download_file() {
-  local URL="$1"
-  local DEST="$2"
-  local LABEL="$3"
-  local HF_TOKEN="$4"
-
-  if [ -s "$DEST" ]; then
-    log "  $LABEL already exists, skipping"
-    return 0
-  fi
-
-  # Remove empty/partial file if present
-  [ -f "$DEST" ] && rm -f "$DEST"
-
-  log "  Downloading $LABEL..."
-  if [ -n "$HF_TOKEN" ]; then
-    wget -q --show-progress --header="Authorization: Bearer $HF_TOKEN" -O "$DEST" "$URL"
-  else
-    wget -q --show-progress -O "$DEST" "$URL"
-  fi
-
-  if [ ! -s "$DEST" ]; then
-    log "  ERROR: $LABEL download failed or produced empty file"
-    rm -f "$DEST"
-    return 1
-  fi
-  log "  $LABEL downloaded"
-}
-
 # ─────────────────────────────────────────────
-# 1. Pip dependencies
+# 1. Pip dependencies + aria2 (for parallel model downloads)
 # ─────────────────────────────────────────────
-log "[1/8] Installing pip dependencies..."
+log "[1/4] Installing pip dependencies + aria2..."
 $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | tail -1
+
+if ! command -v aria2c >/dev/null 2>&1; then
+  log "  Installing aria2..."
+  apt-get update -qq 2>&1 | tail -1
+  apt-get install -y -qq aria2 2>&1 | tail -1
+fi
+
+if ! command -v aria2c >/dev/null 2>&1; then
+  log "  FATAL: aria2 install failed. Cannot do parallel downloads."
+  exit 1
+fi
 log "  Done"
 
 # ─────────────────────────────────────────────
-# 2. FLUX.2 Klein 9B UNET (~18GB) — requires HF token + license
+# 2. Download all models in parallel via aria2
+#    (Previously 6 serial wget phases → single parallel phase.
+#     HF CDN routing + 16 connections/file yields 200–500 MB/s
+#     vs ~1 MB/s serial wget. Full 72 GB in ~3–10 min, not hours.)
 # ─────────────────────────────────────────────
-log "[2/8] FLUX.2 Klein 9B UNET..."
-mkdir -p "$MODELS/diffusion_models"
-FLUX_UNET="$MODELS/diffusion_models/flux2-klein-9b.safetensors"
-download_file \
-  "https://huggingface.co/black-forest-labs/FLUX.2-klein-9B/resolve/main/flux-2-klein-9b.safetensors" \
-  "$FLUX_UNET" \
-  "FLUX Klein 9B UNET (18GB)" \
-  "$TOKEN"
+log "[2/4] Downloading models (parallel, ~72 GB total)..."
+mkdir -p "$MODELS/diffusion_models" "$MODELS/vae" "$MODELS/text_encoders" \
+         "$MODELS/loras" "$MODELS/checkpoints" "$MODELS/latent_upscale_models"
 
-if [ $? -ne 0 ]; then
-  log "  FATAL: FLUX UNET download failed. Check your HF_TOKEN has access to black-forest-labs/FLUX.2-klein-9B"
+ARIA2_INPUT="/tmp/ai-gen-api-v2-downloads.txt"
+cat > "$ARIA2_INPUT" <<EOF
+https://huggingface.co/black-forest-labs/FLUX.2-klein-9B/resolve/main/flux-2-klein-9b.safetensors
+  dir=$MODELS/diffusion_models
+  out=flux2-klein-9b.safetensors
+https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/vae/flux2-vae.safetensors
+  dir=$MODELS/vae
+  out=flux2-vae.safetensors
+https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors
+  dir=$MODELS/text_encoders
+  out=qwen_3_8b_fp8mixed.safetensors
+https://huggingface.co/Alissonerdx/BFS-Best-Face-Swap/resolve/main/bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors
+  dir=$MODELS/loras
+  out=bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors
+https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors
+  dir=$MODELS/checkpoints
+  out=ltx-2.3-22b-dev-fp8.safetensors
+https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384.safetensors
+  dir=$MODELS/loras
+  out=ltx-2.3-22b-distilled-lora-384.safetensors
+https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors
+  dir=$MODELS/loras
+  out=gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors
+https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors
+  dir=$MODELS/text_encoders
+  out=gemma_3_12B_it_fp4_mixed.safetensors
+https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.0.safetensors
+  dir=$MODELS/latent_upscale_models
+  out=ltx-2.3-spatial-upscaler-x2-1.0.safetensors
+EOF
+
+# HF token is passed as an Authorization header for all requests.
+# Public repos ignore it; gated repos (FLUX.2, LTX-2.3-fp8) require it.
+# --continue=true skips fully-downloaded files and resumes partials,
+# so rerunning this script after a network blip is a no-op for done files.
+aria2c \
+  --input-file="$ARIA2_INPUT" \
+  --header="Authorization: Bearer $TOKEN" \
+  --max-connection-per-server=16 \
+  --split=16 \
+  --min-split-size=10M \
+  --max-concurrent-downloads=3 \
+  --continue=true \
+  --allow-overwrite=true \
+  --auto-file-renaming=false \
+  --file-allocation=none \
+  --console-log-level=warn \
+  --summary-interval=30 \
+  2>&1 | tee -a "$LOG" | grep -E "Download complete|error|FAILED" || true
+
+ARIA2_EXIT=${PIPESTATUS[0]}
+if [ $ARIA2_EXIT -ne 0 ]; then
+  log "  FATAL: aria2 exited with code $ARIA2_EXIT. Check HF token has access to:"
+  log "    - black-forest-labs/FLUX.2-klein-9B"
+  log "    - Lightricks/LTX-2.3-fp8"
   exit 1
 fi
 
-# Symlink so both filenames resolve (workflow references flux-2-klein-9b.safetensors)
-ln -sf "$FLUX_UNET" "$MODELS/diffusion_models/flux-2-klein-9b.safetensors"
+# Symlink so both filenames resolve (some workflows reference flux-2-klein-9b.safetensors)
+ln -sf "$MODELS/diffusion_models/flux2-klein-9b.safetensors" \
+       "$MODELS/diffusion_models/flux-2-klein-9b.safetensors"
+
+log "  All 9 models downloaded"
 
 # ─────────────────────────────────────────────
-# 3. FLUX VAE + Qwen text encoder
-# ─────────────────────────────────────────────
-log "[3/8] FLUX VAE + Qwen text encoder..."
-mkdir -p "$MODELS/vae" "$MODELS/text_encoders"
-
-download_file \
-  "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/vae/flux2-vae.safetensors" \
-  "$MODELS/vae/flux2-vae.safetensors" \
-  "FLUX VAE (321MB)"
-
-download_file \
-  "https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors" \
-  "$MODELS/text_encoders/qwen_3_8b_fp8mixed.safetensors" \
-  "Qwen 3 8B text encoder (8.1GB)"
-
-# ─────────────────────────────────────────────
-# 4. BFS Head Swap LoRA
-# ─────────────────────────────────────────────
-log "[4/8] BFS Head Swap LoRA..."
-mkdir -p "$MODELS/loras"
-
-download_file \
-  "https://huggingface.co/Alissonerdx/BFS-Best-Face-Swap/resolve/main/bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors" \
-  "$MODELS/loras/bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors" \
-  "BFS head swap LoRA (633MB)"
-
-# ─────────────────────────────────────────────
-# 5. LanPaint custom node (required for face swap)
+# 3. LanPaint custom node (required for FLUX face swap)
 # ─────────────────────────────────────────────
 mkdir -p "$NODES"
 if [ ! -d "$NODES/LanPaint" ]; then
-  log "[5/8] Installing LanPaint custom node..."
+  log "[3/4] Installing LanPaint custom node..."
   (
     cd "$NODES"
     git clone -q https://github.com/scraed/LanPaint
@@ -178,55 +186,13 @@ if [ ! -d "$NODES/LanPaint" ]; then
   )
   log "  LanPaint installed"
 else
-  log "[5/8] LanPaint already exists"
+  log "[3/4] LanPaint already installed"
 fi
 
 # ─────────────────────────────────────────────
-# 6. LTX-2.3 Checkpoint (~27GB) — requires HF token + license
+# 4. Download API + create startup scripts
 # ─────────────────────────────────────────────
-log "[6/8] LTX-2.3 checkpoint..."
-mkdir -p "$MODELS/checkpoints"
-download_file \
-  "https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors" \
-  "$MODELS/checkpoints/ltx-2.3-22b-dev-fp8.safetensors" \
-  "LTX-2.3 22B dev fp8 (27GB)" \
-  "$TOKEN"
-
-if [ $? -ne 0 ]; then
-  log "  FATAL: LTX-2.3 checkpoint download failed. Check your HF_TOKEN has access to Lightricks/LTX-2.3-fp8"
-  exit 1
-fi
-
-# ─────────────────────────────────────────────
-# 7. LTX-2.3 LoRAs + text encoder + spatial upscaler
-# ─────────────────────────────────────────────
-log "[7/8] LTX-2.3 LoRAs + text encoder + upscaler..."
-mkdir -p "$MODELS/loras" "$MODELS/text_encoders" "$MODELS/latent_upscale_models"
-
-download_file \
-  "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384.safetensors" \
-  "$MODELS/loras/ltx-2.3-22b-distilled-lora-384.safetensors" \
-  "LTX-2.3 distilled LoRA (7.1GB)"
-
-download_file \
-  "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors" \
-  "$MODELS/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors" \
-  "Gemma abliterated LoRA (599MB)"
-
-download_file \
-  "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors" \
-  "$MODELS/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors" \
-  "Gemma 3 12B text encoder (8.8GB)"
-
-download_file \
-  "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.0.safetensors" \
-  "$MODELS/latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.0.safetensors" \
-  "LTX-2.3 spatial upscaler (950MB)"
-
-# ─────────────────────────────────────────────
-# 8. Download API + create startup scripts
-# ─────────────────────────────────────────────
-log "[8/8] Setting up API..."
+log "[4/4] Setting up API..."
 mkdir -p /workspace/api
 
 # Always fetch latest main.py from repo
