@@ -56,7 +56,8 @@ Before starting, you need:
 
 ## Step 3 — Monitor Setup Progress
 
-The setup script runs automatically in the background and downloads ~72 GB of models. Track progress via the Jupyter terminal (port 8888):
+The setup runs automatically as part of the Container Start Command. Open the Jupyter
+terminal (port 8888) — or SSH in — and tail the log:
 
 ```bash
 tail -f /workspace/api_setup.log
@@ -64,22 +65,31 @@ tail -f /workspace/api_setup.log
 
 You should see output like:
 ```
+[HH:MM:SS] ==========================================
 [HH:MM:SS] AI Gen API v2 Setup Started
-[HH:MM:SS] [1/8] Installing pip dependencies...
-[HH:MM:SS] [2/8] FLUX.2 Klein 9B UNET...
-[HH:MM:SS]   Downloading FLUX Klein 9B UNET (18GB)...
-[HH:MM:SS] [3/8] FLUX VAE + Qwen text encoder...
-[HH:MM:SS] [4/8] BFS Head Swap LoRA...
-[HH:MM:SS] [5/8] Installing LanPaint custom node...
-[HH:MM:SS] [6/8] LTX-2.3 checkpoint...
-[HH:MM:SS]   Downloading LTX-2.3 22B dev fp8 (27GB)...
-[HH:MM:SS] [7/8] LTX-2.3 LoRAs + text encoder + upscaler...
-[HH:MM:SS] [8/8] Setting up API...
+[HH:MM:SS] Pod ID: xxxxxxxxxxxxxxxx
+[HH:MM:SS] ComfyUI: /workspace/runpod-slim/ComfyUI
+[HH:MM:SS] Python: /workspace/runpod-slim/ComfyUI/.venv-cu128/bin/python
+[HH:MM:SS] ==========================================
+[HH:MM:SS] [1/4] Installing pip dependencies + aria2...
+[HH:MM:SS]   Done
+[HH:MM:SS] [2/4] Downloading models (parallel, ~72 GB total)...
+[HH:MM:SS]   Download complete: /workspace/runpod-slim/ComfyUI/models/...
+[HH:MM:SS]   All 9 models downloaded
+[HH:MM:SS] [3/4] Installing LanPaint custom node...
+[HH:MM:SS] [4/4] Setting up API...
+[HH:MM:SS]   main.py downloaded (latest)
+[HH:MM:SS]   /start.sh patched with API restart hook
+[HH:MM:SS] API supervisor launched
 [HH:MM:SS] Setup Complete!
 ```
 
-**First deploy takes ~30–45 minutes** (downloading ~72 GB of models).
-**Subsequent restarts take ~1–2 minutes** (models already on volume, skip downloads).
+**First deploy: ~3–10 minutes** on a warm HuggingFace CDN. The 9 model files are
+pulled in parallel via aria2 (16 connections/file), which typically saturates the
+pod's network link.
+**Subsequent deploys / pod restarts: ~10–20 seconds.** Models are cached on the
+`/workspace` volume; aria2 just verifies sizes and skips. `setup.sh` is idempotent
+and skips every step whose work is already done.
 
 ---
 
@@ -280,14 +290,15 @@ tail -50 /workspace/api_setup.log
 
 **API not responding on port 7860**
 ```bash
-# Check if API process is running
-ps aux | grep uvicorn
+# Check if the supervisor + uvicorn are alive
+pgrep -xaf "bash /workspace/start_api.sh"
+netstat -tlnp 2>/dev/null | grep :7860
 
 # Check API logs
 tail -50 /workspace/api.log
 
-# Manually restart
-bash /workspace/start_api.sh &
+# Manually relaunch the supervisor (fully detached — survives shell exit)
+setsid nohup bash /workspace/start_api.sh </dev/null >>/workspace/api_setup.log 2>&1 &
 ```
 
 **Job stuck in `processing`**

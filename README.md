@@ -40,23 +40,26 @@ HF_TOKEN = hf_your_token_here
 In the template, paste this as the **Container Start Command**:
 
 ```bash
-bash -c "wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh &"
+bash -c "/start.sh & sleep 3 && wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh; wait"
 ```
 
+> **Why this exact form:** the `runpod/comfyui:latest` image ships `/start.sh` as its
+> entrypoint (starts SSH, JupyterLab, FileBrowser, and ComfyUI). A Container Start
+> Command replaces that entrypoint, so you must re-invoke `/start.sh` yourself in the
+> background, otherwise SSH and ComfyUI never come up. The trailing `wait` keeps the
+> container alive after `setup.sh` finishes so `/start.sh` (which ends in
+> `sleep infinity`) continues supervising ComfyUI.
+
 ### 4. Deploy and Wait
-Click Deploy. The setup script will download models and start the API:
+Click Deploy. `setup.sh` runs 4 steps:
 
-1. Install pip dependencies
-2. Download FLUX.2 Klein 9B UNET (18 GB)
-3. Download FLUX VAE + Qwen 3 8B text encoder (~8.4 GB)
-4. Download BFS head swap LoRA (633 MB)
-5. Install LanPaint custom node
-6. Download LTX-2.3 22B checkpoint (27 GB)
-7. Download LTX-2.3 LoRAs + Gemma text encoder + upscaler (~17 GB)
-8. Download `main.py` and start the API on port 7860
+1. **Install pip deps + aria2** (~5 s)
+2. **Download all 9 models in parallel via aria2** (~72 GB; resumable, skips anything already on the volume)
+3. **Install LanPaint custom node** (skipped if already present)
+4. **Fetch `main.py`, patch `/start.sh` with the restart hook, launch the API supervisor**
 
-**First deploy: ~30–45 min** (downloading ~72 GB of models).
-**Subsequent restarts: ~1–2 min** (models cached on volume).
+**First deploy: ~3–10 minutes** on a warm HuggingFace CDN (parallel aria2 at 200–500 MB/s beats serial wget by 30–50×).
+**Subsequent deploys / pod restarts: ~10–20 seconds** — models are already on the volume, so aria2 just verifies and skips.
 
 ### 5. Monitor Progress
 Open the Jupyter terminal (port 8888) and run:
@@ -202,16 +205,24 @@ tail -20 /workspace/api.log
 ```
 
 ### Manual start (if auto-start fails)
-```bash
-# Install deps
-pip install -q fastapi uvicorn httpx websockets python-multipart
+The supervisor script handles everything (deps, fetch `main.py`, wait for ComfyUI,
+launch uvicorn with auto-restart on crash). Launch it fully detached:
 
-# Start API (from Jupyter terminal so it survives)
-cd /workspace/api && nohup /opt/venv/bin/python -m uvicorn main:app \
-  --host 0.0.0.0 --port 7860 >> /workspace/api.log 2>&1 & disown
+```bash
+setsid nohup bash /workspace/start_api.sh </dev/null >>/workspace/api_setup.log 2>&1 &
 
 # Verify
-sleep 2 && curl http://localhost:7860/health
+sleep 10 && curl http://localhost:7860/health
+```
+
+### API didn't come back after pod restart
+Confirm the `/start.sh` hook is in place (`setup.sh` installs it on first run):
+```bash
+grep -c "AI Gen API v2 auto-start" /start.sh    # should print 2
+```
+If missing (pod was recreated/rebuilt, not just restarted), re-run setup:
+```bash
+wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh
 ```
 
 ### main.py failed to download
@@ -225,9 +236,10 @@ wget -O /workspace/api/main.py \
 # Check GPU
 nvidia-smi
 
-# Restart ComfyUI
-cd /workspace/ComfyUI && nohup /opt/venv/bin/python main.py \
-  --listen --port 8188 >> /workspace/comfyui.log 2>&1 & disown
+# Restart ComfyUI (same command /start.sh uses)
+cd /workspace/runpod-slim/ComfyUI && \
+  nohup .venv-cu128/bin/python main.py --listen 0.0.0.0 --port 8188 \
+    --enable-cors-header >> /workspace/comfyui.log 2>&1 & disown
 ```
 
 ---
@@ -252,15 +264,23 @@ cd /workspace/ComfyUI && nohup /opt/venv/bin/python main.py \
 /workspace/
   api/
     main.py              # FastAPI app
-  start_api.sh           # Auto-start script
+    config.env           # detected Python/pip/ComfyUI paths
+  start_api.sh           # Supervisor: flock-guarded while-loop around uvicorn
   api.log                # API runtime log
-  api_setup.log          # Setup progress log
-  ComfyUI/
-    models/
-      diffusion_models/  # FLUX UNET
-      vae/               # FLUX VAE
-      text_encoders/     # Qwen 3 8B
-      loras/             # BFS head swap LoRA
-    custom_nodes/
-      LanPaint/          # FLUX head swap nodes
+  api_setup.log          # Setup + supervisor progress log
+  runpod-slim/
+    ComfyUI/             # the runpod/comfyui:latest image's ComfyUI tree
+      .venv-cu128/       # Python venv (used by both ComfyUI and API)
+      models/
+        diffusion_models/  # FLUX UNET
+        vae/               # FLUX VAE
+        text_encoders/     # Qwen 3 8B, Gemma 12B
+        loras/             # BFS, distilled LTX, Gemma abliterated
+        checkpoints/       # LTX 2.3 22B
+        latent_upscale_models/  # LTX spatial upscaler
+      custom_nodes/
+        LanPaint/          # FLUX head swap nodes
+
+/start.sh                # container entrypoint; patched by setup.sh to
+                         # auto-launch start_api.sh after ComfyUI boots
 ```
