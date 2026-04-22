@@ -267,9 +267,17 @@ until curl -s http://localhost:8188/system_stats > /dev/null 2>&1; do
 done
 log "ComfyUI ready after ${WAITED}s"
 
-# Kill any stale uvicorn (previous supervisor exited but child survived)
-pkill -f "uvicorn main:app" 2>/dev/null || true
-sleep 1
+# Free :7860 if a stale uvicorn from a prior supervisor is holding it.
+# Target by socket owner (netstat) — safer than pkill -f against an argv
+# pattern, which can accidentally match caller shells whose cmdline
+# happens to contain "uvicorn main:app" as a substring.
+STALE_PID=$(netstat -tlnp 2>/dev/null | awk '$4 ~ /:7860$/ {split($7, a, "/"); print a[1]; exit}')
+if [ -n "$STALE_PID" ]; then
+  log "Freeing :7860 (stale owner PID=$STALE_PID)"
+  kill "$STALE_PID" 2>/dev/null || true
+  for _ in 1 2 3 4 5; do kill -0 "$STALE_PID" 2>/dev/null || break; sleep 1; done
+  kill -9 "$STALE_PID" 2>/dev/null || true
+fi
 
 # Start API with auto-restart on crash
 cd /workspace/api || exit 1
@@ -335,7 +343,10 @@ patch_start_sh
 # Start the API now (fully detached: setsid + nohup + closed stdin)
 # ─────────────────────────────────────────────
 # Kill any stale supervisor so we don't race two while-loops over :7860.
-pkill -f "bash /workspace/start_api.sh" 2>/dev/null || true
+# Use -xf (exact-match on full cmdline) so we only kill processes whose
+# argv is literally "bash /workspace/start_api.sh" — never a caller shell
+# that merely mentions the string in its own command line.
+pkill -xf "bash /workspace/start_api.sh" 2>/dev/null || true
 sleep 1
 setsid nohup bash /workspace/start_api.sh </dev/null >>/workspace/api_setup.log 2>&1 &
 disown 2>/dev/null || true
