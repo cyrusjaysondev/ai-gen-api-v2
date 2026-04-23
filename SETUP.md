@@ -96,6 +96,32 @@ and skips every step whose work is already done.
 
 ---
 
+## Step 3b — Manual fallback (if auto-setup didn't trigger)
+
+If a couple of minutes pass and `/workspace/api_setup.log` shows **no new `AI Gen API v2 Setup Started` line at the current time**, the template's Container Start Command didn't fire — most commonly because the field is empty or was set to an earlier, broken form. Signs:
+
+- `curl https://<pod>-7860.proxy.runpod.net/health` returns **502** (not 503).
+- ComfyUI on `:8188` works, but `:7860` silent.
+- `tail -f /workspace/api_setup.log` is frozen on old timestamps.
+
+**Run `setup.sh` manually** — SSH in (or open a Jupyter terminal) and paste these as **two separate commands**, pressing Enter after each:
+
+```bash
+wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh
+```
+
+```bash
+bash /tmp/setup.sh
+```
+
+> **Why two lines and not one `&&`-chained line?** Some terminals wrap long commands at inconvenient points when you paste them, which splits `&& bash` from its argument and leaves you dropped into a nested interactive shell. Two separate commands can't be split that way.
+
+Setup finishes in ~15–20 s on a volume with cached models (first-ever deploy: 3–10 min while it downloads 72 GB). `setup.sh` also patches `/start.sh` with a restart hook, so **subsequent pod restarts of this same pod** will auto-start the API without you running anything — even without a template fix. The template Start Command only matters for **fresh pods** (new container, new or reused volume).
+
+Then go fix the template so your next fresh pod is truly hands-off — see [the template troubleshooting block](#api-didnt-come-back-after-pod-restart).
+
+---
+
 ## Step 4 — Verify the API is Running
 
 Once setup completes, check the health endpoint:
@@ -325,12 +351,40 @@ setsid nohup bash /workspace/start_api.sh </dev/null >>/workspace/api_setup.log 
 **API didn't come back after pod restart**
 Confirm the `/start.sh` hook is in place (it should be, after `setup.sh` ran once):
 ```bash
-grep -A2 "AI Gen API v2 auto-start" /start.sh
+grep -c "AI Gen API v2 auto-start" /start.sh    # should print 2
 ```
-If the hook is missing, re-run setup to re-apply it:
+If the hook is missing, re-run setup to re-apply it (two separate commands):
 ```bash
-wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh
+wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh
 ```
+```bash
+bash /tmp/setup.sh
+```
+
+**`:7860` returns 502 on a brand-new pod (auto-setup never ran)**
+This happens when your template's **Container Start Command** is empty or wrong, so
+only the image's default `/start.sh` ran. ComfyUI (`:8188`) and Jupyter (`:8888`) will
+be up but `:7860` stays 502 — and `/workspace/api_setup.log` will have no new entries
+at the current time.
+
+Quick check on the pod:
+```bash
+# If the log stops at an old timestamp, setup.sh never fired
+tail -5 /workspace/api_setup.log && date -u
+```
+
+Two fixes:
+
+1. **Unblock this pod right now** — follow [Step 3b](#step-3b--manual-fallback-if-auto-setup-didnt-trigger) to run setup.sh manually. Takes ~15 s if the volume has cached models.
+
+2. **Fix the template for future pods** — open runpod.io → Templates → edit your
+   template → **Container Start Command**. Paste this single line (copy exactly, no
+   wrapping):
+
+   ```
+   bash -c "wget -qO /tmp/boot.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/boot.sh && bash /tmp/boot.sh"
+   ```
+   Save the template. Next fresh pod deploys hands-off.
 
 ---
 

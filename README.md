@@ -67,7 +67,33 @@ Open the Jupyter terminal (port 8888) and run:
 tail -f /workspace/api_setup.log
 ```
 
-If the file doesn't exist, the start command never ran — verify step 3 above.
+You should see a fresh `AI Gen API v2 Setup Started` line with the current timestamp.
+Healthy states (live on `/health` via the proxy):
+- **HTTP 503 + `{"status":"installing", …}`** — setup is running, status server is bound. Wait for 200.
+- **HTTP 200 + `{"status":"ok", …}`** — API is ready.
+- **HTTP 502** for more than ~30 s — auto-setup didn't fire. See next step.
+
+### 5b. Manual fallback (if `/health` stays 502 and log is silent)
+
+If `tail -f` shows only old timestamps from a previous pod's volume (no new
+`AI Gen API v2 Setup Started` line) and `:7860` stays 502, the template's Container
+Start Command didn't trigger. SSH in (or use the Jupyter terminal) and run these as
+**two separate commands** (pressing Enter after each):
+
+```bash
+wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh
+```
+```bash
+bash /tmp/setup.sh
+```
+
+> **Why not one line with `&&`?** Long pasted lines sometimes wrap mid-command in the
+> terminal and drop you into a nested shell. Two lines can't be split wrong.
+
+Setup finishes in ~15–20 s on a volume with cached models. It also patches
+`/start.sh` so that **restarts of this same pod** come back on their own — no manual
+step needed on subsequent restarts. For truly fresh pods, fix the template's Start
+Command (step 3 above) so the auto-path works next time.
 
 ### 6. Verify
 ```
