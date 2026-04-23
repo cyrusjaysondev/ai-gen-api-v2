@@ -38,6 +38,80 @@ fi
 API_REPO="https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main"
 
 # ─────────────────────────────────────────────
+# Bind :7860 IMMEDIATELY with an install-progress server so the proxy
+# returns 503 + a useful JSON body during setup — not a silent Cloudflare
+# 502. start_api.sh's STALE_PID logic will take the port cleanly when
+# it's ready to bind uvicorn.
+#
+# Skip if :7860 is already held by the real API supervisor (pod restart
+# with /start.sh hook) or if another status server is still alive.
+# ─────────────────────────────────────────────
+STATUS_PID_FILE=/var/run/ai-gen-api-v2-status.pid
+if [ -f "$STATUS_PID_FILE" ]; then
+  kill "$(cat "$STATUS_PID_FILE" 2>/dev/null)" 2>/dev/null || true
+  rm -f "$STATUS_PID_FILE"
+  sleep 0.5
+fi
+
+if pgrep -xf "bash /workspace/start_api.sh" >/dev/null 2>&1; then
+  log "start_api.sh supervisor already running — skipping status server"
+elif netstat -tln 2>/dev/null | grep -q ":7860 "; then
+  log ":7860 already bound — skipping status server"
+else
+  cat > /tmp/ai-gen-api-v2-status.py <<'PYEOF'
+import http.server, socketserver, json, os, subprocess, signal, sys
+socketserver.ThreadingTCPServer.allow_reuse_address = True
+
+def recent_log():
+    try:
+        return subprocess.check_output(
+            ['tail', '-40', '/workspace/api_setup.log'],
+            text=True, timeout=2
+        ).splitlines()[-30:]
+    except Exception:
+        return []
+
+class H(http.server.BaseHTTPRequestHandler):
+    def _send(self, code, body):
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
+    def do_GET(self):
+        payload = {
+            "status": "installing",
+            "message": (
+                "AI Gen API v2 is still setting up. First deploy downloads "
+                "~72 GB of models (3-10 min on warm HF CDN). /health will "
+                "return HTTP 200 once uvicorn is bound."
+            ),
+            "pod_id": os.environ.get('RUNPOD_POD_ID', 'unknown'),
+            "hint": "tail -f /workspace/api_setup.log",
+            "recent_log": recent_log(),
+        }
+        self._send(503, json.dumps(payload, indent=2).encode())
+
+signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+try:
+    with socketserver.ThreadingTCPServer(("0.0.0.0", 7860), H) as srv:
+        srv.serve_forever()
+except OSError:
+    # port already taken (another instance or the real uvicorn grabbed it)
+    sys.exit(0)
+PYEOF
+  setsid nohup python3 /tmp/ai-gen-api-v2-status.py </dev/null >/dev/null 2>&1 &
+  echo $! > "$STATUS_PID_FILE"
+  sleep 0.5
+  if kill -0 "$(cat "$STATUS_PID_FILE")" 2>/dev/null; then
+    log "Status server bound :7860 — /health returns 503 + install progress until API ready"
+  else
+    log "WARN: status server failed to start (port taken?) — continuing"
+    rm -f "$STATUS_PID_FILE"
+  fi
+fi
+
+# ─────────────────────────────────────────────
 # HF Token (required for gated model downloads)
 # ─────────────────────────────────────────────
 TOKEN="${HF_TOKEN:-$HUGGING_FACE_HUB_TOKEN}"

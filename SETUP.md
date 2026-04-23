@@ -29,18 +29,21 @@ Before starting, you need:
    ```
    HF_TOKEN = hf_your_token_here
    ```
-4. Under **Container Start Command**, paste:
+4. Under **Container Start Command**, paste this **exactly** (single line):
    ```bash
-   bash -c "/start.sh & sleep 3 && wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh; wait"
+   bash -c "wget -qO /tmp/boot.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/boot.sh && bash /tmp/boot.sh"
    ```
 
-   **Why this form:** the `runpod/comfyui:latest` image ships `/start.sh` as its entrypoint
-   (starts SSH, JupyterLab, FileBrowser, and ComfyUI). Setting a **Container Start Command**
-   in the template replaces that entrypoint, so you must re-invoke `/start.sh` yourself —
-   otherwise only `setup.sh` runs and SSH/ComfyUI never come up. This command runs
-   `/start.sh` in the background, waits briefly, then fetches and runs `setup.sh`. The
-   trailing `wait` keeps the container alive after `setup.sh` returns so `/start.sh`
-   (which ends in `sleep infinity`) continues supervising ComfyUI.
+   > ⚠️ If you leave this field **empty**, the pod will only run the image's default
+   > entrypoint (`/start.sh`) — SSH/Jupyter/ComfyUI come up, but the API never installs
+   > and `:7860` stays 502. The Container Start Command is required.
+
+   **What `boot.sh` does:** `runpod/comfyui:latest` ships `/start.sh` as its entrypoint
+   (starts SSH, JupyterLab, FileBrowser, and ComfyUI). A Container Start Command replaces
+   that entrypoint, so `boot.sh` re-invokes `/start.sh` in the background, fetches and
+   runs `setup.sh`, and then `wait`s on `/start.sh` (which ends in `sleep infinity`) so
+   the container stays alive. Keeping the logic in a file avoids quoting errors that
+   happen when long inline shell strings are pasted into UI fields.
 5. Save the template.
 
 ---
@@ -258,7 +261,7 @@ die if the shell exits. `setsid nohup … </dev/null &` fully detaches.
 | GPU | RTX 5090 (32 GB) or A100 (80 GB) |
 | Volume | 200 GB (persistent across restarts) |
 | Ports | 7860 (API), 8188 (ComfyUI), 8888 (Jupyter) |
-| Start command | `bash -c "/start.sh & sleep 3 && wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh; wait"` |
+| Start command | `bash -c "wget -qO /tmp/boot.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/boot.sh && bash /tmp/boot.sh"` |
 
 ---
 

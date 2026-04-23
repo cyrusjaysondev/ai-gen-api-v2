@@ -37,18 +37,18 @@ HF_TOKEN = hf_your_token_here
 > Setting `SETUP_SCRIPT_URL` as an env var alone does **not** trigger the installer — nothing in the stock image reads it. You must set the Start Command (next step).
 
 ### 3. Set the Start Command
-In the template, paste this as the **Container Start Command**:
+In the template, paste this as the **Container Start Command** (single line, exactly):
 
 ```bash
-bash -c "/start.sh & sleep 3 && wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh; wait"
+bash -c "wget -qO /tmp/boot.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/boot.sh && bash /tmp/boot.sh"
 ```
 
-> **Why this exact form:** the `runpod/comfyui:latest` image ships `/start.sh` as its
-> entrypoint (starts SSH, JupyterLab, FileBrowser, and ComfyUI). A Container Start
-> Command replaces that entrypoint, so you must re-invoke `/start.sh` yourself in the
-> background, otherwise SSH and ComfyUI never come up. The trailing `wait` keeps the
-> container alive after `setup.sh` finishes so `/start.sh` (which ends in
-> `sleep infinity`) continues supervising ComfyUI.
+> ⚠️ Leaving Container Start Command empty → pod runs only `/start.sh` → SSH/Jupyter/ComfyUI up, but `:7860` stays **502** and setup never runs.
+
+`boot.sh` wraps the full startup sequence: it launches `/start.sh` in the background
+(so SSH/Jupyter/ComfyUI come up), fetches `setup.sh` from this repo, runs it, then
+`wait`s on `/start.sh` to keep the container alive. Keeping the logic in a file avoids
+the quoting errors that happen with long inline shell strings in UI fields.
 
 ### 4. Deploy and Wait
 Click Deploy. `setup.sh` runs 4 steps:
