@@ -261,6 +261,7 @@ log "  All 9 models downloaded"
 # 3. LanPaint custom node (required for FLUX face swap)
 # ─────────────────────────────────────────────
 mkdir -p "$NODES"
+LANPAINT_FRESH=0
 if [ ! -d "$NODES/LanPaint" ]; then
   log "[3/4] Installing LanPaint custom node..."
   (
@@ -270,9 +271,49 @@ if [ ! -d "$NODES/LanPaint" ]; then
       $PIP install -q -r LanPaint/requirements.txt 2>&1 | tail -1
     fi
   )
+  LANPAINT_FRESH=1
   log "  LanPaint installed"
 else
   log "[3/4] LanPaint already installed"
+fi
+
+# ─────────────────────────────────────────────
+# 3a. Restart ComfyUI if LanPaint was newly installed.
+#
+# /start.sh launches ComfyUI in parallel with this setup.sh, so on a fresh
+# install ComfyUI is already running before LanPaint hits disk. Custom nodes
+# are scanned only at startup, so without a restart the FIRST Head/Face Swap
+# job after install fails with:
+#   Node 'LanPaint_KSampler' not found. The custom node may not be installed.
+#
+# Killing PID 8188 makes /start.sh's `wait` return and /start.sh exits — but
+# the RunPod container stays alive (SSH/Jupyter run separately). We relaunch
+# ComfyUI ourselves in a detached session so start_api.sh's :8188 poll picks
+# up the new instance automatically.
+# ─────────────────────────────────────────────
+if [ "$LANPAINT_FRESH" = "1" ]; then
+  COMFY_PID=$(pgrep -f "main\.py .*--port 8188" | head -1)
+  if [ -n "$COMFY_PID" ]; then
+    log "  Restarting ComfyUI (PID $COMFY_PID) to register LanPaint..."
+    kill "$COMFY_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do kill -0 "$COMFY_PID" 2>/dev/null || break; sleep 1; done
+    kill -9 "$COMFY_PID" 2>/dev/null || true
+
+    ARGS_FILE="/workspace/runpod-slim/comfyui_args.txt"
+    FIXED_ARGS="--listen 0.0.0.0 --port 8188 --enable-cors-header"
+    if [ -s "$ARGS_FILE" ]; then
+      CUSTOM_ARGS=$(grep -v '^#' "$ARGS_FILE" | tr '\n' ' ')
+      [ -n "$CUSTOM_ARGS" ] && FIXED_ARGS="$FIXED_ARGS $CUSTOM_ARGS"
+    fi
+    (
+      cd "$COMFY_ROOT"
+      setsid nohup "$PYTHON" main.py $FIXED_ARGS </dev/null >>/workspace/comfyui.log 2>&1 &
+      disown 2>/dev/null || true
+    )
+    log "  ComfyUI relaunched in detached session — log: /workspace/comfyui.log"
+  else
+    log "  ComfyUI not running on :8188 — next pod start will register LanPaint normally"
+  fi
 fi
 
 # ─────────────────────────────────────────────
