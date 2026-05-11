@@ -78,7 +78,8 @@ You should see output like:
 [HH:MM:SS]   Done
 [HH:MM:SS] [2/4] Downloading models (parallel, ~72 GB total)...
 [HH:MM:SS]   Download complete: /workspace/runpod-slim/ComfyUI/models/...
-[HH:MM:SS]   All 9 models downloaded
+[HH:MM:SS]   Verifying downloaded files against HF expected sizes...
+[HH:MM:SS]   All 9 models verified at expected sizes
 [HH:MM:SS] [3/4] Installing LanPaint custom node...
 [HH:MM:SS] [4/4] Setting up API...
 [HH:MM:SS]   main.py downloaded (latest)
@@ -161,6 +162,10 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/ltx/i2v \
   -F "preset=fast"
 ```
 
+> **Default output is 9:16 vertical (544×960).** Pass `-F "aspect_ratio=16:9" -F "width=960" -F "height=544"` to get horizontal output, or `-F "aspect_ratio=original"` to match the input image.
+
+> **`enhance_prompt` (default `true`)** runs the Gemma 12B text encoder to rewrite your prompt before sampling — helps short prompts, costs ~2–5s + VRAM per request. Add `-F "enhance_prompt=false"` to skip it when you've written a detailed prompt yourself.
+
 ### Image to Video (quality, with audio)
 
 ```bash
@@ -219,6 +224,7 @@ All LTX video endpoints (`/ltx/i2v`, `/ltx/t2v`, `/face-animate`) support `prese
 - **Lower resolution = faster.** 768x448 generates in ~20s vs ~36s at 1280x720
 - **Shorter clips = faster.** `length=49` (2s) is much faster than `length=121` (5s)
 - **audio=false (default) saves ~5-10s** by skipping the audio VAE entirely
+- **`enhance_prompt=false` saves 2–5s** on `/ltx/i2v` by skipping the Gemma 12B prompt rewrite. Recommended when you've written a detailed prompt yourself; leave the default `true` for short / generic prompts where the rewrite materially improves output.
 - **First request after pod start is slow** (~3-5 min) because models load into VRAM. All subsequent requests use cached models
 - **Warm model benchmarks (fast preset):**
 
