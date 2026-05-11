@@ -587,13 +587,14 @@ async def ltx_image_to_video(
     prompt: str = Form("", description="What should happen in the video"),
     negative_prompt: str = Form(LTX_DEFAULT_NEGATIVE),
     preset: str = Form("fast", description="Speed/quality preset: fast (~8 steps, <12s) or quality (~20 steps)"),
-    aspect_ratio: str = Form("original", description="Output aspect ratio: original | 16:9 | 9:16 | 1:1 | 4:3 | 3:4 | 3:2 | 2:3 | 21:9 | 9:21"),
-    width: int = Form(1280, description="Output width in pixels (height auto-computed if aspect_ratio set)"),
-    height: int = Form(720, description="Output height in pixels (ignored if aspect_ratio set)"),
+    aspect_ratio: str = Form("9:16", description="Output aspect ratio: original | 16:9 | 9:16 | 1:1 | 4:3 | 3:4 | 3:2 | 2:3 | 21:9 | 9:21"),
+    width: int = Form(544, description="Output width in pixels (height auto-computed if aspect_ratio set). 544 with 9:16 → 544×960"),
+    height: int = Form(960, description="Output height in pixels (ignored if aspect_ratio set)"),
     length: int = Form(121, description="Number of frames — 97 (~4s), 121 (~5s), 161 (~6.7s)"),
     fps: int = Form(24, description="Frames per second"),
     seed: int = Form(-1),
     audio: bool = Form(False, description="Generate audio track with the video (adds overhead)"),
+    enhance_prompt: bool = Form(True, description="Rewrite prompt via Gemma 12B (adds 2-5s + VRAM). Disable for speed when you wrote a detailed prompt."),
 ):
     if preset not in LTX_PRESETS:
         raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
@@ -620,20 +621,23 @@ async def ltx_image_to_video(
         }},
         "235": {"class_type": "ResizeImagesByLongerEdge", "inputs": {"images": ["238", 0], "longer_edge": 1536}},
         "248": {"class_type": "LTXVPreprocess",           "inputs": {"image": ["235", 0], "img_compression": 18}},
-        # Prompt enhancer uses the image
-        "274": {"class_type": "TextGenerateLTX2Prompt", "inputs": {
-            "clip": ["272", 1], "image": ["269", 0], "prompt": prompt,
-            "max_length": 256, "sampling_mode": "on",
-            "sampling_mode.temperature": 0.7, "sampling_mode.top_k": 64,
-            "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
-            "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": seed
-        }},
         # I2V inplace for the generation pass (feeds into latent "228")
         "249": {"class_type": "LTXVImgToVideoInplace", "inputs": {
             "vae": ["236", 2], "image": ["248", 0], "latent": ["228", 0],
             "strength": 0.7 if two_pass else 1.0, "bypass": False
         }},
     }
+
+    if enhance_prompt:
+        img_nodes["274"] = {"class_type": "TextGenerateLTX2Prompt", "inputs": {
+            "clip": ["272", 1], "image": ["269", 0], "prompt": prompt,
+            "max_length": 256, "sampling_mode": "on",
+            "sampling_mode.temperature": 0.7, "sampling_mode.top_k": 64,
+            "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
+            "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": seed
+        }}
+        # Override CLIPTextEncode to use enhanced prompt (otherwise base node uses raw prompt)
+        img_nodes["240"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["243", 0], "text": ["274", 0]}}
 
     # High-res i2v inplace only needed for quality two-pass
     if two_pass:
@@ -643,9 +647,6 @@ async def ltx_image_to_video(
         high_res_src = ["230", 0]
     else:
         high_res_src = None  # not used in single-pass
-
-    # Override CLIPTextEncode to use enhanced prompt
-    img_nodes["240"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["243", 0], "text": ["274", 0]}}
 
     workflow = _ltx_base_nodes(
         prompt, negative_prompt, width, height, length, fps, seed,
