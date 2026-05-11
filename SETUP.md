@@ -210,6 +210,24 @@ curl https://YOUR_POD_ID-7860.proxy.runpod.net/status/JOB_ID
 
 ---
 
+## GPU Acceleration (enabled by default)
+
+`setup.sh` installs [SageAttention](https://github.com/thu-ml/SageAttention) into the ComfyUI venv and writes the following flags into `/workspace/runpod-slim/comfyui_args.txt` (read by `/start.sh` on every ComfyUI launch):
+
+- `--use-sage-attention` — replaces PyTorch's SDPA with SageAttention's Triton-based attention kernels (~20–40% faster on diffusion transformers).
+- `--fast fp16_accumulation fp8_matrix_mult cublas_ops` — enables FP16 accumulators, FP8 matmul on Blackwell sm_120 (RTX 5090+), and cuBLAS op selection.
+
+You should see this in `/workspace/comfyui.log` on boot:
+
+```
+Enabled fp16 accumulation.
+Using sage attention
+```
+
+To disable any of these (e.g. for debugging), comment out the relevant line in `/workspace/runpod-slim/comfyui_args.txt` and restart ComfyUI (or the pod).
+
+---
+
 ## Speed & Quality Presets
 
 All LTX video endpoints (`/ltx/i2v`, `/ltx/t2v`, `/face-animate`) support `preset` and `audio` parameters.

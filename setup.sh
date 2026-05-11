@@ -172,6 +172,30 @@ log "=========================================="
 # ─────────────────────────────────────────────
 log "[1/4] Installing pip dependencies + aria2..."
 $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | tail -1
+# SageAttention (drop-in replacement for PyTorch SDPA, ~20-40% faster on
+# diffusion transformers). Install in the ComfyUI venv so --use-sage-attention
+# in comfyui_args.txt resolves it. Separated from the FastAPI install so a
+# future packaging hiccup here doesn't block API deps.
+$PIP install -q sageattention 2>&1 | tail -1 || log "  WARN: sageattention install failed — ComfyUI will fall back to PyTorch SDPA"
+
+# Ensure ComfyUI's args file enables sage-attention + --fast (fp16 accumulation,
+# fp8 matmul, cublas autotune). Idempotent: only appends if --use-sage-attention
+# isn't already present, so a user's hand-edited args are preserved.
+ARGS_FILE="/workspace/runpod-slim/comfyui_args.txt"
+[ -f "$ARGS_FILE" ] || echo "# Add your custom ComfyUI arguments here (one per line)" > "$ARGS_FILE"
+if ! grep -qxF -- "--use-sage-attention" "$ARGS_FILE"; then
+  log "  Enabling SageAttention + --fast in $ARGS_FILE"
+  cat >> "$ARGS_FILE" <<'EOF'
+
+# SageAttention — drop-in attention replacement (~20-40% faster on diffusion)
+--use-sage-attention
+# Mixed-precision optimizations for Blackwell sm_120 (RTX 5090) and newer
+--fast
+fp16_accumulation
+fp8_matrix_mult
+cublas_ops
+EOF
+fi
 
 if ! command -v aria2c >/dev/null 2>&1; then
   log "  Installing aria2..."
