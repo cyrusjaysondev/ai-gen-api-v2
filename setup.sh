@@ -230,34 +230,90 @@ EOF
 # Public repos ignore it; gated repos (FLUX.2, LTX-2.3-fp8) require it.
 # --continue=true skips fully-downloaded files and resumes partials,
 # so rerunning this script after a network blip is a no-op for done files.
-aria2c \
-  --input-file="$ARIA2_INPUT" \
-  --header="Authorization: Bearer $TOKEN" \
-  --max-connection-per-server=16 \
-  --split=16 \
-  --min-split-size=10M \
-  --max-concurrent-downloads=3 \
-  --continue=true \
-  --allow-overwrite=true \
-  --auto-file-renaming=false \
-  --file-allocation=none \
-  --console-log-level=warn \
-  --summary-interval=30 \
-  2>&1 | tee -a "$LOG" | grep -E "Download complete|error|FAILED" || true
+run_aria2() {
+  aria2c \
+    --input-file="$ARIA2_INPUT" \
+    --header="Authorization: Bearer $TOKEN" \
+    --max-connection-per-server=16 \
+    --split=16 \
+    --min-split-size=10M \
+    --max-concurrent-downloads=3 \
+    --continue=true \
+    --allow-overwrite=true \
+    --auto-file-renaming=false \
+    --file-allocation=none \
+    --console-log-level=warn \
+    --summary-interval=30 \
+    2>&1 | tee -a "$LOG" | grep -E "Download complete|error|FAILED" || true
+  return ${PIPESTATUS[0]}
+}
 
-ARIA2_EXIT=${PIPESTATUS[0]}
+run_aria2
+ARIA2_EXIT=$?
 if [ $ARIA2_EXIT -ne 0 ]; then
-  log "  FATAL: aria2 exited with code $ARIA2_EXIT. Check HF token has access to:"
-  log "    - black-forest-labs/FLUX.2-klein-9B"
-  log "    - Lightricks/LTX-2.3-fp8"
-  exit 1
+  log "  WARN: aria2 exited with code $ARIA2_EXIT — will verify and retry."
+fi
+
+# Per-file verification. aria2 has been observed to exit 0 while silently
+# leaving individual files missing or short (e.g., a gated URL transiently
+# 401s, or the parent shell gets SIGTERM mid-download). Trusting the exit
+# code alone causes "All N models downloaded" to print over a broken set.
+# So we compare each file's on-disk size to HF's x-linked-size header and
+# resume any that don't match before declaring success.
+#
+# local_path|HF_URL — kept in lockstep with $ARIA2_INPUT above.
+EXPECTED_FILES="\
+diffusion_models/flux2-klein-9b.safetensors|https://huggingface.co/black-forest-labs/FLUX.2-klein-9B/resolve/main/flux-2-klein-9b.safetensors
+vae/flux2-vae.safetensors|https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/vae/flux2-vae.safetensors
+text_encoders/qwen_3_8b_fp8mixed.safetensors|https://huggingface.co/Comfy-Org/flux2-klein-9B/resolve/main/split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors
+loras/bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors|https://huggingface.co/Alissonerdx/BFS-Best-Face-Swap/resolve/main/bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors
+checkpoints/ltx-2.3-22b-dev-fp8.safetensors|https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors
+loras/ltx-2.3-22b-distilled-lora-384.safetensors|https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384.safetensors
+loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors|https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors
+text_encoders/gemma_3_12B_it_fp4_mixed.safetensors|https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors
+latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.0.safetensors|https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
+
+verify_models() {
+  local bad=0
+  local entry local_path url expected actual full
+  while IFS='|' read -r local_path url; do
+    [ -z "$local_path" ] && continue
+    full="$MODELS/$local_path"
+    expected=$(curl -sSI -H "Authorization: Bearer $TOKEN" "$url" 2>/dev/null \
+      | tr -d '\r' | awk 'tolower($1)=="x-linked-size:"{print $2; exit}')
+    actual=$(stat -c%s "$full" 2>/dev/null || echo 0)
+    if [ -z "$expected" ]; then
+      log "    WARN: could not fetch expected size for $local_path (HF unreachable?)"
+      continue
+    fi
+    if [ "$expected" != "$actual" ]; then
+      log "    INCOMPLETE: $local_path (have $actual, expected $expected)"
+      bad=$((bad+1))
+    fi
+  done <<<"$EXPECTED_FILES"
+  return $bad
+}
+
+log "  Verifying downloaded files against HF expected sizes..."
+if ! verify_models; then
+  log "  One or more files incomplete — resuming via aria2 (--continue)..."
+  run_aria2 || true
+  if ! verify_models; then
+    log "  FATAL: model files still incomplete after retry. Check:"
+    log "    - HF token has access to gated repos:"
+    log "        black-forest-labs/FLUX.2-klein-9B"
+    log "        Lightricks/LTX-2.3-fp8"
+    log "    - Disk space ($(df -h "$MODELS" | awk 'NR==2{print $4 " free on " $6}'))"
+    log "    - Network connectivity to huggingface.co"
+    exit 1
+  fi
 fi
 
 # Symlink so both filenames resolve (some workflows reference flux-2-klein-9b.safetensors)
 ln -sf "$MODELS/diffusion_models/flux2-klein-9b.safetensors" \
        "$MODELS/diffusion_models/flux-2-klein-9b.safetensors"
 
-log "  All 9 models downloaded"
+log "  All 9 models verified at expected sizes"
 
 # ─────────────────────────────────────────────
 # 3. LanPaint custom node (required for FLUX face swap)
