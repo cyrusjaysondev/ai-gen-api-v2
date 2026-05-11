@@ -172,30 +172,18 @@ log "=========================================="
 # ─────────────────────────────────────────────
 log "[1/4] Installing pip dependencies + aria2..."
 $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | tail -1
-# SageAttention (drop-in replacement for PyTorch SDPA, ~20-40% faster on
-# diffusion transformers). Install in the ComfyUI venv so --use-sage-attention
-# in comfyui_args.txt resolves it. Separated from the FastAPI install so a
-# future packaging hiccup here doesn't block API deps.
+# SageAttention package install only — DO NOT auto-enable via comfyui_args.txt.
+# SageAttention 1.0.6 hangs the Gemma 12B prompt-enhancer's autoregressive
+# token-generation path (the kernel is tuned for fixed-shape diffusion
+# attention, not LLM decoding), which deadlocks every /ltx/* call before the
+# KSampler ever runs. We leave the package installed so users who want sage
+# for non-Gemma workflows can enable it manually in comfyui_args.txt.
 $PIP install -q sageattention 2>&1 | tail -1 || log "  WARN: sageattention install failed — ComfyUI will fall back to PyTorch SDPA"
 
-# Ensure ComfyUI's args file enables sage-attention + --fast (fp16 accumulation,
-# fp8 matmul, cublas autotune). Idempotent: only appends if --use-sage-attention
-# isn't already present, so a user's hand-edited args are preserved.
+# Initialize the args file with just a header if it doesn't exist. We
+# deliberately don't append --use-sage-attention or --fast here (see above).
 ARGS_FILE="/workspace/runpod-slim/comfyui_args.txt"
 [ -f "$ARGS_FILE" ] || echo "# Add your custom ComfyUI arguments here (one per line)" > "$ARGS_FILE"
-if ! grep -qxF -- "--use-sage-attention" "$ARGS_FILE"; then
-  log "  Enabling SageAttention + --fast in $ARGS_FILE"
-  cat >> "$ARGS_FILE" <<'EOF'
-
-# SageAttention — drop-in attention replacement (~20-40% faster on diffusion)
---use-sage-attention
-# Mixed-precision optimizations for Blackwell sm_120 (RTX 5090) and newer
---fast
-fp16_accumulation
-fp8_matrix_mult
-cublas_ops
-EOF
-fi
 
 if ! command -v aria2c >/dev/null 2>&1; then
   log "  Installing aria2..."
@@ -359,44 +347,10 @@ else
   log "[3/4] LanPaint already installed"
 fi
 
-# ─────────────────────────────────────────────
-# 3a. Restart ComfyUI if LanPaint was newly installed.
-#
-# /start.sh launches ComfyUI in parallel with this setup.sh, so on a fresh
-# install ComfyUI is already running before LanPaint hits disk. Custom nodes
-# are scanned only at startup, so without a restart the FIRST Head/Face Swap
-# job after install fails with:
-#   Node 'LanPaint_KSampler' not found. The custom node may not be installed.
-#
-# Killing PID 8188 makes /start.sh's `wait` return and /start.sh exits — but
-# the RunPod container stays alive (SSH/Jupyter run separately). We relaunch
-# ComfyUI ourselves in a detached session so start_api.sh's :8188 poll picks
-# up the new instance automatically.
-# ─────────────────────────────────────────────
-if [ "$LANPAINT_FRESH" = "1" ]; then
-  COMFY_PID=$(pgrep -f "main\.py .*--port 8188" | head -1)
-  if [ -n "$COMFY_PID" ]; then
-    log "  Restarting ComfyUI (PID $COMFY_PID) to register LanPaint..."
-    kill "$COMFY_PID" 2>/dev/null || true
-    for _ in 1 2 3 4 5; do kill -0 "$COMFY_PID" 2>/dev/null || break; sleep 1; done
-    kill -9 "$COMFY_PID" 2>/dev/null || true
-
-    ARGS_FILE="/workspace/runpod-slim/comfyui_args.txt"
-    FIXED_ARGS="--listen 0.0.0.0 --port 8188 --enable-cors-header"
-    if [ -s "$ARGS_FILE" ]; then
-      CUSTOM_ARGS=$(grep -v '^#' "$ARGS_FILE" | tr '\n' ' ')
-      [ -n "$CUSTOM_ARGS" ] && FIXED_ARGS="$FIXED_ARGS $CUSTOM_ARGS"
-    fi
-    (
-      cd "$COMFY_ROOT"
-      setsid nohup "$PYTHON" main.py $FIXED_ARGS </dev/null >>/workspace/comfyui.log 2>&1 8>&- &
-      disown 2>/dev/null || true
-    )
-    log "  ComfyUI relaunched in detached session — log: /workspace/comfyui.log"
-  else
-    log "  ComfyUI not running on :8188 — next pod start will register LanPaint normally"
-  fi
-fi
+# (The conditional LanPaint-only ComfyUI relaunch that used to live here
+# is now subsumed by the start_comfy.sh supervisor below: it unconditionally
+# kills /start.sh's unsupervised ComfyUI and relaunches under flock'd
+# auto-restart, so newly-installed custom nodes are always picked up.)
 
 # ─────────────────────────────────────────────
 # 4. Download API + create startup scripts
@@ -412,13 +366,120 @@ if [ ! -s "/workspace/api/main.py" ]; then
 fi
 log "  main.py downloaded (latest)"
 
-# Save detected paths for start_api.sh
+# Save detected paths for start_api.sh and start_comfy.sh
 cat > /workspace/api/config.env << CONFEOF
 COMFY_ROOT=$COMFY_ROOT
 PYTHON=$PYTHON
 PIP=$PIP
 API_REPO=$API_REPO
 CONFEOF
+
+# ─────────────────────────────────────────────
+# Create the ComfyUI supervisor (mirrors start_api.sh: flock'd, auto-restart
+# loop, parsed CLI args from comfyui_args.txt). RunPod's /start.sh launches
+# ComfyUI as an unsupervised child — if it segfaults, OOMs, or is killed,
+# /start.sh's `wait` returns and ComfyUI stays down until pod restart. The
+# supervisor relaunches it within 5 seconds on any exit code.
+# ─────────────────────────────────────────────
+cat > /workspace/start_comfy.sh << 'COMFYEOF'
+#!/bin/bash
+# =============================================================
+# AI Gen API v2 — supervisor for ComfyUI on :8188
+#
+# Safe to invoke multiple times: a flock guards the while-loop so
+# a second invocation (e.g. setup.sh re-running on pod restart)
+# exits immediately instead of racing the first supervisor.
+#
+# Reads extra ComfyUI CLI flags one-per-line from
+# /workspace/runpod-slim/comfyui_args.txt (comments + blanks ignored).
+# =============================================================
+LOG_SETUP="/workspace/comfy_setup.log"
+LOG_OUT="/workspace/comfyui.log"
+ARGS_FILE="/workspace/runpod-slim/comfyui_args.txt"
+PORT=8188
+FIXED_ARGS=(--listen 0.0.0.0 --port "$PORT" --enable-cors-header)
+
+log() { echo "[$(date '+%H:%M:%S')] $1" | tee -a "$LOG_SETUP"; }
+
+# ─── single-instance guard ───
+exec 9>/var/lock/ai-gen-comfy.lock
+if ! flock -n 9; then
+  log "start_comfy.sh: another supervisor already running — exiting"
+  exit 0
+fi
+
+# Truncate old logs on restart (cap at last 500 lines each)
+tail -500 "$LOG_SETUP" > "${LOG_SETUP}.tmp" 2>/dev/null && mv "${LOG_SETUP}.tmp" "$LOG_SETUP"
+tail -500 "$LOG_OUT"   > "${LOG_OUT}.tmp"   2>/dev/null && mv "${LOG_OUT}.tmp"   "$LOG_OUT"
+
+if [ ! -f /workspace/api/config.env ]; then
+  log "ERROR: /workspace/api/config.env missing — setup.sh did not complete"
+  exit 1
+fi
+source /workspace/api/config.env
+
+if [ -z "$PYTHON" ] || [ -z "$COMFY_ROOT" ]; then
+  log "ERROR: PYTHON or COMFY_ROOT not set in config.env"
+  exit 1
+fi
+if [ ! -x "$PYTHON" ]; then
+  log "ERROR: PYTHON ($PYTHON) not executable"
+  exit 1
+fi
+if [ ! -f "$COMFY_ROOT/main.py" ]; then
+  log "ERROR: $COMFY_ROOT/main.py not found"
+  exit 1
+fi
+
+# Free :PORT if a stale ComfyUI is holding it (e.g. the one /start.sh
+# launched on pod boot). Target by socket owner — safer than pkill -f
+# against an argv pattern, which can accidentally match caller shells.
+STALE_PID=$(netstat -tlnp 2>/dev/null | awk -v p=":$PORT\$" '$4 ~ p {split($7, a, "/"); print a[1]; exit}')
+if [ -n "$STALE_PID" ] && [ "$STALE_PID" != "-" ]; then
+  log "Freeing :$PORT (stale owner PID=$STALE_PID)"
+  kill "$STALE_PID" 2>/dev/null || true
+  for _ in 1 2 3 4 5; do kill -0 "$STALE_PID" 2>/dev/null || break; sleep 1; done
+  kill -9 "$STALE_PID" 2>/dev/null || true
+fi
+
+# Parse extra args from comfyui_args.txt: strip comments + blank lines,
+# word-split each remaining line into one or more args.
+EXTRA_ARGS=()
+if [ -f "$ARGS_FILE" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    [ -z "$trimmed" ] && continue
+    [[ "$trimmed" =~ ^# ]] && continue
+    # shellcheck disable=SC2206
+    args=($trimmed)
+    EXTRA_ARGS+=("${args[@]}")
+  done < "$ARGS_FILE"
+fi
+log "ComfyUI extra args: ${EXTRA_ARGS[*]:-(none)}"
+
+cd "$COMFY_ROOT" || exit 1
+log "Starting ComfyUI on port $PORT..."
+while true; do
+  "$PYTHON" main.py "${FIXED_ARGS[@]}" "${EXTRA_ARGS[@]}" >> "$LOG_OUT" 2>&1
+  EXIT_CODE=$?
+  log "ComfyUI exited with code $EXIT_CODE — restarting in 5s..."
+  sleep 5
+done
+COMFYEOF
+
+chmod +x /workspace/start_comfy.sh
+
+# Launch the ComfyUI supervisor unless one's already running. The supervisor's
+# STALE_PID step will adopt :8188 from /start.sh's unsupervised ComfyUI on the
+# first launch; subsequent setup re-runs hit the flock and exit cleanly.
+# 8>&- closes the setup-lock FD so the daemon doesn't inherit it.
+if pgrep -xf "bash /workspace/start_comfy.sh" >/dev/null 2>&1; then
+  log "  ComfyUI supervisor already running — leaving it alone"
+else
+  setsid nohup bash /workspace/start_comfy.sh </dev/null >>/workspace/api_setup.log 2>&1 8>&- &
+  disown 2>/dev/null || true
+  log "  ComfyUI supervisor launched (will adopt :8188 from /start.sh)"
+fi
 
 # Create startup script (runs on every pod start/restart)
 cat > /workspace/start_api.sh << 'STARTEOF'
@@ -516,28 +577,43 @@ chmod +x /workspace/start_api.sh
 patch_start_sh() {
   local f="/start.sh"
   [ -f "$f" ] || { log "  /start.sh not found — skipping restart hook"; return; }
-  if grep -q "AI Gen API v2 auto-start hook" "$f"; then
-    log "  /start.sh already has restart hook"
+  # The hook block is versioned (v2). If the file already contains the v2
+  # marker, skip; if it contains the older v1 marker, we strip it and re-apply
+  # v2 so we don't end up with stacked hooks.
+  if grep -q "AI Gen API v2 auto-start hook v2" "$f"; then
+    log "  /start.sh already has v2 restart hook"
     return
   fi
   # Insert hook right after ComfyUI is launched (line: `python main.py $FIXED_ARGS &`),
   # before the `wait $COMFY_PID` call. setsid + nohup + </dev/null fully detaches so
-  # the supervisor survives SSH disconnect, shell exit, and session teardown.
+  # the supervisors survive SSH disconnect, shell exit, and /start.sh teardown.
   #
   # Use atomic rename (write-new-then-mv) so the currently-running /start.sh
-  # (which may still be reading the script — it's `bash /start.sh` under the
-  # container CMD) isn't truncated mid-read. Processes holding the old inode
-  # via their open fd continue reading the old content; new invocations see
-  # the new file.
+  # (which may still be reading the script) isn't truncated mid-read. Processes
+  # holding the old inode via their open fd continue reading the old content;
+  # new invocations see the new file.
   python3 - "$f" <<'PYEOF'
 import os, sys, re
 p = sys.argv[1]
 src = open(p).read()
+# Strip any previously-injected hook block (v1 or v2) so re-runs don't stack.
+src = re.sub(
+    r'\n# === AI Gen API v2 auto-start hook[^\n]*===\n.*?# === end AI Gen API v2 auto-start hook ===\n',
+    '\n',
+    src,
+    flags=re.S,
+)
 hook = '''
-# === AI Gen API v2 auto-start hook ===
-# Launches /workspace/start_api.sh in a detached session so the API
-# supervisor survives shell exit, SSH disconnect, and /start.sh teardown.
-# start_api.sh itself waits for ComfyUI before binding :7860.
+# === AI Gen API v2 auto-start hook v2 ===
+# Launches the ComfyUI + API supervisors in detached sessions so they
+# survive shell exit, SSH disconnect, and /start.sh teardown.
+#   - start_comfy.sh adopts :8188 from /start.sh's unsupervised ComfyUI
+#     and provides auto-restart on crash.
+#   - start_api.sh waits for ComfyUI before binding :7860.
+if [ -x /workspace/start_comfy.sh ]; then
+    echo "AI Gen API v2: launching /workspace/start_comfy.sh"
+    setsid nohup bash /workspace/start_comfy.sh </dev/null >>/workspace/api_setup.log 2>&1 &
+fi
 if [ -x /workspace/start_api.sh ]; then
     echo "AI Gen API v2: launching /workspace/start_api.sh"
     setsid nohup bash /workspace/start_api.sh </dev/null >>/workspace/api_setup.log 2>&1 &
@@ -554,7 +630,7 @@ with open(tmp, "w") as fh:
 os.chmod(tmp, os.stat(p).st_mode)
 os.rename(tmp, p)
 PYEOF
-  log "  /start.sh patched with API restart hook"
+  log "  /start.sh patched with v2 restart hook (supervisors for ComfyUI + API)"
 }
 patch_start_sh
 
