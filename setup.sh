@@ -100,7 +100,9 @@ except OSError:
     # port already taken (another instance or the real uvicorn grabbed it)
     sys.exit(0)
 PYEOF
-  setsid nohup python3 /tmp/ai-gen-api-v2-status.py </dev/null >/dev/null 2>&1 &
+  # 8>&- closes the setup-lock FD so children don't inherit it (otherwise
+  # the lock would persist for the lifetime of the daemon, blocking re-runs).
+  setsid nohup python3 /tmp/ai-gen-api-v2-status.py </dev/null >/dev/null 2>&1 8>&- &
   echo $! > "$STATUS_PID_FILE"
   sleep 0.5
   if kill -0 "$(cat "$STATUS_PID_FILE")" 2>/dev/null; then
@@ -307,7 +309,7 @@ if [ "$LANPAINT_FRESH" = "1" ]; then
     fi
     (
       cd "$COMFY_ROOT"
-      setsid nohup "$PYTHON" main.py $FIXED_ARGS </dev/null >>/workspace/comfyui.log 2>&1 &
+      setsid nohup "$PYTHON" main.py $FIXED_ARGS </dev/null >>/workspace/comfyui.log 2>&1 8>&- &
       disown 2>/dev/null || true
     )
     log "  ComfyUI relaunched in detached session — log: /workspace/comfyui.log"
@@ -494,7 +496,7 @@ else
   # that merely mentions the string in its own command line.
   pkill -xf "bash /workspace/start_api.sh" 2>/dev/null || true
   sleep 1
-  setsid nohup bash /workspace/start_api.sh </dev/null >>/workspace/api_setup.log 2>&1 &
+  setsid nohup bash /workspace/start_api.sh </dev/null >>/workspace/api_setup.log 2>&1 8>&- &
   disown 2>/dev/null || true
   log "API supervisor launched"
 fi
