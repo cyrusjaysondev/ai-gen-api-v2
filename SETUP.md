@@ -29,13 +29,17 @@ Before starting, you need:
    ```
    HF_TOKEN = hf_your_token_here
 
-   # (optional) enable the admin API for the face blocklist:
-   ADMIN_TOKEN = <generate a long random string>
+   # (optional) protect the admin blocklist API with a Bearer token:
+   # ADMIN_TOKEN = <generate a long random string>
    ```
-   `HF_TOKEN` is required (model downloads). `ADMIN_TOKEN` is optional —
-   if unset, the `/admin/blocklist` endpoints return 503 (the API is
-   functional but compliance management is disabled). Generate a strong
-   random token: `python -c "import secrets; print(secrets.token_hex(32))"`
+   `HF_TOKEN` is required (model downloads).
+
+   `ADMIN_TOKEN` is **optional**. By default (unset), the
+   `/admin/blocklist` and `/admin/blocklist-logos` endpoints are open
+   for easy access during development. Set `ADMIN_TOKEN` to require
+   `Authorization: Bearer <token>` on every admin call — recommended
+   before sharing the pod URL or going to production.
+   Generate one with: `python -c "import secrets; print(secrets.token_hex(32))"`
 4. Under **Container Start Command**, paste this **exactly** (single line):
    ```bash
    bash -c "wget -qO /tmp/boot.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/boot.sh && bash /tmp/boot.sh"

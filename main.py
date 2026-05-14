@@ -807,9 +807,15 @@ IDENTITY_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 
 
 def _require_admin(authorization):
+    """Admin auth is optional. Behavior depends on the ADMIN_TOKEN env var:
+      - ADMIN_TOKEN unset     → admin endpoints are OPEN (no auth required).
+                                Convenient for dev / when the pod URL isn't shared.
+      - ADMIN_TOKEN set       → caller MUST send `Authorization: Bearer <token>`.
+                                401 without header, 403 with wrong token.
+    Set the env var on the RunPod template when going to production."""
     token = os.environ.get("ADMIN_TOKEN")
     if not token:
-        raise HTTPException(503, "admin API disabled — set the ADMIN_TOKEN env var on the pod to enable")
+        return  # open mode — no token configured
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "missing Authorization: Bearer <ADMIN_TOKEN> header")
     if authorization[len("Bearer "):] != token:

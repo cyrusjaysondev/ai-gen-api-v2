@@ -671,24 +671,38 @@ which filter was bypassed.
 ## Admin API (blocklist management)
 
 Two parallel sets of admin endpoints — one for faces, one for logos/flags.
-Same auth (`Authorization: Bearer $ADMIN_TOKEN`), same shape, same hot-reload.
+Same shape, same hot-reload, same optional auth.
+
+### Auth
+
+Auth is **optional and off by default** so the admin API is easy to access
+during development. Behavior is controlled by the `ADMIN_TOKEN` env var:
+
+- **`ADMIN_TOKEN` unset (default):** admin endpoints are open — no auth
+  required. Anyone with the pod URL can manage the blocklist. Fine for
+  dev / private pods.
+- **`ADMIN_TOKEN` set:** every admin call must include
+  `Authorization: Bearer <token>`. `401` without header, `403` with wrong
+  token. Recommended before going to production / sharing the pod URL.
+
+Switch between modes by setting/unsetting the env var on the RunPod template
+and restarting the pod — no code change needed.
 
 ### Faces — `/admin/blocklist`
-
-All admin endpoints require `Authorization: Bearer $ADMIN_TOKEN`. Set
-`ADMIN_TOKEN` as an env var on the pod template. If unset, admin endpoints
-return `503 Service Unavailable` — you cannot accidentally expose them.
 
 The blocklist is stored on the network volume at `/workspace/blocklist/`,
 one image per identity. It's shared with serverless workers (mounted at
 `/runpod-volume/blocklist/`) and hot-reloaded on every face-filter check —
 uploads and deletes take effect on the next request.
 
+> The examples below show the open-mode (no `ADMIN_TOKEN`). If you set
+> `ADMIN_TOKEN` on the pod, add `-H "Authorization: Bearer $ADMIN_TOKEN"`
+> to every call.
+
 ### POST /admin/blocklist — Upload a face
 
 ```bash
 curl -X POST "$POD/admin/blocklist" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -F "identity=tom_hanks" \
   -F "image=@hanks.png" \
   -F "overwrite=false"
@@ -711,12 +725,12 @@ Returns:
 Errors:
 - `400` — no face detected, or multiple faces, or invalid identity name
 - `409` — identity already exists (use `overwrite=true` to replace)
-- `503` — face filter unavailable / `ADMIN_TOKEN` not set
+- `503` — face filter unavailable (e.g. `safety` module not installed)
 
 ### GET /admin/blocklist — List
 
 ```bash
-curl "$POD/admin/blocklist" -H "Authorization: Bearer $ADMIN_TOKEN"
+curl "$POD/admin/blocklist"
 ```
 
 ```json
@@ -735,7 +749,7 @@ curl "$POD/admin/blocklist" -H "Authorization: Bearer $ADMIN_TOKEN"
 
 ```bash
 curl -X DELETE "$POD/admin/blocklist/tom_hanks" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
+ 
 ```
 
 ```json
@@ -749,7 +763,6 @@ Returns the stored face image as raw bytes (for CMS preview).
 
 ```bash
 curl "$POD/admin/blocklist/tom_hanks/image" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -o tom_hanks.png
 ```
 
@@ -761,20 +774,19 @@ and different validation (no face-detection prereq — any valid image is accept
 ```bash
 # Upload
 curl -X POST "$POD/admin/blocklist-logos" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -F "identity=apple_logo" \
   -F "image=@apple.png"
 
 # List
-curl "$POD/admin/blocklist-logos" -H "Authorization: Bearer $ADMIN_TOKEN"
+curl "$POD/admin/blocklist-logos"
 
 # Delete
 curl -X DELETE "$POD/admin/blocklist-logos/apple_logo" \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
+ 
 
 # Preview
 curl "$POD/admin/blocklist-logos/apple_logo/image" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" -o apple.png
+  -o apple.png
 ```
 
 Response shape mirrors `/admin/blocklist`. The list response groups blocked
