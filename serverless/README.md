@@ -1,4 +1,7 @@
-# Serverless Deployment
+# Serverless Deployment — API Reference
+
+> **For the step-by-step deploy guide, see [`../SERVERLESS_SETUP.md`](../SERVERLESS_SETUP.md).**
+> This file is the API reference: endpoint inputs/outputs and example calls.
 
 Two RunPod serverless endpoints share the same network volume that the pod uses:
 
