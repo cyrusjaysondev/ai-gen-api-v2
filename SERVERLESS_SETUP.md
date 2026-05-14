@@ -339,6 +339,58 @@ spawns fresh workers that pull the new image.
 
 ---
 
+## Managing the compliance blocklists
+
+**The admin API for the face + logo blocklists lives on the pod, NOT on
+the serverless workers.** Serverless workers come and go (scale to zero,
+restart on demand) — they're a bad surface for write operations. The pod
+is always-on, has the same network volume mounted, and is the natural
+single-writer.
+
+The flow is:
+
+```
+  Your CMS  ─POST /admin/blocklist────►  POD (https://<POD>-7860...)
+                                          │
+                                          │ writes face image to
+                                          │ /workspace/blocklist/ on the volume
+                                          ▼
+                                  Network Volume
+                                          ▲
+                                          │ serverless workers see the
+                                          │ same files at /runpod-volume/
+                                          │ blocklist/ and hot-reload them
+                                          │ on every face_filter check
+                            ┌─────────────┴──────────────┐
+                  Image Worker A           Image Worker B
+                  (enforces filter)        (enforces filter)
+```
+
+This means:
+
+- **Your CMS only talks to the pod** for blocklist management. There's no
+  serverless admin endpoint.
+- **Serverless workers enforce the filter** when you pass
+  `face_filter=true` or `logo_filter=true` on a generation request.
+- **Updates propagate automatically.** Add a face via the pod's
+  `POST /admin/blocklist` → the next serverless request that runs the
+  filter picks it up (hot-reload via volume-mtime scan).
+- **The pod must be running** to manage the blocklist. If you spin the
+  pod down, you can still mount the volume on any RunPod pod or use the
+  RunPod S3 API to add/remove files manually under
+  `<volume>/blocklist/` and `<volume>/blocklist_logos/`.
+
+See [`API.md`](API.md) → "Admin API (blocklist management)" for the
+endpoint details (`/admin/blocklist`, `/admin/blocklist-logos`, list /
+upload / delete / preview).
+
+**Auth:** by default the pod's admin API is **open** (no auth required).
+Set `ADMIN_TOKEN` as a pod env var to require
+`Authorization: Bearer <token>` on every admin call — recommended before
+sharing the pod URL.
+
+---
+
 ## Troubleshooting
 
 ### Worker logs show: `FATAL: network volume models not found at /runpod-volume/runpod-slim/ComfyUI/models`
