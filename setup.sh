@@ -321,9 +321,12 @@ if ! verify_models; then
   fi
 fi
 
-# Symlink so both filenames resolve (some workflows reference flux-2-klein-9b.safetensors)
-ln -sf "$MODELS/diffusion_models/flux2-klein-9b.safetensors" \
-       "$MODELS/diffusion_models/flux-2-klein-9b.safetensors"
+# Symlink so both filenames resolve (workflows.py references flux-2-klein-9b.safetensors).
+# Use a RELATIVE link so it works regardless of mount point — pods see the
+# volume at /workspace/, serverless workers see it at /runpod-volume/.
+# An absolute link to /workspace/... would break inside serverless containers.
+(cd "$MODELS/diffusion_models" && \
+ ln -sfn flux2-klein-9b.safetensors flux-2-klein-9b.safetensors)
 
 log "  All 9 models verified at expected sizes"
 
