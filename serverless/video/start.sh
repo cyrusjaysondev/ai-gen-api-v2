@@ -26,6 +26,7 @@ fi
 mkdir -p "$VOLUME_OUTPUTS"
 log "video outputs will stage to $VOLUME_OUTPUTS"
 
+mkdir -p "$COMFY_ROOT/models"   # defensive — base image already provides this
 for sub in diffusion_models vae text_encoders loras checkpoints latent_upscale_models; do
   src="$VOLUME_MODELS/$sub"
   dst="$COMFY_ROOT/models/$sub"

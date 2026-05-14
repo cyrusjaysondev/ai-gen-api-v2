@@ -40,8 +40,8 @@ Output (success):
   }
 """
 
+import asyncio
 import base64
-import json
 import os
 import sys
 import time
@@ -50,7 +50,6 @@ from pathlib import Path
 
 import httpx
 import runpod
-import websockets
 
 # Make repo-root /app/workflows.py importable
 sys.path.insert(0, "/app")
@@ -72,6 +71,25 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ─────────────────────────────────────────────
+# Input helpers
+# ─────────────────────────────────────────────
+
+def _decode_image_b64(b64: str, field_name: str) -> bytes:
+    """Decode a base64 image, accepting both raw and data-URI (`data:image/png;base64,…`) forms.
+    Raises ValueError with the field name if the input is malformed."""
+    if not isinstance(b64, str):
+        raise ValueError(f"'{field_name}' must be a base64 string, got {type(b64).__name__}")
+    # Strip data URI prefix if present — common in browser clients
+    # (canvas.toDataURL, FileReader.readAsDataURL).
+    if b64.startswith("data:") and "," in b64:
+        b64 = b64.split(",", 1)[1]
+    try:
+        return base64.b64decode(b64, validate=False)
+    except Exception as e:
+        raise ValueError(f"'{field_name}' is not valid base64: {e}") from e
+
+
+# ─────────────────────────────────────────────
 # ComfyUI readiness — workers cold-start with ComfyUI booting in parallel
 # (start.sh spawns it). Block on first invocation until it's serving.
 # ─────────────────────────────────────────────
@@ -90,39 +108,41 @@ def wait_for_comfyui(timeout_s: int = 300) -> None:
 
 
 # ─────────────────────────────────────────────
-# Submit a workflow to ComfyUI and block until a file lands on disk.
-# Mirrors the pod-mode `run_job` but synchronous (handler must return result).
+# Submit a workflow to ComfyUI and block until /history reports completion.
+#
+# We poll /history instead of using the /ws stream because the WS pattern has
+# a race: the prompt may finish executing before we manage to connect, and
+# then `ws.recv()` hangs forever waiting for a message that already fired.
+# Polling adds ~0.5–1s overhead, which is invisible next to model load +
+# inference time.
 # ─────────────────────────────────────────────
 
-async def submit_and_wait(workflow: dict) -> tuple[str, Path]:
-    client_id = str(uuid.uuid4())
+async def submit_and_wait(workflow: dict, max_wait_s: float = 600.0) -> tuple[str, Path]:
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             f"{COMFYUI_URL}/prompt",
-            json={"prompt": workflow, "client_id": client_id},
+            json={"prompt": workflow, "client_id": str(uuid.uuid4())},
         )
         if resp.status_code != 200:
             raise RuntimeError(f"ComfyUI rejected workflow: {resp.text}")
         prompt_id = resp.json()["prompt_id"]
 
-    ws_url = f"{COMFYUI_URL.replace('http', 'ws')}/ws?clientId={client_id}"
-    async with websockets.connect(ws_url, max_size=None) as ws:
-        while True:
-            raw = await ws.recv()
-            if isinstance(raw, bytes):
-                continue
-            msg = json.loads(raw)
-            if msg.get("type") == "executing":
-                data = msg.get("data", {})
-                if data.get("node") is None and data.get("prompt_id") == prompt_id:
-                    break
-
+    deadline = time.time() + max_wait_s
+    job_data: dict = {}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        history = await client.get(f"{COMFYUI_URL}/history/{prompt_id}")
-        job_data = history.json().get(prompt_id, {})
+        while True:
+            if time.time() > deadline:
+                raise RuntimeError(
+                    f"ComfyUI did not finish prompt {prompt_id} within {max_wait_s:.0f}s"
+                )
+            history = (await client.get(f"{COMFYUI_URL}/history/{prompt_id}")).json()
+            job_data = history.get(prompt_id, {})
+            if job_data.get("status", {}).get("completed"):
+                break
+            await asyncio.sleep(1.0)
 
-    status = job_data.get("status", {}).get("status_str", "")
-    if status == "error":
+    status_str = job_data.get("status", {}).get("status_str", "")
+    if status_str == "error":
         for m in job_data.get("status", {}).get("messages", []):
             if m[0] == "execution_error":
                 raise RuntimeError(m[1].get("exception_message", "ComfyUI execution error"))
@@ -171,9 +191,7 @@ async def run_t2i(inp: dict) -> dict:
 
 
 async def run_flux_face_swap(inp: dict) -> dict:
-    target_b64 = inp.get("target_image_b64")
-    face_b64 = inp.get("face_image_b64")
-    if not target_b64 or not face_b64:
+    if not inp.get("target_image_b64") or not inp.get("face_image_b64"):
         raise ValueError("'target_image_b64' and 'face_image_b64' are required for flux/face-swap")
 
     seed = inp.get("seed", -1)
@@ -184,8 +202,8 @@ async def run_flux_face_swap(inp: dict) -> dict:
     if aspect_ratio != "original" and aspect_ratio not in ASPECT_RATIOS:
         raise ValueError(f"invalid aspect_ratio '{aspect_ratio}'; valid: original, {', '.join(ASPECT_RATIOS)}")
 
-    target_bytes = base64.b64decode(target_b64)
-    face_bytes = base64.b64decode(face_b64)
+    target_bytes = _decode_image_b64(inp["target_image_b64"], "target_image_b64")
+    face_bytes   = _decode_image_b64(inp["face_image_b64"],   "face_image_b64")
 
     if aspect_ratio != "original":
         w_r, h_r = ASPECT_RATIOS[aspect_ratio]

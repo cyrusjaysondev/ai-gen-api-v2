@@ -32,8 +32,19 @@ You need all of these before starting:
    your volume's region (e.g. `EU-RO-1`, `US-CA-2`, `AP-JP-1`). You'll
    need this in Step 3.
 
-3. **A Docker registry account** (Docker Hub free tier works). You'll push
-   two images to it.
+   **Verify on this pod:**
+   ```bash
+   df /workspace | tail -1 | awk '{print $1}'
+   # Example output: mfs#ap-jp-1.runpod.net:9421
+   #                       ^^^^^ that's your region — AP-JP-1
+   ```
+
+3. **A Docker registry account** (Docker Hub free tier works).
+   - **Public images** (recommended for simplicity): no extra setup on
+     RunPod's side.
+   - **Private images**: you'll need to add registry credentials to the
+     endpoint config in Step 3 (runpod.io endpoint → **Container** →
+     **Container Registry Credentials**).
 
 4. **A build machine with Docker.** Options:
    - Your laptop (fastest if you have decent upload bandwidth).
@@ -291,15 +302,38 @@ this for production traffic; leave at `0` for development.
 
 ---
 
+## Force-refresh code on the running pod
+
+If you push a fix to GitHub `main` and want the pod-mode API to pick it up
+without a full pod restart, just kill uvicorn — the supervisor re-fetches
+`main.py` + `workflows.py` from GitHub and restarts within ~5 seconds:
+
+```bash
+pkill -f "uvicorn main:app"
+# Wait ~10s, then verify:
+curl http://localhost:7860/health
+```
+
+Serverless workers always pull the image you pushed — to deploy new
+handler code, rebuild and push the Docker image, then in runpod.io →
+endpoint → **Workers** → terminate the active workers. The next request
+spawns fresh workers that pull the new image.
+
+---
+
 ## Troubleshooting
 
 ### Worker logs show: `FATAL: network volume models not found at /runpod-volume/runpod-slim/ComfyUI/models`
 
-The endpoint isn't getting the network volume.
+The endpoint isn't getting the network volume, OR the endpoint's region
+doesn't match the volume's region.
 
 - runpod.io → endpoint → **Edit** → **Network Volume** → select your
   volume → **Save**.
-- The endpoint region **must match** the volume's region.
+- **Region match is mandatory.** If your volume is in `AP-JP-1` and the
+  endpoint is in `US-CA-2`, RunPod won't even let you attach (the volume
+  won't appear in the dropdown). Recreate the endpoint in the volume's
+  region.
 - Restart the worker (or just send a new request — the next cold start
   picks up the new config).
 

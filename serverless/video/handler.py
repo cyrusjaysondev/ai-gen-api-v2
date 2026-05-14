@@ -54,7 +54,7 @@ Output (success):
   }
 """
 
-import json
+import asyncio
 import base64
 import os
 import shutil
@@ -65,7 +65,6 @@ from pathlib import Path
 
 import httpx
 import runpod
-import websockets
 
 sys.path.insert(0, "/app")
 from workflows import (
@@ -89,6 +88,19 @@ VOLUME_OUTPUTS = Path(os.environ.get("VOLUME_OUTPUTS", "/runpod-volume/outputs")
 VOLUME_OUTPUTS.mkdir(parents=True, exist_ok=True)
 
 
+def _decode_image_b64(b64: str, field_name: str) -> bytes:
+    """Decode a base64 image, accepting both raw and data-URI (`data:image/png;base64,…`) forms.
+    Raises ValueError with the field name if the input is malformed."""
+    if not isinstance(b64, str):
+        raise ValueError(f"'{field_name}' must be a base64 string, got {type(b64).__name__}")
+    if b64.startswith("data:") and "," in b64:
+        b64 = b64.split(",", 1)[1]
+    try:
+        return base64.b64decode(b64, validate=False)
+    except Exception as e:
+        raise ValueError(f"'{field_name}' is not valid base64: {e}") from e
+
+
 def wait_for_comfyui(timeout_s: int = 300) -> None:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -102,35 +114,33 @@ def wait_for_comfyui(timeout_s: int = 300) -> None:
     raise RuntimeError(f"ComfyUI not ready after {timeout_s}s at {COMFYUI_URL}")
 
 
-async def submit_and_wait(workflow: dict) -> tuple[str, Path]:
-    client_id = str(uuid.uuid4())
+async def submit_and_wait(workflow: dict, max_wait_s: float = 600.0) -> tuple[str, Path]:
+    """Submit a workflow to ComfyUI, poll /history until done. Race-free vs WS stream."""
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             f"{COMFYUI_URL}/prompt",
-            json={"prompt": workflow, "client_id": client_id},
+            json={"prompt": workflow, "client_id": str(uuid.uuid4())},
         )
         if resp.status_code != 200:
             raise RuntimeError(f"ComfyUI rejected workflow: {resp.text}")
         prompt_id = resp.json()["prompt_id"]
 
-    ws_url = f"{COMFYUI_URL.replace('http', 'ws')}/ws?clientId={client_id}"
-    async with websockets.connect(ws_url, max_size=None) as ws:
-        while True:
-            raw = await ws.recv()
-            if isinstance(raw, bytes):
-                continue
-            msg = json.loads(raw)
-            if msg.get("type") == "executing":
-                data = msg.get("data", {})
-                if data.get("node") is None and data.get("prompt_id") == prompt_id:
-                    break
-
+    deadline = time.time() + max_wait_s
+    job_data: dict = {}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        history = await client.get(f"{COMFYUI_URL}/history/{prompt_id}")
-        job_data = history.json().get(prompt_id, {})
+        while True:
+            if time.time() > deadline:
+                raise RuntimeError(
+                    f"ComfyUI did not finish prompt {prompt_id} within {max_wait_s:.0f}s"
+                )
+            history = (await client.get(f"{COMFYUI_URL}/history/{prompt_id}")).json()
+            job_data = history.get(prompt_id, {})
+            if job_data.get("status", {}).get("completed"):
+                break
+            await asyncio.sleep(1.0)
 
-    status = job_data.get("status", {}).get("status_str", "")
-    if status == "error":
+    status_str = job_data.get("status", {}).get("status_str", "")
+    if status_str == "error":
         for m in job_data.get("status", {}).get("messages", []):
             if m[0] == "execution_error":
                 raise RuntimeError(m[1].get("exception_message", "ComfyUI execution error"))
@@ -165,8 +175,7 @@ def _stage_output_to_volume(filename: str, src: Path, job_id: str) -> Path:
 
 
 async def run_ltx_i2v(inp: dict, job_id: str) -> dict:
-    image_b64 = inp.get("image_b64")
-    if not image_b64:
+    if not inp.get("image_b64"):
         raise ValueError("'image_b64' is required for ltx/i2v")
 
     preset = inp.get("preset", "fast")
@@ -179,7 +188,7 @@ async def run_ltx_i2v(inp: dict, job_id: str) -> dict:
         int(inp.get("width", 544)), int(inp.get("height", 960)), aspect_ratio
     )
 
-    img_bytes = base64.b64decode(image_b64)
+    img_bytes = _decode_image_b64(inp["image_b64"], "image_b64")
     img_filename = f"ltx_i2v_{uuid.uuid4().hex}.png"
     img_path = INPUT_DIR / img_filename
     img_path.write_bytes(img_bytes)

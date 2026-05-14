@@ -31,6 +31,7 @@ fi
 # existing dirs (the base image ships empty ones) with symlinks so ComfyUI
 # finds weights on the network volume without copying 27 GB into the
 # container's writable layer.
+mkdir -p "$COMFY_ROOT/models"   # defensive — base image already provides this, but never assume
 for sub in diffusion_models vae text_encoders loras checkpoints latent_upscale_models; do
   src="$VOLUME_MODELS/$sub"
   dst="$COMFY_ROOT/models/$sub"
@@ -38,7 +39,6 @@ for sub in diffusion_models vae text_encoders loras checkpoints latent_upscale_m
     log "WARN: $src missing on volume — skipping (workflow may fail to load this category)"
     continue
   fi
-  # Replace stock empty dir with a symlink to the volume
   rm -rf "$dst"
   ln -s "$src" "$dst"
 done
