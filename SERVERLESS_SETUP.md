@@ -146,6 +146,8 @@ weights). First build downloads the base layer; second build reuses it.
    - `COMFYUI_URL` — override if you change ComfyUI's listen port.
    - `FACE_FILTER_THRESHOLD` — cosine similarity threshold for the face
      blocklist (default `0.6`, higher = stricter, fewer matches).
+   - `LOGO_FILTER_THRESHOLD` — cosine similarity threshold for the
+     logo/flag blocklist (default `0.85`).
 6. Click **Deploy**. RunPod pulls the image (~2 min first time), and
    the endpoint goes **Ready** when a worker has booted.
 

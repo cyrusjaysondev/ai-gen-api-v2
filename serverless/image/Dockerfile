@@ -35,8 +35,13 @@ COPY workflows.py /app/workflows.py
 # Model weights (~280 MB) are NOT baked into the image — they download once
 # on first use and cache on the network volume at /runpod-volume/insightface_models/.
 COPY safety.py /app/safety.py
+# Logo/flag blocklist filter — imported lazily on first logo_filter=true.
+# CLIP ViT-B/32 weights (~150 MB) cache at /runpod-volume/clip_models/.
+COPY logo_safety.py /app/logo_safety.py
 ENV INSIGHTFACE_MODEL_ROOT=/runpod-volume/insightface_models \
+    CLIP_MODEL_ROOT=/runpod-volume/clip_models \
     BLOCKLIST_DIR=/runpod-volume/blocklist \
+    BLOCKLIST_LOGOS_DIR=/runpod-volume/blocklist_logos \
     BYPASS_LOG=/runpod-volume/face_filter_bypass.log
 
 # Handler + entrypoint

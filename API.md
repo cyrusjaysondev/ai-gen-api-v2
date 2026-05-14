@@ -14,10 +14,14 @@ Interactive docs (Swagger UI): `https://YOUR_POD_ID-7860.proxy.runpod.net/docs`
 | POST | `/t2i` | Text to image (FLUX.2 Klein 9B) |
 | POST | `/flux/face-swap` | Head / face swap (FLUX.2 Klein 9B) |
 | POST | `/flux/i2i` | Multi-reference image editing — 1 to 5 input images (FLUX.2 Klein 9B) |
-| GET | `/admin/blocklist` | List blocked face identities (admin auth required) |
+| GET | `/admin/blocklist` | List blocked face identities (admin auth) |
 | POST | `/admin/blocklist` | Upload a face to block |
 | DELETE | `/admin/blocklist/{identity}` | Remove a blocked face |
-| GET | `/admin/blocklist/{identity}/image` | Download the stored face image (preview) |
+| GET | `/admin/blocklist/{identity}/image` | Preview a blocked face image |
+| GET | `/admin/blocklist-logos` | List blocked logos/flags (admin auth) |
+| POST | `/admin/blocklist-logos` | Upload a logo/flag to block |
+| DELETE | `/admin/blocklist-logos/{identity}` | Remove a blocked logo/flag |
+| GET | `/admin/blocklist-logos/{identity}/image` | Preview a blocked logo image |
 | POST | `/ltx/i2v` | Image to video (LTX 2.3) |
 | POST | `/ltx/t2v` | Text to video (LTX 2.3) |
 | POST | `/face-animate` | Face swap + animate pipeline |
@@ -572,12 +576,26 @@ done
 
 ---
 
-## Face Filter / Compliance
+## Compliance Filters
 
-`/flux/face-swap` and `/flux/i2i` accept an optional `face_filter` parameter
-(boolean, default `false`). When `true`, every input image is checked against
-a blocklist on the network volume; requests with any matching face are
-rejected with `400`.
+`/flux/face-swap` and `/flux/i2i` accept two **independent** compliance toggles:
+
+| Parameter | Default | Detector | Blocklist dir | What it catches |
+|---|---|---|---|---|
+| `face_filter` | `false` | InsightFace `buffalo_l` (face recognition) | `/workspace/blocklist/` | Specific human faces (politicians, celebrities, banned individuals) |
+| `logo_filter` | `false` | CLIP ViT-B/32 (whole-image semantic) | `/workspace/blocklist_logos/` | Logos, flags, symbols, propaganda imagery — anything that's the **main subject** of the input |
+
+Set either or both to `true` per request. They run in sequence; the first
+blocked input fails the whole request with `400`.
+
+### Limits
+
+- **Face filter** is precise (~99% recall on clear faces above threshold).
+- **Logo filter** is whole-image — it catches "this image is mostly the Apple logo"
+  but **may miss tiny logos in corners** of larger photos. For tight detection
+  of small logos, that's a v2 feature (SIFT keypoint matching).
+
+### Face Filter
 
 ### Request
 
@@ -605,15 +623,57 @@ curl -X POST "$POD/flux/i2i" \
 `score` is cosine similarity vs the closest blocklist entry; default threshold
 is `0.6` (override via `FACE_FILTER_THRESHOLD` env var on the pod).
 
+### Logo / flag filter
+
+```bash
+curl -X POST "$POD/flux/i2i" \
+  -F "prompt=stylize" \
+  -F "images=@input.png" \
+  -F "logo_filter=true"
+```
+
+Block response:
+```json
+{
+  "detail": {
+    "error": "blocked",
+    "filter": "logo",
+    "reason": "images[0] matches blocked logo/flag",
+    "matched_logo": "apple_logo",
+    "score": 0.91,
+    "image_index": 0
+  }
+}
+```
+
+Threshold defaults to `0.85` (override via `LOGO_FILTER_THRESHOLD` env var).
+
+### Both filters at once
+
+```bash
+curl -X POST "$POD/flux/face-swap" \
+  -F "target_image=@body.png" -F "face_image=@face.png" \
+  -F "face_filter=true" \
+  -F "logo_filter=true"
+```
+
+The response's `filter` field (`"face"` or `"logo"`) tells you which check
+fired. Face filter runs first.
+
 ### Bypass audit
 
-Every call where `face_filter=false` (or omitted) is logged with timestamp,
-endpoint, job_id, and image count to `/workspace/face_filter_bypass.log`.
-Compliance auditors can `cat` this file to see every bypass event.
+Every `face_filter=false` and `logo_filter=false` call is appended to
+`/workspace/face_filter_bypass.log` with timestamp, endpoint, job_id, and
+which filter was bypassed.
 
 ---
 
-## Admin API (face blocklist management)
+## Admin API (blocklist management)
+
+Two parallel sets of admin endpoints — one for faces, one for logos/flags.
+Same auth (`Authorization: Bearer $ADMIN_TOKEN`), same shape, same hot-reload.
+
+### Faces — `/admin/blocklist`
 
 All admin endpoints require `Authorization: Bearer $ADMIN_TOKEN`. Set
 `ADMIN_TOKEN` as an env var on the pod template. If unset, admin endpoints
@@ -692,6 +752,39 @@ curl "$POD/admin/blocklist/tom_hanks/image" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -o tom_hanks.png
 ```
+
+### Logos / flags — `/admin/blocklist-logos`
+
+Same shape as the face endpoints, different storage (`/workspace/blocklist_logos/`)
+and different validation (no face-detection prereq — any valid image is accepted).
+
+```bash
+# Upload
+curl -X POST "$POD/admin/blocklist-logos" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -F "identity=apple_logo" \
+  -F "image=@apple.png"
+
+# List
+curl "$POD/admin/blocklist-logos" -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# Delete
+curl -X DELETE "$POD/admin/blocklist-logos/apple_logo" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# Preview
+curl "$POD/admin/blocklist-logos/apple_logo/image" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -o apple.png
+```
+
+Response shape mirrors `/admin/blocklist`. The list response groups blocked
+logos by their `identity` (filename stem) — the same name returned in
+`matched_logo` on a block.
+
+**Tip:** tight crops give best CLIP discrimination. A blocklist image that
+fills the frame with the logo/flag scores ~0.9+ against itself; if the
+logo is small in the corner of your blocklist image, CLIP will embed the
+background's content instead and miss real-world matches.
 
 ---
 

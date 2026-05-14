@@ -33,9 +33,11 @@ fi
 # container's writable layer.
 mkdir -p "$COMFY_ROOT/models"   # defensive — base image already provides this, but never assume
 
-# Face-filter dirs on the volume (idempotent). The blocklist starts empty;
-# admins drop face images into it via SSH / S3.
-mkdir -p /runpod-volume/blocklist /runpod-volume/insightface_models
+# Compliance filter dirs on the volume (idempotent). The blocklists start
+# empty; admins manage them via the pod's /admin/blocklist and
+# /admin/blocklist-logos endpoints (mounted on the same volume).
+mkdir -p /runpod-volume/blocklist /runpod-volume/blocklist_logos \
+         /runpod-volume/insightface_models /runpod-volume/clip_models
 for sub in diffusion_models vae text_encoders loras checkpoints latent_upscale_models; do
   src="$VOLUME_MODELS/$sub"
   dst="$COMFY_ROOT/models/$sub"

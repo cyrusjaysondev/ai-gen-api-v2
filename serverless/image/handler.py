@@ -71,6 +71,10 @@ try:
     import safety as face_safety
 except ImportError:
     face_safety = None
+try:
+    import logo_safety
+except ImportError:
+    logo_safety = None
 
 
 COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")
@@ -101,27 +105,45 @@ def _stage_output_to_volume(filename: str, src: Path, job_id: str) -> Path:
 # the handler catches it and returns a structured error response.
 # ─────────────────────────────────────────────
 
-class FaceFilterBlocked(Exception):
-    def __init__(self, matched_identity: str, score: float, image_index: int, label: str):
-        self.matched_identity = matched_identity
+class FilterBlocked(Exception):
+    """Either filter (face or logo) matched. The handler converts this to
+    a structured error response."""
+    def __init__(self, filter_name: str, matched: str, score: float,
+                 image_index: int, label: str):
+        self.filter_name = filter_name   # "face" or "logo"
+        self.matched = matched
         self.score = score
         self.image_index = image_index
         self.label = label
-        super().__init__(f"{label} matches blocked identity '{matched_identity}'")
+        super().__init__(f"{label} matches blocked {filter_name} '{matched}'")
 
 
 def _apply_face_filter(endpoint: str, job_id: str, face_filter: bool,
                        images_with_names: list) -> None:
     if not face_filter:
         if face_safety is not None:
-            face_safety.log_bypass(job_id, endpoint, note=f"{len(images_with_names)} images")
+            face_safety.log_bypass(job_id, endpoint, note=f"face_filter=false, {len(images_with_names)} images")
         return
     if face_safety is None:
         raise RuntimeError("face filter requested but the `safety` module is not installed in this image")
     for idx, (img_bytes, label) in enumerate(images_with_names):
         result = face_safety.check_image(img_bytes)
         if result.blocked:
-            raise FaceFilterBlocked(result.matched_identity, result.score, idx, label)
+            raise FilterBlocked("face", result.matched_identity, result.score, idx, label)
+
+
+def _apply_logo_filter(endpoint: str, job_id: str, logo_filter: bool,
+                       images_with_names: list) -> None:
+    if not logo_filter:
+        if face_safety is not None:
+            face_safety.log_bypass(job_id, endpoint, note=f"logo_filter=false, {len(images_with_names)} images")
+        return
+    if logo_safety is None:
+        raise RuntimeError("logo filter requested but `logo_safety` (open_clip_torch) is not installed in this image")
+    for idx, (img_bytes, label) in enumerate(images_with_names):
+        result = logo_safety.check_image(img_bytes)
+        if result.blocked:
+            raise FilterBlocked("logo", result.matched_logo, result.score, idx, label)
 
 
 # ─────────────────────────────────────────────
@@ -261,10 +283,12 @@ async def run_flux_face_swap(inp: dict, job_id: str) -> dict:
     target_bytes = _decode_image_b64(inp["target_image_b64"], "target_image_b64")
     face_bytes   = _decode_image_b64(inp["face_image_b64"],   "face_image_b64")
 
-    _apply_face_filter("flux/face-swap", job_id, bool(inp.get("face_filter", False)), [
+    inputs_for_filter = [
         (target_bytes, "target_image_b64"),
         (face_bytes,   "face_image_b64"),
-    ])
+    ]
+    _apply_face_filter("flux/face-swap", job_id, bool(inp.get("face_filter", False)), inputs_for_filter)
+    _apply_logo_filter("flux/face-swap", job_id, bool(inp.get("logo_filter", False)), inputs_for_filter)
 
     if aspect_ratio != "original":
         w_r, h_r = ASPECT_RATIOS[aspect_ratio]
@@ -318,6 +342,7 @@ async def run_flux_i2i(inp: dict, job_id: str) -> dict:
         decoded.append((_decode_image_b64(b64, f"images_b64[{idx}]"), f"images_b64[{idx}]"))
 
     _apply_face_filter("flux/i2i", job_id, bool(inp.get("face_filter", False)), decoded)
+    _apply_logo_filter("flux/i2i", job_id, bool(inp.get("logo_filter", False)), decoded)
 
     # Stage each input image to ComfyUI's input dir
     input_filenames: list[str] = []
@@ -385,14 +410,19 @@ async def handler(event):
     job_id = event.get("id") or str(uuid.uuid4())
     try:
         return await ENDPOINTS[endpoint](inp, job_id)
-    except FaceFilterBlocked as e:
-        return {
+    except FilterBlocked as e:
+        resp = {
             "error": "blocked",
-            "reason": f"{e.label} matches blocked identity",
-            "matched_identity": e.matched_identity,
+            "filter": e.filter_name,
+            "reason": f"{e.label} matches blocked {e.filter_name}",
             "score": round(e.score, 4),
             "image_index": e.image_index,
         }
+        if e.filter_name == "face":
+            resp["matched_identity"] = e.matched
+        else:
+            resp["matched_logo"] = e.matched
+        return resp
     except ValueError as e:
         return {"error": str(e)}
     except Exception as e:

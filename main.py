@@ -31,6 +31,12 @@ try:
 except ImportError:
     face_safety = None
 
+# Compliance logo/flag filter — CLIP-based, separate blocklist dir.
+try:
+    import logo_safety
+except ImportError:
+    logo_safety = None
+
 app = FastAPI(title="AI Gen API v2")
 
 COMFYUI_URL = "http://127.0.0.1:8188"
@@ -298,7 +304,7 @@ def _apply_face_filter(endpoint: str, job_id: str, face_filter: bool,
     """images_with_names: list of (bytes, label) pairs. label is used in the error."""
     if not face_filter:
         if face_safety is not None:
-            face_safety.log_bypass(job_id, endpoint, note=f"{len(images_with_names)} images")
+            face_safety.log_bypass(job_id, endpoint, note=f"face_filter=false, {len(images_with_names)} images")
         return
     if face_safety is None:
         raise HTTPException(503, "face filter requested but `safety` module unavailable (insightface not installed)")
@@ -310,8 +316,35 @@ def _apply_face_filter(endpoint: str, job_id: str, face_filter: bool,
         if result.blocked:
             raise HTTPException(400, {
                 "error": "blocked",
-                "reason": f"{label} matches blocked identity",
+                "filter": "face",
+                "reason": f"{label} matches blocked face identity",
                 "matched_identity": result.matched_identity,
+                "score": round(result.score, 4),
+                "image_index": idx,
+            })
+
+
+def _apply_logo_filter(endpoint: str, job_id: str, logo_filter: bool,
+                       images_with_names: list) -> None:
+    """Parallel to _apply_face_filter but for the logo/flag blocklist (CLIP-based)."""
+    if not logo_filter:
+        # Reuse the face-filter bypass log so admins have one audit trail
+        if face_safety is not None:
+            face_safety.log_bypass(job_id, endpoint, note=f"logo_filter=false, {len(images_with_names)} images")
+        return
+    if logo_safety is None:
+        raise HTTPException(503, "logo filter requested but `logo_safety` module unavailable (open_clip_torch not installed)")
+    for idx, (img_bytes, label) in enumerate(images_with_names):
+        try:
+            result = logo_safety.check_image(img_bytes)
+        except RuntimeError as e:
+            raise HTTPException(503, f"logo filter unavailable: {e}")
+        if result.blocked:
+            raise HTTPException(400, {
+                "error": "blocked",
+                "filter": "logo",
+                "reason": f"{label} matches blocked logo/flag",
+                "matched_logo": result.matched_logo,
                 "score": round(result.score, 4),
                 "image_index": idx,
             })
@@ -648,7 +681,8 @@ async def flux_face_swap(
     cfg: float = Form(1.0),
     guidance: float = Form(4.0),
     lora_strength: float = Form(1.0),
-    face_filter: bool = Form(False, description="Reject the request if either input image matches a face in /workspace/blocklist/. Off by default; set true to enable compliance check. Every false call is recorded to /workspace/face_filter_bypass.log."),
+    face_filter: bool = Form(False, description="Reject the request if either input image matches a face in /workspace/blocklist/. Off by default."),
+    logo_filter: bool = Form(False, description="Reject the request if either input image matches a logo/flag in /workspace/blocklist_logos/. Off by default."),
 ):
     seed = seed if seed != -1 else uuid.uuid4().int % 2**32
 
@@ -659,12 +693,11 @@ async def flux_face_swap(
     target_bytes = await target_image.read()
     face_bytes = await face_image.read()
 
-    # Face filter — must run before any heavy work, before writing to disk
+    # Compliance filters — must run before any heavy work, before writing to disk
     job_id = str(uuid.uuid4())
-    _apply_face_filter("flux/face-swap", job_id, face_filter, [
-        (target_bytes, "target_image"),
-        (face_bytes,   "face_image"),
-    ])
+    inputs = [(target_bytes, "target_image"), (face_bytes, "face_image")]
+    _apply_face_filter("flux/face-swap", job_id, face_filter, inputs)
+    _apply_logo_filter("flux/face-swap", job_id, logo_filter, inputs)
 
     # If aspect ratio is specified, crop target image to that ratio before sending to ComfyUI.
     # The workflow's ImageScaleToTotalPixels + GetImageSize will then produce output at that AR.
@@ -707,23 +740,22 @@ async def flux_image_to_image(
     cfg: float = Form(1.0),
     guidance: float = Form(4.0),
     lora_strength: float = Form(0.0, description="Apply the head-swap LoRA. 0 = off (general edits). Set 0.5–1.0 for face/head-focused edits."),
-    face_filter: bool = Form(False, description="Reject the request if any input image matches a face in /workspace/blocklist/. Off by default; set true to enable compliance check. Every false call is recorded to /workspace/face_filter_bypass.log."),
+    face_filter: bool = Form(False, description="Reject if any input image matches a face in /workspace/blocklist/. Off by default."),
+    logo_filter: bool = Form(False, description="Reject if any input image matches a logo/flag in /workspace/blocklist_logos/. Off by default."),
 ):
     if not 1 <= len(images) <= 5:
         raise HTTPException(400, f"images must be 1–5 files, got {len(images)}")
 
     seed = seed if seed != -1 else uuid.uuid4().int % 2**32
 
-    # Read bytes once so we can run the face filter BEFORE writing anything
-    # to disk (cheaper to reject early).
     image_bytes_list: list[bytes] = []
     for up in images:
         image_bytes_list.append(await up.read())
 
     job_id = str(uuid.uuid4())
-    _apply_face_filter("flux/i2i", job_id, face_filter, [
-        (b, f"images[{i}]") for i, b in enumerate(image_bytes_list)
-    ])
+    labeled = [(b, f"images[{i}]") for i, b in enumerate(image_bytes_list)]
+    _apply_face_filter("flux/i2i", job_id, face_filter, labeled)
+    _apply_logo_filter("flux/i2i", job_id, logo_filter, labeled)
 
     # Save uploads to ComfyUI's input dir (only after filter passes)
     input_filenames: list[str] = []
@@ -902,4 +934,123 @@ async def admin_get_blocklist_image(
     existing = _find_existing_blocklist_file(identity)
     if not existing:
         raise HTTPException(404, f"identity '{identity}' is not on the blocklist")
+    return FileResponse(str(existing), filename=existing.name)
+
+
+# ─────────────────────────────────────────────
+# Admin API — manage the LOGO/FLAG blocklist (CLIP-based)
+#
+# Parallel to /admin/blocklist (faces). Stored at /workspace/blocklist_logos/.
+# Hot-reloaded on every logo-filter check.
+# ─────────────────────────────────────────────
+
+BLOCKLIST_LOGOS_DIR = Path(os.environ.get("BLOCKLIST_LOGOS_DIR", "/workspace/blocklist_logos"))
+
+
+def _find_existing_logo_file(identity: str):
+    for ext in ALLOWED_BLOCKLIST_EXTS:
+        p = BLOCKLIST_LOGOS_DIR / f"{identity}{ext}"
+        if p.exists():
+            return p
+    return None
+
+
+def _logo_blocklist_count() -> int:
+    if not BLOCKLIST_LOGOS_DIR.is_dir():
+        return 0
+    return sum(1 for p in BLOCKLIST_LOGOS_DIR.iterdir()
+               if p.is_file() and p.suffix.lower() in ALLOWED_BLOCKLIST_EXTS)
+
+
+@app.get("/admin/blocklist-logos")
+async def admin_list_logos(authorization: str = Header(default=None)):
+    """List all logos/flags on the blocklist."""
+    _require_admin(authorization)
+    BLOCKLIST_LOGOS_DIR.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for p in sorted(BLOCKLIST_LOGOS_DIR.iterdir()):
+        if p.is_file() and p.suffix.lower() in ALLOWED_BLOCKLIST_EXTS:
+            entries.append({
+                "identity": p.stem,
+                "filename": p.name,
+                "size_bytes": p.stat().st_size,
+                "added_at": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(),
+            })
+    return {"count": len(entries), "blocklist": entries}
+
+
+@app.post("/admin/blocklist-logos")
+async def admin_upload_logo(
+    image: UploadFile = File(..., description="Logo / flag / symbol image. Should be cropped tight on the subject for best CLIP discrimination."),
+    identity: str = Form(..., description="Stable identifier — e.g. 'apple_logo' or 'flag_xx'. Returned in block responses."),
+    overwrite: bool = Form(False, description="If true, replace an existing entry with the same identity"),
+    authorization: str = Header(default=None),
+):
+    """Add a logo/flag to the blocklist. Unlike faces, no face-detection
+    prerequisite — but the file must be a valid image."""
+    _require_admin(authorization)
+    _validate_identity(identity)
+    BLOCKLIST_LOGOS_DIR.mkdir(parents=True, exist_ok=True)
+
+    existing = _find_existing_logo_file(identity)
+    if existing and not overwrite:
+        raise HTTPException(409, f"logo '{identity}' already on blocklist as {existing.name}. Pass overwrite=true to replace.")
+
+    img_bytes = await image.read()
+
+    if logo_safety is None:
+        raise HTTPException(503, "logo filter module unavailable — cannot validate the uploaded image")
+    err = logo_safety.validate_uploadable(img_bytes)
+    if err:
+        raise HTTPException(400, err)
+
+    ext_from_filename = Path(image.filename or "").suffix.lower()
+    ext = ext_from_filename if ext_from_filename in ALLOWED_BLOCKLIST_EXTS else ".png"
+
+    if existing:
+        existing.unlink()
+
+    target = BLOCKLIST_LOGOS_DIR / f"{identity}{ext}"
+    target.write_bytes(img_bytes)
+
+    return {
+        "status": "replaced" if existing else "added",
+        "identity": identity,
+        "filename": target.name,
+        "size_bytes": target.stat().st_size,
+        "blocklist_count": _logo_blocklist_count(),
+    }
+
+
+@app.delete("/admin/blocklist-logos/{identity}")
+async def admin_delete_logo(
+    identity: str,
+    authorization: str = Header(default=None),
+):
+    """Remove a logo/flag from the blocklist."""
+    _require_admin(authorization)
+    _validate_identity(identity)
+    existing = _find_existing_logo_file(identity)
+    if not existing:
+        raise HTTPException(404, f"logo '{identity}' is not on the blocklist")
+    existing.unlink()
+    return {
+        "status": "deleted",
+        "identity": identity,
+        "filename": existing.name,
+        "blocklist_count": _logo_blocklist_count(),
+    }
+
+
+@app.get("/admin/blocklist-logos/{identity}/image")
+async def admin_get_logo_image(
+    identity: str,
+    authorization: str = Header(default=None),
+):
+    """Download the stored logo image for CMS preview."""
+    _require_admin(authorization)
+    _validate_identity(identity)
+    existing = _find_existing_logo_file(identity)
+    if not existing:
+        raise HTTPException(404, f"logo '{identity}' is not on the blocklist")
     return FileResponse(str(existing), filename=existing.name)

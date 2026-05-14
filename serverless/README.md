@@ -190,28 +190,48 @@ Response (same shape as t2i + a `ref_count` field):
 | `cfg` | 1.0 | CFG scale |
 | `guidance` | 4.0 | FLUX guidance (2.0–6.0) |
 | `lora_strength` | 0.0 | `0` = general edits, `0.5–1.0` = face/head-focused |
-| `face_filter` | false | If `true`, reject the request when any input image matches a face on `/runpod-volume/blocklist/`. See "Face filter" below. |
+| `face_filter` | false | Reject if any input image matches a face on `/runpod-volume/blocklist/`. |
+| `logo_filter` | false | Reject if any input image matches a logo/flag on `/runpod-volume/blocklist_logos/`. |
 
-### Face filter (compliance)
+### Compliance filters (face + logo, independent)
 
-Both `flux/face-swap` and `flux/i2i` accept `"face_filter": true` to enforce
-the blocklist on the network volume. The blocklist is managed via the pod's
-`/admin/blocklist` API (see top-level `API.md`); serverless workers
-share the same volume and hot-reload changes on every request.
+Both `flux/face-swap` and `flux/i2i` accept **two independent** compliance
+toggles: `face_filter` and `logo_filter`. They run in sequence on every
+input image. Both default to `false`. The blocklists are managed via the
+pod's `/admin/blocklist` and `/admin/blocklist-logos` admin APIs (see
+top-level `API.md`); serverless workers share the same network volume and
+hot-reload changes on every request.
 
-Block response:
+Block response (`filter` field tells you which check fired):
 ```json
 {
   "error": "blocked",
-  "reason": "target_image_b64 matches blocked identity",
-  "matched_identity": "celebrity_x",
+  "filter": "face",                       // or "logo"
+  "reason": "target_image_b64 matches blocked face",
+  "matched_identity": "celebrity_x",      // present when filter="face"
   "score": 0.87,
   "image_index": 0
 }
 ```
 
-Every `face_filter=false` call is appended to
+```json
+{
+  "error": "blocked",
+  "filter": "logo",
+  "reason": "images_b64[0] matches blocked logo/flag",
+  "matched_logo": "apple_logo",            // present when filter="logo"
+  "score": 0.91,
+  "image_index": 0
+}
+```
+
+Every `face_filter=false` or `logo_filter=false` is appended to
 `/runpod-volume/face_filter_bypass.log` for compliance audit.
+
+**Note on coverage:** the face filter (InsightFace) is precise on clear
+faces; the logo filter (CLIP whole-image) catches dominant logos but
+**may miss small logos in a corner** of a larger photo. Crop your
+blocklist entries tightly on the target for best CLIP recall.
 
 ### Video / ltx/i2v
 

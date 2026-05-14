@@ -176,6 +176,10 @@ $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | 
 # ~500MB total; the buffalo_l model itself (~280MB) is downloaded on first
 # face_filter=true request and cached at $INSIGHTFACE_MODEL_ROOT on the volume.
 $PIP install -q insightface onnxruntime-gpu 2>&1 | tail -1 || log "  WARN: insightface/onnxruntime-gpu install failed — face filter will return 503 if used"
+# Logo/flag filter dependency (CLIP ViT-B/32). ~600MB on disk; the model
+# weights (~150MB) download on first logo_filter=true request and cache at
+# $CLIP_MODEL_ROOT on the volume.
+$PIP install -q open_clip_torch 2>&1 | tail -1 || log "  WARN: open_clip_torch install failed — logo filter will return 503 if used"
 # SageAttention package install only — DO NOT auto-enable via comfyui_args.txt.
 # SageAttention 1.0.6 hangs the Gemma 12B prompt-enhancer's autoregressive
 # token-generation path (the kernel is tuned for fixed-shape diffusion
@@ -380,10 +384,14 @@ wget -q -O /workspace/api/safety.py "${API_REPO}/safety.py"
 if [ ! -s "/workspace/api/safety.py" ]; then
   log "  WARN: Failed to download safety.py — face_filter parameter will return 503 if used"
 fi
-log "  main.py + workflows.py + safety.py downloaded (latest)"
+wget -q -O /workspace/api/logo_safety.py "${API_REPO}/logo_safety.py"
+if [ ! -s "/workspace/api/logo_safety.py" ]; then
+  log "  WARN: Failed to download logo_safety.py — logo_filter parameter will return 503 if used"
+fi
+log "  main.py + workflows.py + safety.py + logo_safety.py downloaded (latest)"
 
-# Create the blocklist dir if it doesn't exist so admins know where to drop face images
-mkdir -p /workspace/blocklist
+# Create blocklist dirs so admins know where files land
+mkdir -p /workspace/blocklist /workspace/blocklist_logos
 
 # Save detected paths for start_api.sh and start_comfy.sh
 cat > /workspace/api/config.env << CONFEOF
@@ -537,9 +545,9 @@ source /workspace/api/config.env
 log "Installing pip deps..."
 $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | tail -1
 
-# Always fetch latest main.py + workflows.py + safety.py from repo on restart
+# Always fetch latest main.py + workflows.py + safety.py + logo_safety.py from repo on restart
 log "Fetching latest API code..."
-for f in main.py workflows.py safety.py; do
+for f in main.py workflows.py safety.py logo_safety.py; do
   wget -q -O "/workspace/api/$f.new" "${API_REPO}/$f"
   if [ -s "/workspace/api/$f.new" ]; then
     mv "/workspace/api/$f.new" "/workspace/api/$f"
