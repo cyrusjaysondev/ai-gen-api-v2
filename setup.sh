@@ -672,6 +672,49 @@ else
   log "API supervisor launched"
 fi
 
+# ─────────────────────────────────────────────
+# Video reaper — deletes videos older than RETENTION_DAYS (default 3)
+# from both the pod-mode output dir and the serverless staging dir on
+# the network volume. Without this, generated videos accumulate
+# forever and eventually fill the volume.
+# ─────────────────────────────────────────────
+log "Installing video reaper..."
+wget -q -O /workspace/cleanup.sh "${API_REPO}/cleanup.sh"
+if [ ! -s "/workspace/cleanup.sh" ]; then
+  log "  WARN: failed to download cleanup.sh — videos will not be auto-pruned"
+else
+  chmod +x /workspace/cleanup.sh
+
+  # Supervisor: runs cleanup.sh once, then sleeps 24h, repeats. Flock'd so
+  # re-running setup.sh doesn't spawn a second loop.
+  cat > /workspace/start_cleanup.sh << 'CLEANEOF'
+#!/bin/bash
+# =============================================================
+# AI Gen API v2 — daily reaper supervisor
+# Runs /workspace/cleanup.sh once every 24h. Flock guarded.
+# =============================================================
+LOG="/workspace/cleanup.log"
+exec 9>/var/lock/ai-gen-cleanup.lock
+if ! flock -n 9; then
+  echo "[$(date '+%H:%M:%S')] start_cleanup.sh: another reaper running — exiting" >> "$LOG"
+  exit 0
+fi
+while true; do
+  bash /workspace/cleanup.sh
+  sleep 86400  # 24h
+done
+CLEANEOF
+  chmod +x /workspace/start_cleanup.sh
+
+  if pgrep -xf "bash /workspace/start_cleanup.sh" >/dev/null 2>&1; then
+    log "  reaper supervisor already running — leaving it alone"
+  else
+    setsid nohup bash /workspace/start_cleanup.sh </dev/null >>/workspace/api_setup.log 2>&1 8>&- &
+    disown 2>/dev/null || true
+    log "  reaper supervisor launched (deletes videos older than 3 days, daily)"
+  fi
+fi
+
 log "=========================================="
 log "Setup Complete!"
 log "  API docs: https://${RUNPOD_POD_ID}-7860.proxy.runpod.net/docs"
