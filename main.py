@@ -11,6 +11,7 @@ from workflows import (
     LTX_ASPECT_RATIOS,
     LTX_DEFAULT_NEGATIVE,
     LTX_PRESETS,
+    build_flux_i2i_workflow,
     build_t2i_workflow,
     build_ltx_i2v_workflow,
     build_ltx_t2v_workflow,
@@ -634,3 +635,60 @@ async def flux_face_swap(
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
     background_tasks.add_task(run_job, job_id, workflow, [target_path, face_path])
     return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", "poll_url": f"{BASE_URL}/status/{job_id}"}
+
+
+# ─────────────────────────────────────────────
+# FLUX.2 Klein 9B Image-to-Image (multi-reference editing)
+# Up to 5 reference images — each one feeds a ReferenceLatent chained
+# onto the prompt's conditioning. Output dimensions default to the first
+# image's (rescaled) size, or override via width/height.
+# ─────────────────────────────────────────────
+
+@app.post("/flux/i2i")
+async def flux_image_to_image(
+    background_tasks: BackgroundTasks,
+    prompt: str = Form(..., description="What to do — edit instructions"),
+    images: list[UploadFile] = File(..., description="1 to 5 reference images. The first one's dimensions (after rescale) are used as the output canvas unless width/height are set."),
+    seed: int = Form(-1),
+    megapixels: float = Form(2.0, description="Resolution per reference image in megapixels (0.5–4.0)"),
+    width: int = Form(0, description="Output width — 0 (default) means: derive from the first image"),
+    height: int = Form(0, description="Output height — 0 (default) means: derive from the first image"),
+    steps: int = Form(4),
+    cfg: float = Form(1.0),
+    guidance: float = Form(4.0),
+    lora_strength: float = Form(0.0, description="Apply the head-swap LoRA. 0 = off (general edits). Set 0.5–1.0 for face/head-focused edits."),
+):
+    if not 1 <= len(images) <= 5:
+        raise HTTPException(400, f"images must be 1–5 files, got {len(images)}")
+
+    seed = seed if seed != -1 else uuid.uuid4().int % 2**32
+
+    # Save uploads to ComfyUI's input dir
+    input_filenames: list[str] = []
+    cleanup_paths: list[str] = []
+    for idx, up in enumerate(images):
+        img_bytes = await up.read()
+        fn = f"flux_i2i_{uuid.uuid4().hex}_{idx}.png"
+        p = str(INPUT_DIR / fn)
+        Path(p).write_bytes(img_bytes)
+        input_filenames.append(fn)
+        cleanup_paths.append(p)
+
+    workflow = build_flux_i2i_workflow(
+        input_filenames, prompt, seed,
+        megapixels=megapixels,
+        output_width=width, output_height=height,
+        steps=steps, cfg=cfg, guidance=guidance,
+        lora_strength=lora_strength,
+    )
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
+    background_tasks.add_task(run_job, job_id, workflow, cleanup_paths)
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "model": "flux2-klein-9b",
+        "ref_count": len(images),
+        "poll_url": f"{BASE_URL}/status/{job_id}",
+    }

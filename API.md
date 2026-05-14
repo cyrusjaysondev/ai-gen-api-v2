@@ -13,6 +13,7 @@ Interactive docs (Swagger UI): `https://YOUR_POD_ID-7860.proxy.runpod.net/docs`
 | GET | `/health` | Health check |
 | POST | `/t2i` | Text to image (FLUX.2 Klein 9B) |
 | POST | `/flux/face-swap` | Head / face swap (FLUX.2 Klein 9B) |
+| POST | `/flux/i2i` | Multi-reference image editing — 1 to 5 input images (FLUX.2 Klein 9B) |
 | POST | `/ltx/i2v` | Image to video (LTX 2.3) |
 | POST | `/ltx/t2v` | Text to video (LTX 2.3) |
 | POST | `/face-animate` | Face swap + animate pipeline |
@@ -195,6 +196,58 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/face-swap \
   -F "aspect_ratio=9:16" \
   -F "megapixels=2.0"
 ```
+
+---
+
+## POST /flux/i2i — Multi-reference Image Editing
+
+Edit / compose with 1 to 5 reference images. All inputs are chained as FLUX.2
+reference latents on top of the prompt's conditioning — the prompt drives
+the edit, the images supply style, identity, objects, composition cues.
+
+Output canvas dimensions default to the **first image's rescaled size**, so
+you can use the first image as the "edit target" and the rest as references.
+Override explicitly with `width` and `height` if you want a fixed canvas.
+
+### Parameters (multipart/form-data)
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `prompt` | required | The edit instruction |
+| `images` | required | 1 to 5 image files. First image's dimensions are used as the canvas unless `width`/`height` are set |
+| `seed` | -1 (random) | Reproducibility seed |
+| `megapixels` | 2.0 | Resolution per reference image (0.5–4.0) |
+| `width` | 0 | Output width — `0` means "derive from first image" |
+| `height` | 0 | Output height — `0` means "derive from first image" |
+| `steps` | 4 | Inference steps |
+| `cfg` | 1.0 | CFG scale |
+| `guidance` | 4.0 | FLUX guidance strength (2.0–6.0) |
+| `lora_strength` | 0.0 | Apply head-swap LoRA. `0` = general edits; `0.5–1.0` = face/head-focused |
+
+### Example
+
+```bash
+curl -X POST "$POD/flux/i2i" \
+  -F "prompt=combine the subject from image 1 with the outfit from image 2 in the setting of image 3" \
+  -F "images=@subject.png" \
+  -F "images=@outfit.png" \
+  -F "images=@setting.png" \
+  -F "megapixels=2.0" \
+  -F "seed=42"
+```
+
+Response shape is the standard job-queue response:
+```json
+{
+  "job_id": "...",
+  "status": "queued",
+  "model": "flux2-klein-9b",
+  "ref_count": 3,
+  "poll_url": "https://YOUR_POD_ID-7860.proxy.runpod.net/status/..."
+}
+```
+
+Poll `/status/{job_id}` for the result URL, just like the other endpoints.
 
 ---
 

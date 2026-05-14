@@ -1,7 +1,7 @@
 # AI Gen API v2
 
 API on RunPod for:
-- **FLUX.2 Klein 9B** — text-to-image + AI head/face swap
+- **FLUX.2 Klein 9B** — text-to-image, head/face swap, multi-reference image editing (1–5 input images)
 - **LTX 2.3 22B** — image-to-video, text-to-video, face-animate pipeline
 
 Two ways to run it:
@@ -9,7 +9,7 @@ Two ways to run it:
   FastAPI on `:7860`, models on `/workspace`. Pay per pod-second.
 - **Serverless mode** ([SERVERLESS_SETUP.md](SERVERLESS_SETUP.md) for step-by-step
   deploy, [serverless/README.md](serverless/README.md) for the API reference) —
-  split into an **image endpoint** (`t2i`, `flux/face-swap`) and a **video
+  split into an **image endpoint** (`t2i`, `flux/face-swap`, `flux/i2i`) and a **video
   endpoint** (`ltx/i2v`, `ltx/t2v`). Same models, mounted from the same network
   volume the pod uses. Pay per request, scale to zero.
 
@@ -166,6 +166,30 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/face-swap \
 | `cfg` | 1.0 | CFG scale |
 | `guidance` | 4.0 | FLUX guidance (2.0-6.0) |
 | `lora_strength` | 1.0 | Head swap LoRA strength (0.0-1.5) |
+
+### Multi-reference Image Editing (FLUX)
+Send 1 to 5 reference images plus a prompt. The prompt drives the edit; the
+images supply style, identity, objects, composition cues. Output canvas
+defaults to the first image's dimensions.
+
+```bash
+curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/i2i \
+  -F "prompt=combine the subject from image 1 with the outfit from image 2" \
+  -F "images=@subject.png" \
+  -F "images=@outfit.png"
+```
+
+**Parameters:**
+| Param | Default | Description |
+|-------|---------|-------------|
+| `prompt` | required | Edit instruction |
+| `images` | required | 1 to 5 image files (repeat `-F "images=@..."`) |
+| `seed` | -1 (random) | Reproducibility seed |
+| `megapixels` | 2.0 | Resolution per reference image (0.5-4.0) |
+| `width` / `height` | 0 / 0 | `0` = derive from first image |
+| `steps` | 4 | Inference steps |
+| `guidance` | 4.0 | FLUX guidance (2.0-6.0) |
+| `lora_strength` | 0.0 | `0` = general edits, `0.5-1.0` = face-focused edits |
 
 ### Check Job Status
 ```bash

@@ -14,7 +14,7 @@ Two RunPod serverless endpoints share the same network volume that the pod uses:
 
 | Endpoint | Workflows | Image size | Models loaded from volume |
 |---|---|---|---|
-| **Image** (`serverless/image/`) | `t2i`, `flux/face-swap` | ~6 GB (no weights baked in) | FLUX.2 Klein 9B + VAE + Qwen 3 + BFS LoRA |
+| **Image** (`serverless/image/`) | `t2i`, `flux/face-swap`, `flux/i2i` | ~6 GB (no weights baked in) | FLUX.2 Klein 9B + VAE + Qwen 3 + BFS LoRA |
 | **Video** (`serverless/video/`) | `ltx/i2v`, `ltx/t2v` | ~6 GB | LTX-2.3 22B + distilled LoRA + Gemma 12B + Gemma LoRA + upscaler |
 
 `face-animate` is **client-orchestrated**: call image first, then feed the
@@ -139,6 +139,58 @@ curl -X POST "$ENDPOINT" \
   }"
 ```
 
+### Image / flux/i2i (multi-reference editing, 1–5 images)
+
+Send 1 to 5 base64-encoded images plus an edit prompt. Output canvas
+defaults to the first image's rescaled dimensions; override with
+`width`/`height` if you need a fixed size. Each input image accepts
+either raw base64 or a `data:image/...;base64,...` data URI.
+
+```bash
+A=$(base64 -w0 subject.png)
+B=$(base64 -w0 outfit.png)
+C=$(base64 -w0 setting.png)
+
+curl -X POST "$ENDPOINT" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"input\": {
+      \"endpoint\": \"flux/i2i\",
+      \"images_b64\": [\"$A\", \"$B\", \"$C\"],
+      \"prompt\": \"the subject from image 1 wearing the outfit from image 2 in the setting of image 3, photorealistic\",
+      \"megapixels\": 2.0,
+      \"seed\": 42
+    }
+  }"
+```
+
+Response (same shape as t2i + a `ref_count` field):
+```json
+{
+  "output": {
+    "image_path": "/runpod-volume/outputs/<job_id>/flux_i2i_42_00001_.png",
+    "filename":   "flux_i2i_42_00001_.png",
+    "size_bytes": 412104,
+    "seed": 42,
+    "ref_count": 3,
+    "duration_seconds": 14.7
+  }
+}
+```
+
+| Param | Default | Notes |
+|---|---|---|
+| `images_b64` | required | List of 1–5 base64 strings (data URI prefix ok) |
+| `prompt` | required | The edit instruction |
+| `seed` | -1 | Reproducibility seed |
+| `megapixels` | 2.0 | Resolution per reference image |
+| `width` / `height` | 0 / 0 | `0` = derive from first image |
+| `steps` | 4 | Inference steps |
+| `cfg` | 1.0 | CFG scale |
+| `guidance` | 4.0 | FLUX guidance (2.0–6.0) |
+| `lora_strength` | 0.0 | `0` = general edits, `0.5–1.0` = face/head-focused |
+
 ### Video / ltx/i2v
 
 ```bash
@@ -262,4 +314,5 @@ on the volume may be incomplete; try mounting the volume on a pod and
 running `setup.sh` to re-verify sizes.
 
 **`unknown endpoint 'foo'`** — `input.endpoint` must be exactly one of
-`t2i`, `flux/face-swap`, `ltx/i2v`, `ltx/t2v` (no leading slash).
+`t2i`, `flux/face-swap`, `flux/i2i` (image worker) or `ltx/i2v`, `ltx/t2v`
+(video worker). No leading slash.

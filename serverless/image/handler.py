@@ -3,7 +3,8 @@ RunPod serverless handler — Image worker (FLUX.2 Klein 9B).
 
 Endpoints supported via `event["input"]["endpoint"]`:
   - "t2i"            text-to-image
-  - "flux/face-swap" face / head swap
+  - "flux/face-swap" face / head swap (2 reference images: target body + face)
+  - "flux/i2i"       multi-reference image editing (1–5 reference images + prompt)
 
 Models read from the network volume at /runpod-volume/runpod-slim/ComfyUI/models
 (linked into ComfyUI's models dir by start.sh before the handler boots).
@@ -60,6 +61,7 @@ import runpod
 sys.path.insert(0, "/app")
 from workflows import (
     ASPECT_RATIOS,
+    build_flux_i2i_workflow,
     build_t2i_workflow,
     compute_dimensions,
     crop_to_aspect,
@@ -262,9 +264,58 @@ async def run_flux_face_swap(inp: dict, job_id: str) -> dict:
         (INPUT_DIR / face_filename).unlink(missing_ok=True)
 
 
+async def run_flux_i2i(inp: dict, job_id: str) -> dict:
+    images_b64 = inp.get("images_b64")
+    if not isinstance(images_b64, list) or not (1 <= len(images_b64) <= 5):
+        raise ValueError("'images_b64' must be a list of 1 to 5 base64-encoded images")
+
+    prompt = inp.get("prompt") or ""
+    seed = inp.get("seed", -1)
+    seed = seed if seed != -1 else uuid.uuid4().int % 2**32
+
+    # Decode + stage each input image to ComfyUI's input dir
+    input_filenames: list[str] = []
+    staged_paths: list[Path] = []
+    try:
+        for idx, b64 in enumerate(images_b64):
+            img_bytes = _decode_image_b64(b64, f"images_b64[{idx}]")
+            fn = f"flux_i2i_{uuid.uuid4().hex}_{idx}.png"
+            p = INPUT_DIR / fn
+            p.write_bytes(img_bytes)
+            input_filenames.append(fn)
+            staged_paths.append(p)
+
+        workflow = build_flux_i2i_workflow(
+            input_filenames, prompt, seed,
+            megapixels=float(inp.get("megapixels", 2.0)),
+            output_width=int(inp.get("width", 0)),
+            output_height=int(inp.get("height", 0)),
+            steps=int(inp.get("steps", 4)),
+            cfg=float(inp.get("cfg", 1.0)),
+            guidance=float(inp.get("guidance", 4.0)),
+            lora_strength=float(inp.get("lora_strength", 0.0)),
+        )
+
+        started = time.time()
+        filename, src = await submit_and_wait(workflow)
+        dest = _stage_output_to_volume(filename, src, job_id)
+        return {
+            "image_path": str(dest),
+            "filename": filename,
+            "size_bytes": dest.stat().st_size,
+            "seed": seed,
+            "ref_count": len(images_b64),
+            "duration_seconds": round(time.time() - started, 2),
+        }
+    finally:
+        for p in staged_paths:
+            p.unlink(missing_ok=True)
+
+
 ENDPOINTS = {
     "t2i": run_t2i,
     "flux/face-swap": run_flux_face_swap,
+    "flux/i2i": run_flux_i2i,
 }
 
 

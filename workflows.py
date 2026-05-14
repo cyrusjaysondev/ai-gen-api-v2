@@ -139,6 +139,106 @@ def get_flux_face_swap_workflow(target_filename: str, face_filename: str, seed: 
 
 
 # ─────────────────────────────────────────────
+# FLUX.2 Klein 9B — Image to Image (multi-reference editing)
+# ─────────────────────────────────────────────
+
+DEFAULT_I2I_PROMPT = (
+    "edit the image faithfully according to the instructions, preserving "
+    "lighting, perspective, and identity where not explicitly changed; "
+    "photorealistic, sharp details, 4K."
+)
+
+
+def build_flux_i2i_workflow(image_filenames: list, prompt: str, seed: int,
+                             megapixels: float = 2.0,
+                             output_width: int = 0, output_height: int = 0,
+                             steps: int = 4, cfg: float = 1.0, guidance: float = 4.0,
+                             lora_strength: float = 0.0) -> dict:
+    """Build an N-image FLUX.2 reference workflow (1 <= N <= 5).
+
+    All input images are encoded to latents and chained as ReferenceLatents
+    on top of the prompt's conditioning. The prompt drives the edit; the
+    images supply style, identity, objects, composition cues.
+
+    Output dimensions:
+      - If output_width AND output_height are both > 0, use those directly.
+      - Otherwise, derive from the FIRST image (encode → decode → GetImageSize)
+        after the megapixels rescale, so the result matches the canvas the
+        caller probably has in mind.
+
+    `lora_strength` activates the head-swap LoRA when > 0 (use for face-related
+    edits). Set 0 (default) for general edits.
+    """
+    if not image_filenames or len(image_filenames) > 5:
+        raise ValueError(f"build_flux_i2i_workflow needs 1-5 images, got {len(image_filenames)}")
+    if not prompt:
+        prompt = DEFAULT_I2I_PROMPT
+
+    nodes = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux-2-klein-9b.safetensors", "weight_dtype": "default"}},
+        "2": {"class_type": "VAELoader",  "inputs": {"vae_name":  "flux2-vae.safetensors"}},
+        "3": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_3_8b_fp8mixed.safetensors", "type": "flux2", "device": "default"}},
+    }
+
+    if lora_strength > 0:
+        nodes["4"] = {"class_type": "LoraLoaderModelOnly", "inputs": {
+            "model": ["1", 0],
+            "lora_name": "bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors",
+            "strength_model": lora_strength,
+        }}
+        model_ref = ["4", 0]
+    else:
+        model_ref = ["1", 0]
+
+    # Prompt conditioning
+    nodes["10"] = {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["3", 0]}}
+
+    # Load + scale + encode each image; chain ReferenceLatents.
+    cond_chain = ["10", 0]
+    for i, fname in enumerate(image_filenames):
+        load_id  = f"20{i}"
+        scale_id = f"21{i}"
+        enc_id   = f"22{i}"
+        ref_id   = f"23{i}"
+        nodes[load_id]  = {"class_type": "LoadImage",                "inputs": {"image": fname}}
+        nodes[scale_id] = {"class_type": "ImageScaleToTotalPixels",  "inputs": {
+            "image": [load_id, 0], "upscale_method": "lanczos",
+            "megapixels": megapixels, "resolution_steps": 1
+        }}
+        nodes[enc_id]   = {"class_type": "VAEEncode", "inputs": {"pixels": [scale_id, 0], "vae": ["2", 0]}}
+        nodes[ref_id]   = {"class_type": "ReferenceLatent", "inputs": {"conditioning": cond_chain, "latent": [enc_id, 0]}}
+        cond_chain = [ref_id, 0]
+
+    nodes["30"] = {"class_type": "FluxGuidance",        "inputs": {"conditioning": cond_chain, "guidance": guidance}}
+    nodes["31"] = {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["10", 0]}}
+
+    # Pick canvas dimensions
+    if output_width > 0 and output_height > 0:
+        nodes["40"] = {"class_type": "EmptyFlux2LatentImage", "inputs": {
+            "width": int(output_width), "height": int(output_height), "batch_size": 1
+        }}
+    else:
+        # Derive from the first (rescaled) image via decode+GetImageSize
+        nodes["41"] = {"class_type": "VAEDecode",    "inputs": {"samples": ["220", 0], "vae": ["2", 0]}}
+        nodes["42"] = {"class_type": "GetImageSize", "inputs": {"image": ["41", 0]}}
+        nodes["40"] = {"class_type": "EmptyFlux2LatentImage", "inputs": {
+            "width": ["42", 0], "height": ["42", 1], "batch_size": 1
+        }}
+
+    nodes["50"] = {"class_type": "KSampler", "inputs": {
+        "model": model_ref, "positive": ["30", 0], "negative": ["31", 0],
+        "latent_image": ["40", 0], "seed": seed, "steps": steps, "cfg": cfg,
+        "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0,
+    }}
+    nodes["60"] = {"class_type": "VAEDecode", "inputs": {"samples": ["50", 0], "vae": ["2", 0]}}
+    nodes["70"] = {"class_type": "SaveImage", "inputs": {
+        "images": ["60", 0], "filename_prefix": f"images/flux_i2i_{seed}"
+    }}
+
+    return nodes
+
+
+# ─────────────────────────────────────────────
 # LTX-2.3 — shared helpers
 # ─────────────────────────────────────────────
 

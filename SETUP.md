@@ -1,6 +1,6 @@
 # AI Gen API v2 — RunPod Setup Guide
 
-FLUX.2 Klein 9B · Face Swap + Text-to-Image
+FLUX.2 Klein 9B · Face Swap + Text-to-Image + Multi-reference Image Editing
 LTX 2.3 22B · Image-to-Video + Text-to-Video + Face-Animate Pipeline
 
 ---
