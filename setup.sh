@@ -358,13 +358,18 @@ fi
 log "[4/4] Setting up API..."
 mkdir -p /workspace/api
 
-# Always fetch latest main.py from repo
+# Always fetch latest main.py + workflows.py from repo
 wget -q -O /workspace/api/main.py "${API_REPO}/main.py"
 if [ ! -s "/workspace/api/main.py" ]; then
   log "  ERROR: Failed to download main.py"
   exit 1
 fi
-log "  main.py downloaded (latest)"
+wget -q -O /workspace/api/workflows.py "${API_REPO}/workflows.py"
+if [ ! -s "/workspace/api/workflows.py" ]; then
+  log "  ERROR: Failed to download workflows.py (shared with serverless workers)"
+  exit 1
+fi
+log "  main.py + workflows.py downloaded (latest)"
 
 # Save detected paths for start_api.sh and start_comfy.sh
 cat > /workspace/api/config.env << CONFEOF
@@ -518,7 +523,7 @@ source /workspace/api/config.env
 log "Installing pip deps..."
 $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | tail -1
 
-# Always fetch latest main.py from repo on restart
+# Always fetch latest main.py + workflows.py from repo on restart
 log "Fetching latest API code..."
 wget -q -O /workspace/api/main.py.new "${API_REPO}/main.py"
 if [ -s "/workspace/api/main.py.new" ]; then
@@ -526,6 +531,13 @@ if [ -s "/workspace/api/main.py.new" ]; then
 else
   log "WARN: Failed to download main.py — using existing version"
   rm -f /workspace/api/main.py.new
+fi
+wget -q -O /workspace/api/workflows.py.new "${API_REPO}/workflows.py"
+if [ -s "/workspace/api/workflows.py.new" ]; then
+  mv /workspace/api/workflows.py.new /workspace/api/workflows.py
+else
+  log "WARN: Failed to download workflows.py — using existing version"
+  rm -f /workspace/api/workflows.py.new
 fi
 
 # Wait for ComfyUI to be ready

@@ -1,0 +1,283 @@
+"""
+RunPod serverless handler — Video worker (LTX-2.3 22B).
+
+Endpoints supported via `event["input"]["endpoint"]`:
+  - "ltx/i2v"  image-to-video
+  - "ltx/t2v"  text-to-video
+
+Models read from the network volume at /runpod-volume/runpod-slim/ComfyUI/models
+(linked into ComfyUI's models dir by start.sh before the handler boots).
+
+Output files are written to /runpod-volume/outputs/<job-id>/<filename> so the
+client (which also has the network volume mounted) can read them — base64 is
+not used here since LTX videos routinely exceed RunPod's ~10 MB response cap.
+
+Input (i2v):
+  {
+    "input": {
+      "endpoint": "ltx/i2v",
+      "image_b64": "iVBOR...",
+      "prompt": "...",
+      "negative_prompt": "...",       (optional)
+      "preset": "fast",               (fast | quality)
+      "aspect_ratio": "9:16",
+      "width": 544, "height": 960,
+      "length": 121, "fps": 24,
+      "seed": -1,
+      "audio": false,
+      "enhance_prompt": true
+    }
+  }
+
+Input (t2v):
+  {
+    "input": {
+      "endpoint": "ltx/t2v",
+      "prompt": "...",
+      "negative_prompt": "...",       (optional)
+      "preset": "fast",
+      "aspect_ratio": "16:9",
+      "width": 1280, "height": 720,
+      "length": 121, "fps": 24,
+      "seed": -1,
+      "audio": false
+    }
+  }
+
+Output (success):
+  {
+    "video_path": "/runpod-volume/outputs/<job-id>/ltx_i2v_42_00001_.mp4",
+    "filename":   "ltx_i2v_42_00001_.mp4",
+    "size_bytes": 18472104,
+    "seed": 42,
+    "duration_seconds": 87.4
+  }
+"""
+
+import json
+import base64
+import os
+import shutil
+import sys
+import time
+import uuid
+from pathlib import Path
+
+import httpx
+import runpod
+import websockets
+
+sys.path.insert(0, "/app")
+from workflows import (
+    LTX_ASPECT_RATIOS,
+    LTX_DEFAULT_NEGATIVE,
+    LTX_PRESETS,
+    build_ltx_i2v_workflow,
+    build_ltx_t2v_workflow,
+    compute_ltx_dimensions,
+)
+
+
+COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")
+COMFY_ROOT = Path(os.environ.get("COMFY_ROOT", "/comfyui"))
+OUTPUT_DIR = COMFY_ROOT / "output"
+INPUT_DIR = COMFY_ROOT / "input"
+INPUT_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+VOLUME_OUTPUTS = Path(os.environ.get("VOLUME_OUTPUTS", "/runpod-volume/outputs"))
+VOLUME_OUTPUTS.mkdir(parents=True, exist_ok=True)
+
+
+def wait_for_comfyui(timeout_s: int = 300) -> None:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            r = httpx.get(f"{COMFYUI_URL}/system_stats", timeout=2.0)
+            if r.status_code == 200:
+                return
+        except Exception:
+            pass
+        time.sleep(1)
+    raise RuntimeError(f"ComfyUI not ready after {timeout_s}s at {COMFYUI_URL}")
+
+
+async def submit_and_wait(workflow: dict) -> tuple[str, Path]:
+    client_id = str(uuid.uuid4())
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            f"{COMFYUI_URL}/prompt",
+            json={"prompt": workflow, "client_id": client_id},
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"ComfyUI rejected workflow: {resp.text}")
+        prompt_id = resp.json()["prompt_id"]
+
+    ws_url = f"{COMFYUI_URL.replace('http', 'ws')}/ws?clientId={client_id}"
+    async with websockets.connect(ws_url, max_size=None) as ws:
+        while True:
+            raw = await ws.recv()
+            if isinstance(raw, bytes):
+                continue
+            msg = json.loads(raw)
+            if msg.get("type") == "executing":
+                data = msg.get("data", {})
+                if data.get("node") is None and data.get("prompt_id") == prompt_id:
+                    break
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        history = await client.get(f"{COMFYUI_URL}/history/{prompt_id}")
+        job_data = history.json().get(prompt_id, {})
+
+    status = job_data.get("status", {}).get("status_str", "")
+    if status == "error":
+        for m in job_data.get("status", {}).get("messages", []):
+            if m[0] == "execution_error":
+                raise RuntimeError(m[1].get("exception_message", "ComfyUI execution error"))
+        raise RuntimeError("ComfyUI execution error (no detail in history)")
+
+    for node_output in job_data.get("outputs", {}).values():
+        for key in ("videos", "gifs", "images"):
+            if key in node_output:
+                item = node_output[key][0]
+                filename = item["filename"]
+                subfolder = item.get("subfolder", "")
+                path = OUTPUT_DIR / subfolder / filename if subfolder else OUTPUT_DIR / filename
+                if path.exists():
+                    return filename, path
+
+    raise RuntimeError("ComfyUI completed but no output file was found in history")
+
+
+def _validate_preset_and_aspect(preset: str, aspect_ratio: str) -> None:
+    if preset not in LTX_PRESETS:
+        raise ValueError(f"invalid preset '{preset}'; valid: {', '.join(LTX_PRESETS)}")
+    if aspect_ratio != "original" and aspect_ratio not in LTX_ASPECT_RATIOS:
+        raise ValueError(f"invalid aspect_ratio '{aspect_ratio}'; valid: original, {', '.join(LTX_ASPECT_RATIOS)}")
+
+
+def _stage_output_to_volume(filename: str, src: Path, job_id: str) -> Path:
+    dest_dir = VOLUME_OUTPUTS / job_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / filename
+    shutil.copy2(src, dest)
+    return dest
+
+
+async def run_ltx_i2v(inp: dict, job_id: str) -> dict:
+    image_b64 = inp.get("image_b64")
+    if not image_b64:
+        raise ValueError("'image_b64' is required for ltx/i2v")
+
+    preset = inp.get("preset", "fast")
+    aspect_ratio = inp.get("aspect_ratio", "9:16")
+    _validate_preset_and_aspect(preset, aspect_ratio)
+
+    seed = inp.get("seed", -1)
+    seed = seed if seed != -1 else uuid.uuid4().int % 2**32
+    width, height = compute_ltx_dimensions(
+        int(inp.get("width", 544)), int(inp.get("height", 960)), aspect_ratio
+    )
+
+    img_bytes = base64.b64decode(image_b64)
+    img_filename = f"ltx_i2v_{uuid.uuid4().hex}.png"
+    img_path = INPUT_DIR / img_filename
+    img_path.write_bytes(img_bytes)
+
+    workflow = build_ltx_i2v_workflow(
+        image_filename=img_filename,
+        prompt=inp.get("prompt", ""),
+        negative_prompt=inp.get("negative_prompt", LTX_DEFAULT_NEGATIVE),
+        width=width, height=height,
+        length=int(inp.get("length", 121)),
+        fps=int(inp.get("fps", 24)),
+        seed=seed,
+        preset=preset,
+        audio=bool(inp.get("audio", False)),
+        enhance_prompt=bool(inp.get("enhance_prompt", True)),
+    )
+
+    started = time.time()
+    try:
+        filename, src = await submit_and_wait(workflow)
+        dest = _stage_output_to_volume(filename, src, job_id)
+        return {
+            "video_path": str(dest),
+            "filename": filename,
+            "size_bytes": dest.stat().st_size,
+            "seed": seed,
+            "duration_seconds": round(time.time() - started, 2),
+        }
+    finally:
+        img_path.unlink(missing_ok=True)
+
+
+async def run_ltx_t2v(inp: dict, job_id: str) -> dict:
+    prompt = inp.get("prompt")
+    if not prompt:
+        raise ValueError("'prompt' is required for ltx/t2v")
+
+    preset = inp.get("preset", "fast")
+    aspect_ratio = inp.get("aspect_ratio", "16:9")
+    _validate_preset_and_aspect(preset, aspect_ratio)
+
+    seed = inp.get("seed", -1)
+    seed = seed if seed != -1 else uuid.uuid4().int % 2**32
+    width, height = compute_ltx_dimensions(
+        int(inp.get("width", 1280)), int(inp.get("height", 720)), aspect_ratio
+    )
+
+    workflow = build_ltx_t2v_workflow(
+        prompt=prompt,
+        negative_prompt=inp.get("negative_prompt", LTX_DEFAULT_NEGATIVE),
+        width=width, height=height,
+        length=int(inp.get("length", 121)),
+        fps=int(inp.get("fps", 24)),
+        seed=seed,
+        preset=preset,
+        audio=bool(inp.get("audio", False)),
+    )
+
+    started = time.time()
+    filename, src = await submit_and_wait(workflow)
+    dest = _stage_output_to_volume(filename, src, job_id)
+    return {
+        "video_path": str(dest),
+        "filename": filename,
+        "size_bytes": dest.stat().st_size,
+        "seed": seed,
+        "duration_seconds": round(time.time() - started, 2),
+    }
+
+
+ENDPOINTS = {
+    "ltx/i2v": run_ltx_i2v,
+    "ltx/t2v": run_ltx_t2v,
+}
+
+
+_comfyui_ready = False
+
+
+async def handler(event):
+    global _comfyui_ready
+    if not _comfyui_ready:
+        wait_for_comfyui()
+        _comfyui_ready = True
+
+    inp = event.get("input") or {}
+    endpoint = inp.get("endpoint")
+    if endpoint not in ENDPOINTS:
+        return {"error": f"unknown endpoint '{endpoint}'; valid: {list(ENDPOINTS)}"}
+
+    job_id = event.get("id") or str(uuid.uuid4())
+    try:
+        return await ENDPOINTS[endpoint](inp, job_id)
+    except ValueError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+if __name__ == "__main__":
+    runpod.serverless.start({"handler": handler})

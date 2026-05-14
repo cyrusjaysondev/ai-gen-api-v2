@@ -4,7 +4,13 @@ API on RunPod for:
 - **FLUX.2 Klein 9B** — text-to-image + AI head/face swap
 - **LTX 2.3 22B** — image-to-video, text-to-video, face-animate pipeline
 
-Full step-by-step setup: [SETUP.md](SETUP.md). Full API reference: [API.md](API.md).
+Two ways to run it:
+- **Pod mode** (this README, [SETUP.md](SETUP.md), [API.md](API.md)) — always-on
+  FastAPI on `:7860`, models on `/workspace`. Pay per pod-second.
+- **Serverless mode** ([serverless/README.md](serverless/README.md)) — split
+  into an **image endpoint** (`t2i`, `flux/face-swap`) and a **video endpoint**
+  (`ltx/i2v`, `ltx/t2v`). Same models, mounted from the same network volume
+  the pod uses. Pay per request, scale to zero.
 
 ---
 
