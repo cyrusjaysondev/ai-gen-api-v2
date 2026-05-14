@@ -172,6 +172,10 @@ log "=========================================="
 # ─────────────────────────────────────────────
 log "[1/4] Installing pip dependencies + aria2..."
 $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | tail -1
+# Face-filter dependencies (compliance / blocklist enforcement).
+# ~500MB total; the buffalo_l model itself (~280MB) is downloaded on first
+# face_filter=true request and cached at $INSIGHTFACE_MODEL_ROOT on the volume.
+$PIP install -q insightface onnxruntime-gpu 2>&1 | tail -1 || log "  WARN: insightface/onnxruntime-gpu install failed — face filter will return 503 if used"
 # SageAttention package install only — DO NOT auto-enable via comfyui_args.txt.
 # SageAttention 1.0.6 hangs the Gemma 12B prompt-enhancer's autoregressive
 # token-generation path (the kernel is tuned for fixed-shape diffusion
@@ -361,7 +365,7 @@ fi
 log "[4/4] Setting up API..."
 mkdir -p /workspace/api
 
-# Always fetch latest main.py + workflows.py from repo
+# Always fetch latest main.py + workflows.py + safety.py from repo
 wget -q -O /workspace/api/main.py "${API_REPO}/main.py"
 if [ ! -s "/workspace/api/main.py" ]; then
   log "  ERROR: Failed to download main.py"
@@ -372,7 +376,14 @@ if [ ! -s "/workspace/api/workflows.py" ]; then
   log "  ERROR: Failed to download workflows.py (shared with serverless workers)"
   exit 1
 fi
-log "  main.py + workflows.py downloaded (latest)"
+wget -q -O /workspace/api/safety.py "${API_REPO}/safety.py"
+if [ ! -s "/workspace/api/safety.py" ]; then
+  log "  WARN: Failed to download safety.py — face_filter parameter will return 503 if used"
+fi
+log "  main.py + workflows.py + safety.py downloaded (latest)"
+
+# Create the blocklist dir if it doesn't exist so admins know where to drop face images
+mkdir -p /workspace/blocklist
 
 # Save detected paths for start_api.sh and start_comfy.sh
 cat > /workspace/api/config.env << CONFEOF
@@ -526,22 +537,17 @@ source /workspace/api/config.env
 log "Installing pip deps..."
 $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | tail -1
 
-# Always fetch latest main.py + workflows.py from repo on restart
+# Always fetch latest main.py + workflows.py + safety.py from repo on restart
 log "Fetching latest API code..."
-wget -q -O /workspace/api/main.py.new "${API_REPO}/main.py"
-if [ -s "/workspace/api/main.py.new" ]; then
-  mv /workspace/api/main.py.new /workspace/api/main.py
-else
-  log "WARN: Failed to download main.py — using existing version"
-  rm -f /workspace/api/main.py.new
-fi
-wget -q -O /workspace/api/workflows.py.new "${API_REPO}/workflows.py"
-if [ -s "/workspace/api/workflows.py.new" ]; then
-  mv /workspace/api/workflows.py.new /workspace/api/workflows.py
-else
-  log "WARN: Failed to download workflows.py — using existing version"
-  rm -f /workspace/api/workflows.py.new
-fi
+for f in main.py workflows.py safety.py; do
+  wget -q -O "/workspace/api/$f.new" "${API_REPO}/$f"
+  if [ -s "/workspace/api/$f.new" ]; then
+    mv "/workspace/api/$f.new" "/workspace/api/$f"
+  else
+    log "WARN: Failed to download $f — using existing version"
+    rm -f "/workspace/api/$f.new"
+  fi
+done
 
 # Wait for ComfyUI to be ready
 log "Waiting for ComfyUI..."

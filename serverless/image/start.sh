@@ -32,6 +32,10 @@ fi
 # finds weights on the network volume without copying 27 GB into the
 # container's writable layer.
 mkdir -p "$COMFY_ROOT/models"   # defensive — base image already provides this, but never assume
+
+# Face-filter dirs on the volume (idempotent). The blocklist starts empty;
+# admins drop face images into it via SSH / S3.
+mkdir -p /runpod-volume/blocklist /runpod-volume/insightface_models
 for sub in diffusion_models vae text_encoders loras checkpoints latent_upscale_models; do
   src="$VOLUME_MODELS/$sub"
   dst="$COMFY_ROOT/models/$sub"

@@ -1,7 +1,8 @@
+import re
 import uuid, json, httpx, os
 from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks, Header
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import websockets
@@ -21,6 +22,14 @@ from workflows import (
     get_flux_face_swap_workflow,
     ltx_base_nodes,
 )
+
+# Compliance face filter (loaded lazily on first face_filter=true request).
+# Module exists even if insightface is uninstalled — it'll raise a clear
+# RuntimeError when actually invoked, never at import time.
+try:
+    import safety as face_safety
+except ImportError:
+    face_safety = None
 
 app = FastAPI(title="AI Gen API v2")
 
@@ -272,6 +281,40 @@ async def text_to_image(req: T2IRequest, background_tasks: BackgroundTasks):
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
     background_tasks.add_task(run_job, job_id, workflow)
     return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", "poll_url": f"{BASE_URL}/status/{job_id}"}
+
+
+# ─────────────────────────────────────────────
+# Compliance helper — checks N input images against the blocklist.
+# Raises HTTPException(400) on the first blocked image. Returns silently
+# if the filter is disabled or no images match.
+#
+# `face_filter=False` is recorded to /workspace/face_filter_bypass.log for
+# audit purposes — anyone calling these endpoints with face_filter=false
+# leaves a trail.
+# ─────────────────────────────────────────────
+
+def _apply_face_filter(endpoint: str, job_id: str, face_filter: bool,
+                       images_with_names: list) -> None:
+    """images_with_names: list of (bytes, label) pairs. label is used in the error."""
+    if not face_filter:
+        if face_safety is not None:
+            face_safety.log_bypass(job_id, endpoint, note=f"{len(images_with_names)} images")
+        return
+    if face_safety is None:
+        raise HTTPException(503, "face filter requested but `safety` module unavailable (insightface not installed)")
+    for idx, (img_bytes, label) in enumerate(images_with_names):
+        try:
+            result = face_safety.check_image(img_bytes)
+        except RuntimeError as e:
+            raise HTTPException(503, f"face filter unavailable: {e}")
+        if result.blocked:
+            raise HTTPException(400, {
+                "error": "blocked",
+                "reason": f"{label} matches blocked identity",
+                "matched_identity": result.matched_identity,
+                "score": round(result.score, 4),
+                "image_index": idx,
+            })
 
 
 # ─────────────────────────────────────────────
@@ -605,6 +648,7 @@ async def flux_face_swap(
     cfg: float = Form(1.0),
     guidance: float = Form(4.0),
     lora_strength: float = Form(1.0),
+    face_filter: bool = Form(False, description="Reject the request if either input image matches a face in /workspace/blocklist/. Off by default; set true to enable compliance check. Every false call is recorded to /workspace/face_filter_bypass.log."),
 ):
     seed = seed if seed != -1 else uuid.uuid4().int % 2**32
 
@@ -614,6 +658,13 @@ async def flux_face_swap(
 
     target_bytes = await target_image.read()
     face_bytes = await face_image.read()
+
+    # Face filter — must run before any heavy work, before writing to disk
+    job_id = str(uuid.uuid4())
+    _apply_face_filter("flux/face-swap", job_id, face_filter, [
+        (target_bytes, "target_image"),
+        (face_bytes,   "face_image"),
+    ])
 
     # If aspect ratio is specified, crop target image to that ratio before sending to ComfyUI.
     # The workflow's ImageScaleToTotalPixels + GetImageSize will then produce output at that AR.
@@ -631,7 +682,6 @@ async def flux_face_swap(
 
     workflow = get_flux_face_swap_workflow(target_filename, face_filename, seed, megapixels=megapixels, steps=steps, cfg=cfg, guidance=guidance, lora_strength=lora_strength)
 
-    job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
     background_tasks.add_task(run_job, job_id, workflow, [target_path, face_path])
     return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", "poll_url": f"{BASE_URL}/status/{job_id}"}
@@ -657,17 +707,28 @@ async def flux_image_to_image(
     cfg: float = Form(1.0),
     guidance: float = Form(4.0),
     lora_strength: float = Form(0.0, description="Apply the head-swap LoRA. 0 = off (general edits). Set 0.5–1.0 for face/head-focused edits."),
+    face_filter: bool = Form(False, description="Reject the request if any input image matches a face in /workspace/blocklist/. Off by default; set true to enable compliance check. Every false call is recorded to /workspace/face_filter_bypass.log."),
 ):
     if not 1 <= len(images) <= 5:
         raise HTTPException(400, f"images must be 1–5 files, got {len(images)}")
 
     seed = seed if seed != -1 else uuid.uuid4().int % 2**32
 
-    # Save uploads to ComfyUI's input dir
+    # Read bytes once so we can run the face filter BEFORE writing anything
+    # to disk (cheaper to reject early).
+    image_bytes_list: list[bytes] = []
+    for up in images:
+        image_bytes_list.append(await up.read())
+
+    job_id = str(uuid.uuid4())
+    _apply_face_filter("flux/i2i", job_id, face_filter, [
+        (b, f"images[{i}]") for i, b in enumerate(image_bytes_list)
+    ])
+
+    # Save uploads to ComfyUI's input dir (only after filter passes)
     input_filenames: list[str] = []
     cleanup_paths: list[str] = []
-    for idx, up in enumerate(images):
-        img_bytes = await up.read()
+    for idx, img_bytes in enumerate(image_bytes_list):
         fn = f"flux_i2i_{uuid.uuid4().hex}_{idx}.png"
         p = str(INPUT_DIR / fn)
         Path(p).write_bytes(img_bytes)
@@ -682,7 +743,6 @@ async def flux_image_to_image(
         lora_strength=lora_strength,
     )
 
-    job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
     background_tasks.add_task(run_job, job_id, workflow, cleanup_paths)
     return {
@@ -692,3 +752,154 @@ async def flux_image_to_image(
         "ref_count": len(images),
         "poll_url": f"{BASE_URL}/status/{job_id}",
     }
+
+
+# ─────────────────────────────────────────────
+# Admin API — manage the face-filter blocklist
+#
+# The blocklist lives on the network volume at /workspace/blocklist/ — one
+# image per blocked identity, filename (minus extension) is the identity
+# name returned in block responses. Hot-reloaded by safety.py on every
+# face-filter check, so changes take effect immediately for the pod AND
+# for any serverless workers mounted on the same volume.
+#
+# Auth: every admin endpoint requires `Authorization: Bearer <ADMIN_TOKEN>`.
+# ADMIN_TOKEN is read from the env at request time, so rotating it doesn't
+# require a restart. If ADMIN_TOKEN is unset, all admin endpoints return
+# 503 — this is a feature (no accidental open admin).
+# ─────────────────────────────────────────────
+
+BLOCKLIST_DIR = Path(os.environ.get("BLOCKLIST_DIR", "/workspace/blocklist"))
+ALLOWED_BLOCKLIST_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+IDENTITY_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+
+
+def _require_admin(authorization):
+    token = os.environ.get("ADMIN_TOKEN")
+    if not token:
+        raise HTTPException(503, "admin API disabled — set the ADMIN_TOKEN env var on the pod to enable")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "missing Authorization: Bearer <ADMIN_TOKEN> header")
+    if authorization[len("Bearer "):] != token:
+        raise HTTPException(403, "invalid admin token")
+
+
+def _validate_identity(identity: str) -> None:
+    if not IDENTITY_NAME_PATTERN.match(identity):
+        raise HTTPException(400, "identity must match [A-Za-z0-9_-]{1,64} — no spaces, no path separators")
+
+
+def _find_existing_blocklist_file(identity: str):
+    for ext in ALLOWED_BLOCKLIST_EXTS:
+        p = BLOCKLIST_DIR / f"{identity}{ext}"
+        if p.exists():
+            return p
+    return None
+
+
+def _blocklist_count() -> int:
+    if not BLOCKLIST_DIR.is_dir():
+        return 0
+    return sum(1 for p in BLOCKLIST_DIR.iterdir()
+               if p.is_file() and p.suffix.lower() in ALLOWED_BLOCKLIST_EXTS)
+
+
+@app.get("/admin/blocklist")
+async def admin_list_blocklist(authorization: str = Header(default=None)):
+    """List all identities currently on the blocklist."""
+    _require_admin(authorization)
+    BLOCKLIST_DIR.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for p in sorted(BLOCKLIST_DIR.iterdir()):
+        if p.is_file() and p.suffix.lower() in ALLOWED_BLOCKLIST_EXTS:
+            entries.append({
+                "identity": p.stem,
+                "filename": p.name,
+                "size_bytes": p.stat().st_size,
+                "added_at": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(),
+            })
+    return {"count": len(entries), "blocklist": entries}
+
+
+@app.post("/admin/blocklist")
+async def admin_upload_blocklist(
+    image: UploadFile = File(..., description="Face image of the identity to block. Must contain exactly one clearly-visible face."),
+    identity: str = Form(..., description="Stable identifier (used to delete later, and returned in block responses). [A-Za-z0-9_-]{1,64}"),
+    overwrite: bool = Form(False, description="If true, replace an existing entry with the same identity"),
+    authorization: str = Header(default=None),
+):
+    """Add a face to the blocklist. Validates the image contains exactly one
+    detectable face before accepting — if face detection fails the upload
+    is rejected so admins know the entry would have been silently skipped."""
+    _require_admin(authorization)
+    _validate_identity(identity)
+    BLOCKLIST_DIR.mkdir(parents=True, exist_ok=True)
+
+    existing = _find_existing_blocklist_file(identity)
+    if existing and not overwrite:
+        raise HTTPException(409, f"identity '{identity}' already on blocklist as {existing.name}. Pass overwrite=true to replace.")
+
+    img_bytes = await image.read()
+
+    # Validate the face is detectable BEFORE writing to disk
+    if face_safety is None:
+        raise HTTPException(503, "face filter module unavailable — cannot validate the uploaded image")
+    try:
+        result = face_safety.check_image(img_bytes)
+    except RuntimeError as e:
+        raise HTTPException(503, f"face filter unavailable: {e}")
+    if result.face_count == 0:
+        raise HTTPException(400, "no face detected in the uploaded image — pick a clearer crop")
+    if result.face_count > 1:
+        raise HTTPException(400, f"detected {result.face_count} faces — please upload an image with exactly one clearly-visible face")
+
+    ext_from_filename = Path(image.filename or "").suffix.lower()
+    ext = ext_from_filename if ext_from_filename in ALLOWED_BLOCKLIST_EXTS else ".png"
+
+    if existing:
+        existing.unlink()
+
+    target = BLOCKLIST_DIR / f"{identity}{ext}"
+    target.write_bytes(img_bytes)
+
+    return {
+        "status": "replaced" if existing else "added",
+        "identity": identity,
+        "filename": target.name,
+        "size_bytes": target.stat().st_size,
+        "blocklist_count": _blocklist_count(),
+    }
+
+
+@app.delete("/admin/blocklist/{identity}")
+async def admin_delete_blocklist(
+    identity: str,
+    authorization: str = Header(default=None),
+):
+    """Remove a face from the blocklist."""
+    _require_admin(authorization)
+    _validate_identity(identity)
+    existing = _find_existing_blocklist_file(identity)
+    if not existing:
+        raise HTTPException(404, f"identity '{identity}' is not on the blocklist")
+    existing.unlink()
+    return {
+        "status": "deleted",
+        "identity": identity,
+        "filename": existing.name,
+        "blocklist_count": _blocklist_count(),
+    }
+
+
+@app.get("/admin/blocklist/{identity}/image")
+async def admin_get_blocklist_image(
+    identity: str,
+    authorization: str = Header(default=None),
+):
+    """Download the stored face image for a blocked identity (for CMS preview)."""
+    _require_admin(authorization)
+    _validate_identity(identity)
+    existing = _find_existing_blocklist_file(identity)
+    if not existing:
+        raise HTTPException(404, f"identity '{identity}' is not on the blocklist")
+    return FileResponse(str(existing), filename=existing.name)

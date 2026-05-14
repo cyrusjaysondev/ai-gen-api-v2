@@ -14,6 +14,10 @@ Interactive docs (Swagger UI): `https://YOUR_POD_ID-7860.proxy.runpod.net/docs`
 | POST | `/t2i` | Text to image (FLUX.2 Klein 9B) |
 | POST | `/flux/face-swap` | Head / face swap (FLUX.2 Klein 9B) |
 | POST | `/flux/i2i` | Multi-reference image editing — 1 to 5 input images (FLUX.2 Klein 9B) |
+| GET | `/admin/blocklist` | List blocked face identities (admin auth required) |
+| POST | `/admin/blocklist` | Upload a face to block |
+| DELETE | `/admin/blocklist/{identity}` | Remove a blocked face |
+| GET | `/admin/blocklist/{identity}/image` | Download the stored face image (preview) |
 | POST | `/ltx/i2v` | Image to video (LTX 2.3) |
 | POST | `/ltx/t2v` | Text to video (LTX 2.3) |
 | POST | `/face-animate` | Face swap + animate pipeline |
@@ -564,6 +568,129 @@ while true; do
   fi
   sleep 5
 done
+```
+
+---
+
+## Face Filter / Compliance
+
+`/flux/face-swap` and `/flux/i2i` accept an optional `face_filter` parameter
+(boolean, default `false`). When `true`, every input image is checked against
+a blocklist on the network volume; requests with any matching face are
+rejected with `400`.
+
+### Request
+
+```bash
+curl -X POST "$POD/flux/i2i" \
+  -F "prompt=stylize as a watercolor" \
+  -F "images=@person.png" \
+  -F "face_filter=true"
+```
+
+### Block response
+
+```json
+{
+  "detail": {
+    "error": "blocked",
+    "reason": "images[0] matches blocked identity",
+    "matched_identity": "tom_hanks",
+    "score": 0.87,
+    "image_index": 0
+  }
+}
+```
+
+`score` is cosine similarity vs the closest blocklist entry; default threshold
+is `0.6` (override via `FACE_FILTER_THRESHOLD` env var on the pod).
+
+### Bypass audit
+
+Every call where `face_filter=false` (or omitted) is logged with timestamp,
+endpoint, job_id, and image count to `/workspace/face_filter_bypass.log`.
+Compliance auditors can `cat` this file to see every bypass event.
+
+---
+
+## Admin API (face blocklist management)
+
+All admin endpoints require `Authorization: Bearer $ADMIN_TOKEN`. Set
+`ADMIN_TOKEN` as an env var on the pod template. If unset, admin endpoints
+return `503 Service Unavailable` — you cannot accidentally expose them.
+
+The blocklist is stored on the network volume at `/workspace/blocklist/`,
+one image per identity. It's shared with serverless workers (mounted at
+`/runpod-volume/blocklist/`) and hot-reloaded on every face-filter check —
+uploads and deletes take effect on the next request.
+
+### POST /admin/blocklist — Upload a face
+
+```bash
+curl -X POST "$POD/admin/blocklist" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -F "identity=tom_hanks" \
+  -F "image=@hanks.png" \
+  -F "overwrite=false"
+```
+
+Validates the image contains **exactly one detectable face** before saving.
+Identity must match `[A-Za-z0-9_-]{1,64}` — no spaces or path separators.
+
+Returns:
+```json
+{
+  "status": "added",       // or "replaced" if overwrite=true and existed
+  "identity": "tom_hanks",
+  "filename": "tom_hanks.png",
+  "size_bytes": 87012,
+  "blocklist_count": 12
+}
+```
+
+Errors:
+- `400` — no face detected, or multiple faces, or invalid identity name
+- `409` — identity already exists (use `overwrite=true` to replace)
+- `503` — face filter unavailable / `ADMIN_TOKEN` not set
+
+### GET /admin/blocklist — List
+
+```bash
+curl "$POD/admin/blocklist" -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+```json
+{
+  "count": 2,
+  "blocklist": [
+    {"identity": "tom_hanks", "filename": "tom_hanks.png",
+     "size_bytes": 87012, "added_at": "2026-05-14T07:30:00+00:00"},
+    {"identity": "celebrity_42", "filename": "celebrity_42.jpg",
+     "size_bytes": 102488, "added_at": "2026-05-14T07:35:00+00:00"}
+  ]
+}
+```
+
+### DELETE /admin/blocklist/{identity} — Remove
+
+```bash
+curl -X DELETE "$POD/admin/blocklist/tom_hanks" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+```json
+{"status": "deleted", "identity": "tom_hanks",
+ "filename": "tom_hanks.png", "blocklist_count": 1}
+```
+
+### GET /admin/blocklist/{identity}/image — Preview
+
+Returns the stored face image as raw bytes (for CMS preview).
+
+```bash
+curl "$POD/admin/blocklist/tom_hanks/image" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -o tom_hanks.png
 ```
 
 ---

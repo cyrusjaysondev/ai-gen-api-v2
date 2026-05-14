@@ -144,6 +144,8 @@ weights). First build downloads the base layer; second build reuses it.
    capacity there yet — pick a different volume region or contact RunPod.
 5. **Environment Variables:** none required. Optional:
    - `COMFYUI_URL` — override if you change ComfyUI's listen port.
+   - `FACE_FILTER_THRESHOLD` — cosine similarity threshold for the face
+     blocklist (default `0.6`, higher = stricter, fewer matches).
 6. Click **Deploy**. RunPod pulls the image (~2 min first time), and
    the endpoint goes **Ready** when a worker has booted.
 

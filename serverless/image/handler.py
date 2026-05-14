@@ -57,7 +57,7 @@ from pathlib import Path
 import httpx
 import runpod
 
-# Make repo-root /app/workflows.py importable
+# Make repo-root /app/workflows.py + /app/safety.py importable
 sys.path.insert(0, "/app")
 from workflows import (
     ASPECT_RATIOS,
@@ -67,6 +67,10 @@ from workflows import (
     crop_to_aspect,
     get_flux_face_swap_workflow,
 )
+try:
+    import safety as face_safety
+except ImportError:
+    face_safety = None
 
 
 COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")
@@ -89,6 +93,35 @@ def _stage_output_to_volume(filename: str, src: Path, job_id: str) -> Path:
     dest = dest_dir / filename
     shutil.copy2(src, dest)
     return dest
+
+
+# ─────────────────────────────────────────────
+# Compliance / face filter — checks N input images against the blocklist
+# on the network volume. Raises FaceFilterBlocked on the first match;
+# the handler catches it and returns a structured error response.
+# ─────────────────────────────────────────────
+
+class FaceFilterBlocked(Exception):
+    def __init__(self, matched_identity: str, score: float, image_index: int, label: str):
+        self.matched_identity = matched_identity
+        self.score = score
+        self.image_index = image_index
+        self.label = label
+        super().__init__(f"{label} matches blocked identity '{matched_identity}'")
+
+
+def _apply_face_filter(endpoint: str, job_id: str, face_filter: bool,
+                       images_with_names: list) -> None:
+    if not face_filter:
+        if face_safety is not None:
+            face_safety.log_bypass(job_id, endpoint, note=f"{len(images_with_names)} images")
+        return
+    if face_safety is None:
+        raise RuntimeError("face filter requested but the `safety` module is not installed in this image")
+    for idx, (img_bytes, label) in enumerate(images_with_names):
+        result = face_safety.check_image(img_bytes)
+        if result.blocked:
+            raise FaceFilterBlocked(result.matched_identity, result.score, idx, label)
 
 
 # ─────────────────────────────────────────────
@@ -228,6 +261,11 @@ async def run_flux_face_swap(inp: dict, job_id: str) -> dict:
     target_bytes = _decode_image_b64(inp["target_image_b64"], "target_image_b64")
     face_bytes   = _decode_image_b64(inp["face_image_b64"],   "face_image_b64")
 
+    _apply_face_filter("flux/face-swap", job_id, bool(inp.get("face_filter", False)), [
+        (target_bytes, "target_image_b64"),
+        (face_bytes,   "face_image_b64"),
+    ])
+
     if aspect_ratio != "original":
         w_r, h_r = ASPECT_RATIOS[aspect_ratio]
         target_w, target_h = compute_dimensions(w_r, h_r, megapixels)
@@ -273,12 +311,19 @@ async def run_flux_i2i(inp: dict, job_id: str) -> dict:
     seed = inp.get("seed", -1)
     seed = seed if seed != -1 else uuid.uuid4().int % 2**32
 
-    # Decode + stage each input image to ComfyUI's input dir
+    # Decode all images first so we can run the face filter BEFORE writing
+    # anything to disk (cheaper to reject early).
+    decoded: list[tuple[bytes, str]] = []
+    for idx, b64 in enumerate(images_b64):
+        decoded.append((_decode_image_b64(b64, f"images_b64[{idx}]"), f"images_b64[{idx}]"))
+
+    _apply_face_filter("flux/i2i", job_id, bool(inp.get("face_filter", False)), decoded)
+
+    # Stage each input image to ComfyUI's input dir
     input_filenames: list[str] = []
     staged_paths: list[Path] = []
     try:
-        for idx, b64 in enumerate(images_b64):
-            img_bytes = _decode_image_b64(b64, f"images_b64[{idx}]")
+        for idx, (img_bytes, _) in enumerate(decoded):
             fn = f"flux_i2i_{uuid.uuid4().hex}_{idx}.png"
             p = INPUT_DIR / fn
             p.write_bytes(img_bytes)
@@ -340,6 +385,14 @@ async def handler(event):
     job_id = event.get("id") or str(uuid.uuid4())
     try:
         return await ENDPOINTS[endpoint](inp, job_id)
+    except FaceFilterBlocked as e:
+        return {
+            "error": "blocked",
+            "reason": f"{e.label} matches blocked identity",
+            "matched_identity": e.matched_identity,
+            "score": round(e.score, 4),
+            "image_index": e.image_index,
+        }
     except ValueError as e:
         return {"error": str(e)}
     except Exception as e:

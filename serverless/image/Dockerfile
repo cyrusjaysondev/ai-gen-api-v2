@@ -31,6 +31,14 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # Shared workflow builders (also used by pod-mode main.py)
 COPY workflows.py /app/workflows.py
 
+# Face-blocklist filter — imported lazily by the handler when face_filter=true.
+# Model weights (~280 MB) are NOT baked into the image — they download once
+# on first use and cache on the network volume at /runpod-volume/insightface_models/.
+COPY safety.py /app/safety.py
+ENV INSIGHTFACE_MODEL_ROOT=/runpod-volume/insightface_models \
+    BLOCKLIST_DIR=/runpod-volume/blocklist \
+    BYPASS_LOG=/runpod-volume/face_filter_bypass.log
+
 # Handler + entrypoint
 COPY serverless/image/handler.py /app/handler.py
 COPY serverless/image/start.sh   /start_serverless.sh
