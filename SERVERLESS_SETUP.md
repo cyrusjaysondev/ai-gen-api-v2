@@ -195,12 +195,24 @@ curl -X POST "https://api.runpod.ai/v2/$IMG_ID/runsync" \
 First call is the cold start — expect **60–90 s** while ComfyUI boots and
 loads FLUX into VRAM. Subsequent calls on the warm worker: 8–15 s.
 
-Decode the base64 result:
+The response returns a **path** on the network volume (not base64), so
+images and videos use the same retrieval flow. Example response:
 
-```bash
-jq -r '.output.image_b64' response.json | base64 -d > result.png
-open result.png   # or: xdg-open / start
+```json
+{
+  "output": {
+    "image_path": "/runpod-volume/outputs/<job_id>/t2i_42_00001_.png",
+    "filename":   "t2i_42_00001_.png",
+    "size_bytes": 423104,
+    "seed": 42,
+    "duration_seconds": 12.3
+  }
+}
 ```
+
+See **"Downloading outputs"** below for the three ways to fetch the
+file. The reaper deletes everything in `/runpod-volume/outputs/` older
+than 3 days, so save anything you need to keep.
 
 ### Test the video endpoint
 
@@ -250,17 +262,16 @@ To **read the file**, see "Downloading video outputs" below.
 
 ---
 
-## Downloading video outputs
+## Downloading outputs
 
-The video handler writes results to the network volume (not base64) since
-LTX clips routinely exceed RunPod's ~10 MB response cap. You have three
-ways to read them:
+Both endpoints write to `/runpod-volume/outputs/<job_id>/<filename>` and
+return that path. Three ways to fetch the file:
 
 ### Option A — From any pod with the volume mounted
 
 ```bash
 # In a pod with the same network volume attached at /workspace:
-cp /workspace/outputs/<job_id>/*.mp4 ./
+cp /workspace/outputs/<job_id>/*.png ./   # or *.mp4 for video
 ```
 
 ### Option B — RunPod S3-compatible API (recommended for external clients)
@@ -272,17 +283,20 @@ RunPod exposes every network volume via an S3 API. From any machine:
 aws configure                                # use your RunPod S3 keys
 # endpoint URL: https://s3api-<region>.runpod.io
 
-aws --endpoint-url https://s3api-eu-ro-1.runpod.io s3 \
-    cp s3://<volume-id>/outputs/<job_id>/<filename>.mp4 ./
+aws --endpoint-url https://s3api-ap-jp-1.runpod.io s3 \
+    cp s3://<volume-id>/outputs/<job_id>/<filename> ./
 ```
 
-Get your S3 keys at runpod.io → **Settings → S3 API**. Use the region that
-matches your volume.
+Get your S3 keys at runpod.io → **Settings → S3 API**. Use the region
+that matches your volume.
 
 ### Option C — Use a small "downloader" pod
 
 For one-off downloads, spin up a CPU pod with the volume mounted, then
 `scp` the file out. Cheapest for the occasional check; not for production.
+
+> ⚠️ **Files older than 3 days are auto-deleted** by the reaper. Save
+> anything you need to keep before that.
 
 ---
 

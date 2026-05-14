@@ -7,8 +7,11 @@ Endpoints supported via `event["input"]["endpoint"]`:
 
 Models read from the network volume at /runpod-volume/runpod-slim/ComfyUI/models
 (linked into ComfyUI's models dir by start.sh before the handler boots).
+Generated images are staged to /runpod-volume/outputs/<job_id>/<filename> so
+the reaper can clean them up after RETENTION_DAYS and so clients can fetch
+them via the same RunPod S3 API used for videos.
 
-Input:
+Input (t2i):
   {
     "input": {
       "endpoint": "t2i",
@@ -18,7 +21,7 @@ Input:
     }
   }
 
-Or for face-swap (images are sent as base64 — no UploadFile in serverless):
+Input (face-swap — base64 with or without `data:image/...;base64,` prefix):
   {
     "input": {
       "endpoint": "flux/face-swap",
@@ -33,8 +36,9 @@ Or for face-swap (images are sent as base64 — no UploadFile in serverless):
 
 Output (success):
   {
-    "image_b64": "iVBOR...",
-    "filename": "t2i_42_00001_.png",
+    "image_path": "/runpod-volume/outputs/<job_id>/t2i_42_00001_.png",
+    "filename":   "t2i_42_00001_.png",
+    "size_bytes": 423104,
     "seed": 42,
     "duration_seconds": 12.3
   }
@@ -43,6 +47,7 @@ Output (success):
 import asyncio
 import base64
 import os
+import shutil
 import sys
 import time
 import uuid
@@ -68,6 +73,20 @@ OUTPUT_DIR = COMFY_ROOT / "output"
 INPUT_DIR = COMFY_ROOT / "input"
 INPUT_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Staging dir on the network volume — clients fetch results from here via
+# the RunPod S3 API or any pod with the same volume mounted. The reaper
+# (cleanup.sh) deletes contents older than RETENTION_DAYS.
+VOLUME_OUTPUTS = Path(os.environ.get("VOLUME_OUTPUTS", "/runpod-volume/outputs"))
+VOLUME_OUTPUTS.mkdir(parents=True, exist_ok=True)
+
+
+def _stage_output_to_volume(filename: str, src: Path, job_id: str) -> Path:
+    dest_dir = VOLUME_OUTPUTS / job_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / filename
+    shutil.copy2(src, dest)
+    return dest
 
 
 # ─────────────────────────────────────────────
@@ -165,7 +184,7 @@ async def submit_and_wait(workflow: dict, max_wait_s: float = 600.0) -> tuple[st
 # Endpoint dispatchers
 # ─────────────────────────────────────────────
 
-async def run_t2i(inp: dict) -> dict:
+async def run_t2i(inp: dict, job_id: str) -> dict:
     prompt = inp.get("prompt")
     if not prompt:
         raise ValueError("'prompt' is required for t2i")
@@ -181,16 +200,18 @@ async def run_t2i(inp: dict) -> dict:
         guidance=float(inp.get("guidance", 4.0)),
     )
     started = time.time()
-    filename, path = await submit_and_wait(workflow)
+    filename, src = await submit_and_wait(workflow)
+    dest = _stage_output_to_volume(filename, src, job_id)
     return {
-        "image_b64": base64.b64encode(path.read_bytes()).decode("ascii"),
+        "image_path": str(dest),
         "filename": filename,
+        "size_bytes": dest.stat().st_size,
         "seed": seed,
         "duration_seconds": round(time.time() - started, 2),
     }
 
 
-async def run_flux_face_swap(inp: dict) -> dict:
+async def run_flux_face_swap(inp: dict, job_id: str) -> dict:
     if not inp.get("target_image_b64") or not inp.get("face_image_b64"):
         raise ValueError("'target_image_b64' and 'face_image_b64' are required for flux/face-swap")
 
@@ -227,10 +248,12 @@ async def run_flux_face_swap(inp: dict) -> dict:
 
     started = time.time()
     try:
-        filename, path = await submit_and_wait(workflow)
+        filename, src = await submit_and_wait(workflow)
+        dest = _stage_output_to_volume(filename, src, job_id)
         return {
-            "image_b64": base64.b64encode(path.read_bytes()).decode("ascii"),
+            "image_path": str(dest),
             "filename": filename,
+            "size_bytes": dest.stat().st_size,
             "seed": seed,
             "duration_seconds": round(time.time() - started, 2),
         }
@@ -263,8 +286,9 @@ async def handler(event):
     if endpoint not in ENDPOINTS:
         return {"error": f"unknown endpoint '{endpoint}'; valid: {list(ENDPOINTS)}"}
 
+    job_id = event.get("id") or str(uuid.uuid4())
     try:
-        return await ENDPOINTS[endpoint](inp)
+        return await ENDPOINTS[endpoint](inp, job_id)
     except ValueError as e:
         return {"error": str(e)}
     except Exception as e:

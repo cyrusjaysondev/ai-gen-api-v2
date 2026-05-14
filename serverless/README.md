@@ -3,6 +3,13 @@
 > **For the step-by-step deploy guide, see [`../SERVERLESS_SETUP.md`](../SERVERLESS_SETUP.md).**
 > This file is the API reference: endpoint inputs/outputs and example calls.
 
+**Both endpoints write outputs to the network volume** at
+`/runpod-volume/outputs/<job_id>/<filename>` and return the **path** in the
+response (not base64). Images and videos use the same convention — clients
+fetch the file via the RunPod S3 API or from any pod that has the same
+volume mounted. The reaper (`cleanup.sh`) deletes everything in this dir
+older than 3 days.
+
 Two RunPod serverless endpoints share the same network volume that the pod uses:
 
 | Endpoint | Workflows | Image size | Models loaded from volume |
@@ -97,21 +104,20 @@ curl -X POST "$ENDPOINT" \
 Response (`runsync` blocks; use `/run` for async):
 ```json
 {
-  "id": "...",
+  "id": "<job_id>",
   "status": "COMPLETED",
   "output": {
-    "image_b64": "iVBORw0KGgo...",
-    "filename": "t2i_42_00001_.png",
+    "image_path": "/runpod-volume/outputs/<job_id>/t2i_42_00001_.png",
+    "filename":   "t2i_42_00001_.png",
+    "size_bytes": 423104,
     "seed": 42,
     "duration_seconds": 12.3
   }
 }
 ```
 
-Decode and save:
-```bash
-echo "$response" | jq -r '.output.image_b64' | base64 -d > result.png
-```
+`image_path` is the file on the network volume. Fetch it (see
+"Downloading outputs" below for the three options).
 
 ### Image / flux/face-swap
 
@@ -190,8 +196,12 @@ Same as i2v but without `image_b64`:
 
 ## Face-animate (client-orchestrated)
 
+The image endpoint returns a path, not bytes. To chain into video/i2v we
+need the bytes — read them via the RunPod S3 API (any client) or directly
+off the volume if the orchestrator runs on a pod that mounts it.
+
 ```python
-import base64, requests, time
+import base64, requests, boto3
 
 def call(endpoint_id, payload, token):
     r = requests.post(f"https://api.runpod.ai/v2/{endpoint_id}/runsync",
@@ -199,7 +209,7 @@ def call(endpoint_id, payload, token):
                       headers={"Authorization": f"Bearer {token}"})
     return r.json()["output"]
 
-# 1. Face-swap on image endpoint
+# 1. Face-swap on image endpoint — returns a path
 swap = call(IMAGE_ENDPOINT, {
     "endpoint": "flux/face-swap",
     "target_image_b64": base64.b64encode(open("body.png", "rb").read()).decode(),
@@ -207,10 +217,20 @@ swap = call(IMAGE_ENDPOINT, {
     "aspect_ratio": "9:16",
 }, TOKEN)
 
-# 2. Animate the swapped image on video endpoint
+# 2. Fetch the swapped image bytes — pick ONE based on where this script runs:
+#    (a) Same network volume mounted locally: just read the file
+#        swap_bytes = open(swap["image_path"], "rb").read()
+#    (b) Anywhere with RunPod S3 creds:
+s3 = boto3.client("s3", endpoint_url=f"https://s3api-{VOLUME_REGION}.runpod.io",
+                  aws_access_key_id=RUNPOD_S3_KEY, aws_secret_access_key=RUNPOD_S3_SECRET)
+# Strip the leading "/runpod-volume/" to get the S3 key
+key = swap["image_path"].removeprefix("/runpod-volume/")
+swap_bytes = s3.get_object(Bucket=VOLUME_ID, Key=key)["Body"].read()
+
+# 3. Animate the swapped image on video endpoint
 anim = call(VIDEO_ENDPOINT, {
     "endpoint": "ltx/i2v",
-    "image_b64": swap["image_b64"],
+    "image_b64": base64.b64encode(swap_bytes).decode(),
     "prompt": "subject smiles and turns head slowly, soft cinematic light",
     "aspect_ratio": "9:16",
     "preset": "fast",
