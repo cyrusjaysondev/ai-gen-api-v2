@@ -41,51 +41,26 @@ In the template, add:
 HF_TOKEN = hf_your_token_here
 ```
 
-> Setting `SETUP_SCRIPT_URL` as an env var alone does **not** trigger the installer — nothing in the stock image reads it. You must set the Start Command (next step).
+> Setting `SETUP_SCRIPT_URL` as an env var alone does **not** trigger the installer — nothing in the stock image reads it. You'll run `setup.sh` manually once after the pod boots (step 4).
 
-### 3. Set the Start Command
-In the template, paste this as the **Container Start Command** (single line, exactly):
+### 3. Leave the Container Start Command empty
 
-```bash
-bash -c "wget -qO /tmp/boot.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/boot.sh && bash /tmp/boot.sh"
-```
+The stock `runpod/comfyui:latest` image has `/start.sh` as its **ENTRYPOINT**.
+RunPod's "Container Start Command" field becomes **args** to that entrypoint —
+and `/start.sh` ignores its args. That means you cannot use the Start Command
+field to auto-run setup on a brand-new pod with this image. Anything you put
+there is silently dropped. Leave it empty.
 
-> ⚠️ Leaving Container Start Command empty → pod runs only `/start.sh` → SSH/Jupyter/ComfyUI up, but `:7860` stays **502** and setup never runs.
+For first deploys you'll run `setup.sh` once manually (step 4). After that,
+a ComfyUI bootstrap custom node (installed by `setup.sh` on the
+**/workspace** volume) auto-launches the API on every subsequent pod restart —
+no manual step needed unless the volume itself is wiped.
 
-`boot.sh` wraps the full startup sequence: it launches `/start.sh` in the background
-(so SSH/Jupyter/ComfyUI come up), fetches `setup.sh` from this repo, runs it, then
-`wait`s on `/start.sh` to keep the container alive. Keeping the logic in a file avoids
-the quoting errors that happen with long inline shell strings in UI fields.
+### 4. Deploy, then run setup.sh once (first deploy only)
 
-### 4. Deploy and Wait
-Click Deploy. `setup.sh` runs 4 steps:
-
-1. **Install pip deps + aria2** (~5 s)
-2. **Download all 9 models in parallel via aria2** (~72 GB; resumable, skips anything already on the volume)
-3. **Install LanPaint custom node** (skipped if already present)
-4. **Fetch `main.py`, patch `/start.sh` with the restart hook, launch the API supervisor**
-
-**First deploy: ~3–10 minutes** on a warm HuggingFace CDN (parallel aria2 at 200–500 MB/s beats serial wget by 30–50×).
-**Subsequent deploys / pod restarts: ~10–20 seconds** — models are already on the volume, so aria2 just verifies and skips.
-
-### 5. Monitor Progress
-Open the Jupyter terminal (port 8888) and run:
-```bash
-tail -f /workspace/api_setup.log
-```
-
-You should see a fresh `AI Gen API v2 Setup Started` line with the current timestamp.
-Healthy states (live on `/health` via the proxy):
-- **HTTP 503 + `{"status":"installing", …}`** — setup is running, status server is bound. Wait for 200.
-- **HTTP 200 + `{"status":"ok", …}`** — API is ready.
-- **HTTP 502** for more than ~30 s — auto-setup didn't fire. See next step.
-
-### 5b. Manual fallback (if `/health` stays 502 and log is silent)
-
-If `tail -f` shows only old timestamps from a previous pod's volume (no new
-`AI Gen API v2 Setup Started` line) and `:7860` stays 502, the template's Container
-Start Command didn't trigger. SSH in (or use the Jupyter terminal) and run these as
-**two separate commands** (pressing Enter after each):
+Click Deploy. SSH/Jupyter/ComfyUI come up via `/start.sh` but `:7860` stays
+**502** until you run `setup.sh`. Open the Jupyter terminal on port 8888 (or
+SSH in) and run these as **two separate commands** (press Enter after each):
 
 ```bash
 wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh
@@ -94,13 +69,29 @@ wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-a
 bash /tmp/setup.sh
 ```
 
-> **Why not one line with `&&`?** Long pasted lines sometimes wrap mid-command in the
-> terminal and drop you into a nested shell. Two lines can't be split wrong.
+> **Why not one line with `&&`?** Long pasted lines sometimes wrap mid-command
+> in the terminal and drop you into a nested shell. Two lines can't be split wrong.
 
-Setup finishes in ~15–20 s on a volume with cached models. It also patches
-`/start.sh` so that **restarts of this same pod** come back on their own — no manual
-step needed on subsequent restarts. For truly fresh pods, fix the template's Start
-Command (step 3 above) so the auto-path works next time.
+`setup.sh` runs 4 steps:
+
+1. **Install pip deps + aria2** (~5 s)
+2. **Download all 9 models in parallel via aria2** (~72 GB; resumable, skips anything already on the volume)
+3. **Install LanPaint custom node** (skipped if already present)
+4. **Fetch `main.py`, install the ComfyUI bootstrap custom node, launch the API supervisor**
+
+**First deploy: ~3–10 minutes** on a warm HuggingFace CDN (parallel aria2 at 200–500 MB/s beats serial wget by 30–50×).
+**Subsequent pod restarts: automatic, ~10–20 s** — the bootstrap custom node on the volume re-launches the API; you don't run anything.
+
+### 5. Monitor Progress
+While `setup.sh` is running, tail the log:
+```bash
+tail -f /workspace/api_setup.log
+```
+
+Healthy states (live on `/health` via the proxy):
+- **HTTP 503 + `{"status":"installing", …}`** — setup is running, status server is bound. Wait for 200.
+- **HTTP 200 + `{"status":"ok", …}`** — API is ready.
+- **HTTP 502** before you've run `setup.sh` is expected; after `setup.sh` reports "Setup Complete!", it should flip to 200 within a few seconds.
 
 ### 6. Verify
 ```
@@ -298,14 +289,23 @@ sleep 10 && curl http://localhost:7860/health
 ```
 
 ### API didn't come back after pod restart
-Confirm the `/start.sh` hook is in place (`setup.sh` installs it on first run):
+Confirm the bootstrap custom node is on the volume (`setup.sh` installs it):
 ```bash
-grep -c "AI Gen API v2 auto-start" /start.sh    # should print 2
+ls -la /workspace/runpod-slim/ComfyUI/custom_nodes/ai_gen_api_bootstrap/__init__.py
 ```
-If missing (pod was recreated/rebuilt, not just restarted), re-run setup:
+And check ComfyUI's log for the bootstrap line:
+```bash
+grep "ai-gen-api-bootstrap" /workspace/comfyui.log
+# expect: [ai-gen-api-bootstrap] launched /workspace/start_api.sh (...)
+```
+If the file is missing (network volume was wiped or the pod was created with a
+different volume), re-run setup:
 ```bash
 wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh
 ```
+If the file is present but ComfyUI didn't log the line, ComfyUI may not have
+loaded the node. Tail `/workspace/comfyui.log` while restarting the pod to see
+the import sequence.
 
 ### main.py failed to download
 ```bash
@@ -361,8 +361,14 @@ cd /workspace/runpod-slim/ComfyUI && \
         checkpoints/       # LTX 2.3 22B
         latent_upscale_models/  # LTX spatial upscaler
       custom_nodes/
-        LanPaint/          # FLUX head swap nodes
+        LanPaint/                  # FLUX head swap nodes
+        ai_gen_api_bootstrap/      # side-effect-only custom node:
+          __init__.py              # spawns start_api.sh on ComfyUI import,
+                                   # giving us a hook that survives pod
+                                   # restarts (lives on the /workspace volume)
 
-/start.sh                # container entrypoint; patched by setup.sh to
-                         # auto-launch start_api.sh after ComfyUI boots
+/start.sh                # container entrypoint (image-owned, not persistent).
+                         # Wiped on every container recreation, so we can't
+                         # rely on patching it. Auto-recovery happens via
+                         # the ComfyUI bootstrap custom node instead.
 ```

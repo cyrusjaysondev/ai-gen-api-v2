@@ -680,6 +680,70 @@ PYEOF
 patch_start_sh
 
 # ─────────────────────────────────────────────
+# Install ComfyUI bootstrap custom node — primary auto-recovery mechanism.
+#
+# Why: /start.sh patching above only survives the current container. On a pod
+# restart RunPod recreates the container, so /start.sh is wiped back to its
+# image-default state and our hook is gone. ComfyUI's custom_nodes/ directory
+# lives on the /workspace network volume (persistent) and is imported by
+# ComfyUI on every startup — so a side-effect-only custom node is the only
+# place we can reliably hook "run something every time ComfyUI starts"
+# without owning the image.
+#
+# The bootstrap module spawns /workspace/start_api.sh on import. The
+# supervisor is flock-guarded, so duplicate launches are no-ops.
+# ─────────────────────────────────────────────
+install_bootstrap_node() {
+  local NODE_DIR="$COMFY_ROOT/custom_nodes/ai_gen_api_bootstrap"
+  mkdir -p "$NODE_DIR"
+  cat > "$NODE_DIR/__init__.py" << 'BOOTEOF'
+"""
+ai-gen-api-v2 bootstrap — launches the API supervisor when ComfyUI starts.
+
+This is a no-op ComfyUI custom node whose only purpose is the side-effect of
+spawning /workspace/start_api.sh on import. ComfyUI imports every custom node
+on startup, so this fires on every pod restart without needing /start.sh to
+be patched (the image's /start.sh is wiped on each container recreation).
+
+The supervisor itself is flock-guarded, so duplicate spawns are no-ops.
+"""
+import os
+import subprocess
+
+NODE_CLASS_MAPPINGS = {}
+NODE_DISPLAY_NAME_MAPPINGS = {}
+
+_SUPERVISOR = "/workspace/start_api.sh"
+_LOG = "/workspace/api_setup.log"
+_TAG = "[ai-gen-api-bootstrap]"
+
+
+def _launch_supervisor():
+    if not os.path.exists(_SUPERVISOR):
+        print(f"{_TAG} {_SUPERVISOR} not found — run setup.sh first", flush=True)
+        return
+    try:
+        with open(_LOG, "a") as logf:
+            subprocess.Popen(
+                ["setsid", "nohup", "bash", _SUPERVISOR],
+                stdin=subprocess.DEVNULL,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+        print(f"{_TAG} launched {_SUPERVISOR} (flock-guarded; safe to retry)", flush=True)
+    except Exception as e:
+        print(f"{_TAG} failed to launch supervisor: {e}", flush=True)
+
+
+_launch_supervisor()
+BOOTEOF
+  log "  bootstrap custom node installed at $NODE_DIR"
+}
+install_bootstrap_node
+
+# ─────────────────────────────────────────────
 # Start the API — but only if it isn't already healthy.
 #
 # On a pod restart, the /start.sh hook already launched start_api.sh in
@@ -753,7 +817,8 @@ log "  Health:   https://${RUNPOD_POD_ID}-7860.proxy.runpod.net/health"
 log "  Setup log: tail -f /workspace/api_setup.log"
 log "  API log:   tail -f /workspace/api.log"
 log ""
-log "  Pod restarts auto-launch the API via /start.sh hook."
+log "  Pod restarts auto-launch the API via the ComfyUI bootstrap custom node."
+log "  (Located at $COMFY_ROOT/custom_nodes/ai_gen_api_bootstrap/__init__.py)"
 log "  Manual relaunch (if needed):"
 log "    setsid nohup bash /workspace/start_api.sh </dev/null >>/workspace/api_setup.log 2>&1 &"
 log "=========================================="
