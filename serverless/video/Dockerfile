@@ -31,7 +31,15 @@ RUN cd /comfyui/custom_nodes \
 COPY serverless/video/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
+# ffmpeg is needed for the optional output watermark on .mp4 outputs. The
+# base image typically already includes it via ComfyUI's video deps; this
+# RUN is a defensive no-op if it's already present.
+RUN command -v ffmpeg >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*)
+
 COPY workflows.py /app/workflows.py
+# Optional output watermarking — invoked only when the request includes
+# the `watermark` field. Uses ffmpeg drawtext.
+COPY watermark.py /app/watermark.py
 
 COPY serverless/video/handler.py /app/handler.py
 COPY serverless/video/start.sh   /start_serverless.sh

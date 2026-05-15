@@ -38,6 +38,9 @@ COPY safety.py /app/safety.py
 # Logo/flag blocklist filter — imported lazily on first logo_filter=true.
 # CLIP ViT-B/32 weights (~150 MB) cache at /runpod-volume/clip_models/.
 COPY logo_safety.py /app/logo_safety.py
+# Optional output watermarking — invoked only when the request includes
+# the `watermark` field. Uses Pillow (already in the base image).
+COPY watermark.py /app/watermark.py
 ENV INSIGHTFACE_MODEL_ROOT=/runpod-volume/insightface_models \
     CLIP_MODEL_ROOT=/runpod-volume/clip_models \
     BLOCKLIST_DIR=/runpod-volume/blocklist \

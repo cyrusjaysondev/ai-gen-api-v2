@@ -138,6 +138,7 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/t2i \
 | `steps` | 4 | Inference steps (4 is good for Klein) |
 | `cfg` | 1.0 | CFG scale |
 | `guidance` | 4.0 | FLUX guidance strength (2.0-6.0) |
+| `watermark` | `null` | Optional text to overlay bottom-right of the output (e.g. `"AI"`). Null/empty = off. See [Output watermark](#output-watermark). |
 
 ### Head Swap (FLUX)
 ```bash
@@ -157,6 +158,7 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/face-swap \
 | `cfg` | 1.0 | CFG scale |
 | `guidance` | 4.0 | FLUX guidance (2.0-6.0) |
 | `lora_strength` | 1.0 | Head swap LoRA strength (0.0-1.5) |
+| `watermark` | `null` | Optional bottom-right text overlay (e.g. `"AI"`). See [Output watermark](#output-watermark). |
 
 ### Multi-reference Image Editing (FLUX)
 Send 1 to 5 reference images plus a prompt. The prompt drives the edit; the
@@ -181,6 +183,7 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/i2i \
 | `steps` | 4 | Inference steps |
 | `guidance` | 4.0 | FLUX guidance (2.0-6.0) |
 | `lora_strength` | 0.0 | `0` = general edits, `0.5-1.0` = face-focused edits |
+| `watermark` | `null` | Optional bottom-right text overlay (e.g. `"AI"`). See [Output watermark](#output-watermark). |
 
 ### Image to Video (LTX 2.3)
 ```bash
@@ -204,8 +207,9 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/ltx/i2v \
 | `seed` | -1 (random) | Reproducibility seed |
 | `audio` | `false` | Generate audio track (adds ~5-10s) |
 | `enhance_prompt` | `true` | Disable to save 2-5s when you've written a detailed prompt |
+| `watermark` | `null` | Optional bottom-right text overlay (e.g. `"AI"`). Re-encodes via ffmpeg (~1-3s for a 5s clip). See [Output watermark](#output-watermark). |
 
-See [API.md](API.md) for `/ltx/t2v` (text-to-video) and `/face-animate` (face-swap + animate pipeline).
+See [API.md](API.md) for `/ltx/t2v` (text-to-video) and `/face-animate` (face-swap + animate pipeline). Both accept the same `watermark` parameter.
 
 ### Check Job Status
 ```bash
@@ -266,6 +270,46 @@ done
 URL=$(curl -s "$POD/status/$JOB" | jq -r '.url')
 curl -o result.png "$URL"
 ```
+
+---
+
+## Output watermark
+
+Every generation endpoint (`/t2i`, `/flux/face-swap`, `/flux/i2i`, `/ltx/i2v`,
+`/ltx/t2v`, `/face-animate`) accepts an optional `watermark` parameter that
+overlays text on the bottom-right of the result.
+
+- **Default:** off. Pass `null`, omit the field, or send `""` to skip.
+- **Enable:** pass any non-empty string (e.g. `"AI"`, `"My Brand"`, `"© 2026"`).
+- **Style:** bold white text with a black outline, sized ~4% of frame height.
+- **Cost:**
+  - Images: negligible (~50 ms Pillow draw).
+  - Videos: re-encoded via ffmpeg `drawtext`. ~1–3 s for a 5 s clip at 544×960; audio is stream-copied so quality is preserved.
+- **Failure mode:** if the watermark step errors (e.g. ffmpeg missing), the
+  generation still completes and the response includes a `watermark_warning`
+  field. The unwatermarked file is still returned.
+
+Examples:
+
+```bash
+# Image with watermark
+curl -X POST $POD/t2i \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"a serene mountain lake","watermark":"AI"}'
+
+# Video with watermark
+curl -X POST $POD/ltx/i2v \
+  -F "image=@photo.jpg" -F "prompt=person waves" \
+  -F "watermark=AI"
+
+# Custom text
+curl -X POST $POD/flux/face-swap \
+  -F "target_image=@body.png" -F "face_image=@face.png" \
+  -F "watermark=Made by AI"
+```
+
+The same `watermark` field works on the serverless endpoints — pass it as
+part of the `input` JSON.
 
 ---
 

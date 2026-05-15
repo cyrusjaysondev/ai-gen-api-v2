@@ -75,6 +75,10 @@ try:
     import logo_safety
 except ImportError:
     logo_safety = None
+try:
+    import watermark
+except ImportError:
+    watermark = None
 
 
 COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")
@@ -97,6 +101,17 @@ def _stage_output_to_volume(filename: str, src: Path, job_id: str) -> Path:
     dest = dest_dir / filename
     shutil.copy2(src, dest)
     return dest
+
+
+def _apply_watermark(path: Path, text):
+    """Apply watermark in-place; never let watermark failure kill the job."""
+    if not text or watermark is None:
+        return None
+    try:
+        watermark.apply(path, text)
+        return None
+    except Exception as e:
+        return str(e)
 
 
 # ─────────────────────────────────────────────
@@ -259,13 +274,17 @@ async def run_t2i(inp: dict, job_id: str) -> dict:
     started = time.time()
     filename, src = await submit_and_wait(workflow)
     dest = _stage_output_to_volume(filename, src, job_id)
-    return {
+    wm_err = _apply_watermark(dest, inp.get("watermark"))
+    result = {
         "image_path": str(dest),
         "filename": filename,
         "size_bytes": dest.stat().st_size,
         "seed": seed,
         "duration_seconds": round(time.time() - started, 2),
     }
+    if wm_err:
+        result["watermark_warning"] = wm_err
+    return result
 
 
 async def run_flux_face_swap(inp: dict, job_id: str) -> dict:
@@ -314,13 +333,17 @@ async def run_flux_face_swap(inp: dict, job_id: str) -> dict:
     try:
         filename, src = await submit_and_wait(workflow)
         dest = _stage_output_to_volume(filename, src, job_id)
-        return {
+        wm_err = _apply_watermark(dest, inp.get("watermark"))
+        result = {
             "image_path": str(dest),
             "filename": filename,
             "size_bytes": dest.stat().st_size,
             "seed": seed,
             "duration_seconds": round(time.time() - started, 2),
         }
+        if wm_err:
+            result["watermark_warning"] = wm_err
+        return result
     finally:
         (INPUT_DIR / target_filename).unlink(missing_ok=True)
         (INPUT_DIR / face_filename).unlink(missing_ok=True)
@@ -369,7 +392,8 @@ async def run_flux_i2i(inp: dict, job_id: str) -> dict:
         started = time.time()
         filename, src = await submit_and_wait(workflow)
         dest = _stage_output_to_volume(filename, src, job_id)
-        return {
+        wm_err = _apply_watermark(dest, inp.get("watermark"))
+        result = {
             "image_path": str(dest),
             "filename": filename,
             "size_bytes": dest.stat().st_size,
@@ -377,6 +401,9 @@ async def run_flux_i2i(inp: dict, job_id: str) -> dict:
             "ref_count": len(images_b64),
             "duration_seconds": round(time.time() - started, 2),
         }
+        if wm_err:
+            result["watermark_warning"] = wm_err
+        return result
     finally:
         for p in staged_paths:
             p.unlink(missing_ok=True)

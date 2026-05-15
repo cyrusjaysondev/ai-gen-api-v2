@@ -404,7 +404,11 @@ wget -q -O /workspace/api/logo_safety.py "${API_REPO}/logo_safety.py"
 if [ ! -s "/workspace/api/logo_safety.py" ]; then
   log "  WARN: Failed to download logo_safety.py — logo_filter parameter will return 503 if used"
 fi
-log "  main.py + workflows.py + safety.py + logo_safety.py downloaded (latest)"
+wget -q -O /workspace/api/watermark.py "${API_REPO}/watermark.py"
+if [ ! -s "/workspace/api/watermark.py" ]; then
+  log "  WARN: Failed to download watermark.py — watermark parameter will be a no-op"
+fi
+log "  main.py + workflows.py + safety.py + logo_safety.py + watermark.py downloaded (latest)"
 
 # Create blocklist dirs so admins know where files land
 mkdir -p /workspace/blocklist /workspace/blocklist_logos
@@ -561,9 +565,9 @@ source /workspace/api/config.env
 log "Installing pip deps..."
 $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | tail -1
 
-# Always fetch latest main.py + workflows.py + safety.py + logo_safety.py from repo on restart
+# Always fetch latest main.py + workflows.py + safety.py + logo_safety.py + watermark.py from repo on restart
 log "Fetching latest API code..."
-for f in main.py workflows.py safety.py logo_safety.py; do
+for f in main.py workflows.py safety.py logo_safety.py watermark.py; do
   wget -q -O "/workspace/api/$f.new" "${API_REPO}/$f"
   if [ -s "/workspace/api/$f.new" ]; then
     mv "/workspace/api/$f.new" "/workspace/api/$f"
