@@ -879,28 +879,39 @@ async def admin_upload_blocklist(
     if existing and not overwrite:
         raise HTTPException(409, f"identity '{identity}' already on blocklist as {existing.name}. Pass overwrite=true to replace.")
 
-    img_bytes = await image.read()
+    raw_bytes = await image.read()
 
-    # Validate the face is detectable BEFORE writing to disk
     if face_safety is None:
         raise HTTPException(503, "face filter module unavailable — cannot validate the uploaded image")
+
+    # Normalize first: EXIF-rotate + downscale to BLOCKLIST_MAX_EDGE + re-encode
+    # as PNG. Lets the caller upload phone photos / 4K crops / odd formats
+    # without hitting body-size or storage issues, and gives detection a
+    # consistent input.
     try:
-        result = face_safety.check_image(img_bytes)
+        norm_bytes, ext = face_safety.normalize_blocklist_image(raw_bytes)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(503, f"image normalizer unavailable: {e}")
+
+    # Validate the face is detectable BEFORE writing to disk. Use the
+    # detect-only helper: check_image short-circuits to face_count=0 when
+    # the blocklist is empty, which would block the very first upload.
+    try:
+        face_count = face_safety.detect_face_count(norm_bytes)
     except RuntimeError as e:
         raise HTTPException(503, f"face filter unavailable: {e}")
-    if result.face_count == 0:
+    if face_count == 0:
         raise HTTPException(400, "no face detected in the uploaded image — pick a clearer crop")
-    if result.face_count > 1:
-        raise HTTPException(400, f"detected {result.face_count} faces — please upload an image with exactly one clearly-visible face")
-
-    ext_from_filename = Path(image.filename or "").suffix.lower()
-    ext = ext_from_filename if ext_from_filename in ALLOWED_BLOCKLIST_EXTS else ".png"
+    if face_count > 1:
+        raise HTTPException(400, f"detected {face_count} faces — please upload an image with exactly one clearly-visible face")
 
     if existing:
         existing.unlink()
 
     target = BLOCKLIST_DIR / f"{identity}{ext}"
-    target.write_bytes(img_bytes)
+    target.write_bytes(norm_bytes)
 
     return {
         "status": "replaced" if existing else "added",

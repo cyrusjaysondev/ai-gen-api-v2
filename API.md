@@ -756,8 +756,20 @@ curl -X POST "$POD/admin/blocklist" \
   -F "overwrite=false"
 ```
 
-Validates the image contains **exactly one detectable face** before saving.
-Identity must match `[A-Za-z0-9_-]{1,64}` — no spaces or path separators.
+**Accepted input:** PNG / JPG / JPEG / WEBP (anything Pillow can decode).
+EXIF orientation is honored, so phone photos rotate correctly.
+
+**Auto-normalize on upload:** every accepted image is downscaled so the
+longer edge is ≤ `BLOCKLIST_MAX_EDGE` (default `1024` px, env-overridable)
+and re-encoded as PNG before storage. Callers do **not** need to resize or
+re-format client-side — upload the raw photo. The stored filename is
+always `<identity>.png` regardless of input format. Identity match accuracy
+is unaffected: InsightFace recognizes at 112x112 internally, so anything
+above ~256 px on the face is identical to the full-resolution input.
+
+Validation runs on the normalized image: the upload must contain **exactly
+one detectable face**. Identity must match `[A-Za-z0-9_-]{1,64}` — no
+spaces or path separators.
 
 Returns:
 ```json
@@ -765,15 +777,15 @@ Returns:
   "status": "added",       // or "replaced" if overwrite=true and existed
   "identity": "tom_hanks",
   "filename": "tom_hanks.png",
-  "size_bytes": 87012,
+  "size_bytes": 87012,      // post-normalize PNG size, not the upload size
   "blocklist_count": 12
 }
 ```
 
 Errors:
-- `400` — no face detected, or multiple faces, or invalid identity name
+- `400` — undecodable image, no face detected, multiple faces, or invalid identity name
 - `409` — identity already exists (use `overwrite=true` to replace)
-- `503` — face filter unavailable (e.g. `safety` module not installed)
+- `503` — face filter / image normalizer unavailable (e.g. `safety` module or Pillow not installed)
 
 ### GET /admin/blocklist — List
 
@@ -787,11 +799,15 @@ curl "$POD/admin/blocklist"
   "blocklist": [
     {"identity": "tom_hanks", "filename": "tom_hanks.png",
      "size_bytes": 87012, "added_at": "2026-05-14T07:30:00+00:00"},
-    {"identity": "celebrity_42", "filename": "celebrity_42.jpg",
+    {"identity": "celebrity_42", "filename": "celebrity_42.png",
      "size_bytes": 102488, "added_at": "2026-05-14T07:35:00+00:00"}
   ]
 }
 ```
+
+> Existing entries uploaded before the auto-normalize change may still have
+> `.jpg` / `.jpeg` / `.webp` extensions — those keep working, but any new
+> upload (or `overwrite=true` replace) re-saves as `.png`.
 
 ### DELETE /admin/blocklist/{identity} — Remove
 

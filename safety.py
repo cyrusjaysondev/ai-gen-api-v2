@@ -140,6 +140,61 @@ def _build_filter():
     print(f"[face-filter] ready: {len(blocklist)} identities loaded from {blocklist_dir}, threshold={threshold}")
 
 
+def detect_face_count(image_bytes: bytes) -> int:
+    """Run face detection on an image and return the number of faces found.
+
+    Used by the admin upload endpoint to validate a blocklist entry without
+    requiring the blocklist to be non-empty — `check_image` short-circuits
+    on empty blocklist for perf and would otherwise report face_count=0
+    for the very first upload.
+    """
+    _maybe_reload()
+    if _FILTER is None:
+        raise RuntimeError(_FILTER_INIT_ERROR or "face filter unavailable")
+    app   = _FILTER["app"]
+    np    = _FILTER["np"]
+    Image = _FILTER["Image"]
+    try:
+        arr = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
+    except Exception:
+        return 0
+    return len(app.get(arr))
+
+
+# Max edge length we store for a blocklist entry. Embeddings are computed by
+# InsightFace at 112x112 internally, so downscaling above ~1024 has no effect
+# on matching accuracy — it only saves disk + reload time.
+BLOCKLIST_MAX_EDGE = int(os.environ.get("BLOCKLIST_MAX_EDGE", "1024"))
+
+
+def normalize_blocklist_image(image_bytes: bytes) -> tuple[bytes, str]:
+    """Decode, EXIF-rotate, downscale (if needed) and re-encode as PNG.
+
+    Returns (png_bytes, ".png"). Raises ValueError on undecodable input so
+    the caller can return a 400 instead of a 500. Lets the admin upload
+    accept phone photos / 4K crops / odd formats without the caller worrying
+    about request-body limits or storing 20 MB blobs on the network volume.
+    """
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as e:
+        raise RuntimeError(f"Pillow missing: {e}")
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img = ImageOps.exif_transpose(img)  # honor camera rotation
+        img = img.convert("RGB")
+    except Exception as e:
+        raise ValueError(f"could not decode image: {e}")
+    w, h = img.size
+    longer = max(w, h)
+    if longer > BLOCKLIST_MAX_EDGE:
+        scale = BLOCKLIST_MAX_EDGE / longer
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue(), ".png"
+
+
 def check_image(image_bytes: bytes) -> FilterResult:
     """Detect faces in an image and compare against the blocklist.
 
