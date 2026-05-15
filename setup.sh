@@ -339,7 +339,9 @@ fi
 log "  All 9 models verified at expected sizes"
 
 # ─────────────────────────────────────────────
-# 3. LanPaint custom node (required for FLUX face swap)
+# 3. Custom nodes: LanPaint (FLUX face swap) + ComfyUI-KJNodes (ColorMatch for i2v)
+# KJNodes ships with runpod/comfyui:latest at the time of writing — this clone is
+# a defensive fallback in case a future base image drops it.
 # ─────────────────────────────────────────────
 mkdir -p "$NODES"
 LANPAINT_FRESH=0
@@ -356,6 +358,20 @@ if [ ! -d "$NODES/LanPaint" ]; then
   log "  LanPaint installed"
 else
   log "[3/4] LanPaint already installed"
+fi
+
+if [ ! -d "$NODES/ComfyUI-KJNodes" ]; then
+  log "  Installing ComfyUI-KJNodes (provides ColorMatch for i2v color correction)..."
+  (
+    cd "$NODES"
+    git clone -q https://github.com/kijai/ComfyUI-KJNodes
+    if [ -f "ComfyUI-KJNodes/requirements.txt" ]; then
+      $PIP install -q -r ComfyUI-KJNodes/requirements.txt 2>&1 | tail -1
+    fi
+  )
+  log "  ComfyUI-KJNodes installed"
+else
+  log "  ComfyUI-KJNodes already installed"
 fi
 
 # (The conditional LanPaint-only ComfyUI relaunch that used to live here

@@ -485,6 +485,21 @@ def build_ltx_i2v_workflow(image_filename: str, prompt: str, negative_prompt: st
         prefix="ltx_i2v", preset=preset, audio=audio
     )
     workflow.update(img_nodes)
+
+    # Color-match each generated frame back to the input image. LTX 2.3 (esp. fp8)
+    # has a warm/saturated drift through VAE encode→sample→decode that t2v doesn't
+    # share, because t2v has no reference to drift away from. Measured on a typical
+    # i2v: red channel +12-18 vs input, saturation +15% — visible as an orange tint.
+    # MKL (Monge-Kantorovich linearization) matches channel covariance and closes
+    # the gap to within ~2 units per channel at ~+0.7s cost. ColorMatch ships with
+    # ComfyUI-KJNodes which setup.sh already installs.
+    workflow["280"] = {"class_type": "ColorMatch", "inputs": {
+        "image_ref":    ["269", 0],
+        "image_target": ["251", 0],
+        "method":       "mkl",
+        "strength":     1.0,
+    }}
+    workflow["242"]["inputs"]["images"] = ["280", 0]
     return workflow
 
 
