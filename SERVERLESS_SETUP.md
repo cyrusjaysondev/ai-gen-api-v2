@@ -119,7 +119,23 @@ Each image is ~6 GB (mostly the `runpod/worker-comfyui` base; no model
 weights). First build downloads the base layer; second build reuses it.
 
 > **Note:** The base image is `runpod/worker-comfyui:5.4.1-base`. If you
-> want to pin a different version, edit `FROM` in both Dockerfiles.
+> want to pin a different version, edit `FROM` in both Dockerfiles. The
+> base must ship **ComfyUI ≥ 0.18** so the built-in LTX 2.3 nodes
+> (`LTXVImgToVideoInplace`, `LTXAVTextEncoderLoader`, etc.) and
+> `EmptyFlux2LatentImage` are present. If a cold worker logs
+> `KeyError: 'LTXVImgToVideoInplace'` or similar, the base image's
+> ComfyUI is too old — bump the tag.
+
+### Custom nodes baked into the images
+
+- **Image worker:** `LanPaint` (required by `flux/face-swap`).
+- **Video worker:** `ComfyUI-KJNodes` (required by `ltx/i2v` for
+  `ColorMatch` + `ResizeImageMaskNode` + `ResizeImagesByLongerEdge`).
+  `ltx/t2v` doesn't use these but `i2v` is unconditional.
+
+If you push fixes to the handlers but the workflow files reference a
+**new** custom node, you must update the Dockerfile to install it and
+rebuild the image — workers don't pull nodes at runtime.
 
 ---
 
