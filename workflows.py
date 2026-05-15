@@ -250,16 +250,18 @@ LTX_ASPECT_RATIOS = {
 
 LTX_DEFAULT_NEGATIVE = "low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly"
 
+_LTX_DISTILLED_LOW_SIGMAS = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+
 LTX_PRESETS = {
     "fast": {
-        "sigmas": "1.0, 0.975, 0.909375, 0.725, 0.421875, 0.0",
+        "sigmas": _LTX_DISTILLED_LOW_SIGMAS,
         "lora_strength": 0.5,
         "two_pass": False,
     },
     "quality": {
-        "low_res_sigmas": "1.0, 0.99688, 0.99375, 0.990625, 0.9875, 0.984375, 0.98125, 0.978125, 0.975, 0.96875, 0.9625, 0.95, 0.9375, 0.909375, 0.875, 0.84375, 0.78125, 0.725, 0.5625, 0.421875, 0.0",
-        "high_res_sigmas": "0.85, 0.7875, 0.7250, 0.5734, 0.4219, 0.0",
-        "lora_strength": 0.35,
+        "low_res_sigmas": _LTX_DISTILLED_LOW_SIGMAS,
+        "high_res_sigmas": "0.85, 0.7250, 0.4219, 0.0",
+        "lora_strength": 0.5,
         "two_pass": True,
     },
 }
@@ -455,7 +457,7 @@ def build_ltx_i2v_workflow(image_filename: str, prompt: str, negative_prompt: st
         "248": {"class_type": "LTXVPreprocess",           "inputs": {"image": ["235", 0], "img_compression": 18}},
         "249": {"class_type": "LTXVImgToVideoInplace", "inputs": {
             "vae": ["236", 2], "image": ["248", 0], "latent": ["228", 0],
-            "strength": 0.7 if two_pass else 1.0, "bypass": False
+            "strength": 0.7, "bypass": False
         }},
     }
 
