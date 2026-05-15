@@ -442,9 +442,18 @@ def ltx_base_nodes(prompt, negative_prompt, width, height, length, fps, seed,
 def build_ltx_i2v_workflow(image_filename: str, prompt: str, negative_prompt: str,
                             width: int, height: int, length: int, fps: int, seed: int,
                             preset: str = "fast", audio: bool = False,
-                            enhance_prompt: bool = True) -> dict:
-    """Build an LTX 2.3 image-to-video workflow. `image_filename` must already exist in ComfyUI's input dir."""
+                            enhance_prompt: bool = True,
+                            inplace_strength: float = 0.7) -> dict:
+    """Build an LTX 2.3 image-to-video workflow. `image_filename` must already exist in ComfyUI's input dir.
+
+    `inplace_strength` controls how tightly each generated frame's latent is pinned to the input
+    image. Reference distilled value is 0.7 (first pass) / 1.0 (two-pass refine), which preserves
+    identity but suppresses motion. Lower it for action prompts where the subject must change pose:
+    0.5 ≈ moderate motion, 0.4 ≈ strong motion (some identity drift), 0.3 ≈ near-t2v behavior.
+    The two-pass refine strength tracks the first pass: refine = min(1.0, inplace_strength + 0.3).
+    """
     two_pass = LTX_PRESETS[preset]["two_pass"]
+    refine_strength = min(1.0, inplace_strength + 0.3)
 
     img_nodes = {
         "269": {"class_type": "LoadImage", "inputs": {"image": image_filename}},
@@ -457,7 +466,7 @@ def build_ltx_i2v_workflow(image_filename: str, prompt: str, negative_prompt: st
         "248": {"class_type": "LTXVPreprocess",           "inputs": {"image": ["235", 0], "img_compression": 18}},
         "249": {"class_type": "LTXVImgToVideoInplace", "inputs": {
             "vae": ["236", 2], "image": ["248", 0], "latent": ["228", 0],
-            "strength": 0.7, "bypass": False
+            "strength": inplace_strength, "bypass": False
         }},
     }
 
@@ -473,7 +482,7 @@ def build_ltx_i2v_workflow(image_filename: str, prompt: str, negative_prompt: st
 
     if two_pass:
         img_nodes["230"] = {"class_type": "LTXVImgToVideoInplace", "inputs": {
-            "vae": ["236", 2], "image": ["248", 0], "latent": ["253", 0], "strength": 1.0, "bypass": False
+            "vae": ["236", 2], "image": ["248", 0], "latent": ["253", 0], "strength": refine_strength, "bypass": False
         }}
         high_res_src = ["230", 0]
     else:

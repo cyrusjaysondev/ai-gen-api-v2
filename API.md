@@ -276,32 +276,41 @@ Generate a video from an input image using LTX 2.3 (22B).
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `image` | file | **required** | Source image — first frame of the video |
-| `prompt` | string | `""` | Description of the desired motion/scene (auto-enhanced via Gemma) |
+| `prompt` | string | `""` | Description of the desired motion/scene |
 | `negative_prompt` | string | *see below* | What to avoid in the output |
-| `preset` | string | `fast` | `fast` (8 steps single-pass) or `quality` (8+3 steps two-pass with 2× spatial upscale). Both ~12s on warm GPU at 544×960. |
+| `preset` | string | `fast` | `fast` (8 steps single-pass, ~10–15s @544×960) or `quality` (8+3 steps two-pass with 2× spatial upscale, ~40–60s) |
 | `audio` | bool | `false` | Generate audio track (`true` adds ~5-10s overhead) |
-| `aspect_ratio` | string | `original` | Output aspect ratio (see options below) |
-| `width` | int | `1280` | Output width in pixels |
-| `height` | int | `720` | Output height in pixels |
+| `aspect_ratio` | string | `9:16` | Output aspect ratio — see table below. **When set, `height` is ignored** and derived from `width`. Use `original` to honor the explicit `width`/`height`. |
+| `width` | int | `544` | Output width in pixels. With `aspect_ratio=9:16`, `width=544` → 544×960 (fast preset spec); `width=720` → 720×1280 (quality preset spec). |
+| `height` | int | `960` | Output height in pixels. **Ignored unless `aspect_ratio=original`.** |
 | `length` | int | `121` | Number of frames (121 = ~5 sec at 24fps) |
 | `fps` | int | `24` | Frames per second |
 | `seed` | int | `-1` (random) | Set for reproducible results |
+| `enhance_prompt` | bool | `true` | Rewrite the prompt via Gemma 12B using the input image as context (adds 2-5s + VRAM). Recommended ON for short prompts (`"make her run"`); OFF when you've already written a detailed scene description. |
+| `inplace_strength` | float | `0.7` | How tightly each frame's latent is pinned to the input image. `0.7` is the reference distilled value (best identity, weakest motion). **Lower it for action prompts:** `0.5` ≈ moderate motion, `0.4` ≈ strong motion (some identity drift), `0.3` ≈ near-t2v. Range `0.3`–`1.0`. Two-pass refine tracks this. |
 
 Default negative prompt: `"low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly"`
 
+### Why your video isn't moving
+
+If the subject barely moves despite a clear action prompt, two things are usually fighting you:
+
+1. **Wrong resolution.** Setting `width=1280 aspect_ratio=9:16` renders **1280×2272** (height is recomputed from width). At that size the input image dominates every frame. Use `width=544` (fast) or `width=720` (quality) for 9:16.
+2. **`inplace_strength` too high.** The default `0.7` matches Lightricks' reference profile and prioritizes identity. For motion-heavy prompts, lower it to `0.5` or `0.4`. The model has cfg=1.0 hardwired (mandatory for the distilled LoRA), so the prompt cannot push hard — `inplace_strength` is the real motion knob.
+
 ### Aspect Ratio Options
 
-All dimensions are snapped to multiples of 32.
+All dimensions are snapped to multiples of 32. When an aspect ratio is set, **height is computed from width** — pick `width` from the table to land on the spec'd resolution.
 
-| Value | Approx resolution | Use case |
-|-------|-------------------|----------|
-| `original` | From input image | Preserve source composition (default) |
-| `16:9` | 1280x720 | YouTube, landscape video |
-| `9:16` | 720x1280 | Instagram / TikTok Reels |
-| `1:1` | 1024x1024 | Social media posts |
-| `4:3` / `3:4` | 1024x768 | Standard / portrait |
-| `3:2` / `2:3` | 1152x768 | Classic landscape / portrait |
-| `21:9` / `9:21` | 1280x544 | Cinematic ultra-wide / tall |
+| Value | `width` for fast | `width` for quality | Use case |
+|-------|------------------|---------------------|----------|
+| `original` | n/a (uses input dims) | n/a | Preserve source composition |
+| `9:16` | `544` → 544×960 | `720` → 720×1280 | **Instagram / TikTok Reels (default)** |
+| `16:9` | `960` → 960×544 | `1280` → 1280×720 | YouTube, landscape video |
+| `1:1` | `768` → 768×768 | `1024` → 1024×1024 | Social media posts |
+| `4:3` / `3:4` | `768` / `576` | `1024` / `768` | Standard / portrait |
+| `3:2` / `2:3` | `864` / `576` | `1152` / `768` | Classic landscape / portrait |
+| `21:9` / `9:21` | `1120` / `480` | `1280` / `544` | Cinematic ultra-wide / tall |
 
 ### Frame length guide
 
@@ -317,26 +326,55 @@ All dimensions are snapped to multiples of 32.
 ### Examples
 
 ```bash
-# Fast preview (default)
+# 9:16 reel — recommended fast preview (5s, ~10-15s on a warm GPU)
 curl -X POST .../ltx/i2v \
   -F "image=@my_photo.jpg" \
-  -F "prompt=the person walks forward slowly"
+  -F "prompt=she walks forward, hair moving in the wind" \
+  -F "preset=fast" \
+  -F "aspect_ratio=9:16" \
+  -F "width=544" \
+  -F "length=121" \
+  -F "fps=24" \
+  -F "seed=-1"
 
-# Quality with audio
+# 9:16 action prompt — needs lower inplace_strength so the subject can actually move
+curl -X POST .../ltx/i2v \
+  -F "image=@my_photo.jpg" \
+  -F "prompt=she runs across the frame" \
+  -F "preset=fast" \
+  -F "aspect_ratio=9:16" \
+  -F "width=544" \
+  -F "length=121" \
+  -F "inplace_strength=0.45" \
+  -F "enhance_prompt=true"
+
+# 9:16 final-quality (two-pass with upscale, ~40-60s)
+curl -X POST .../ltx/i2v \
+  -F "image=@my_photo.jpg" \
+  -F "prompt=camera slowly orbits around her, cinematic lighting" \
+  -F "preset=quality" \
+  -F "aspect_ratio=9:16" \
+  -F "width=720" \
+  -F "length=121"
+
+# Subtle motion (default inplace_strength is fine for this)
+curl -X POST .../ltx/i2v \
+  -F "image=@my_photo.jpg" \
+  -F "prompt=subtle head turn, eyes blink" \
+  -F "preset=fast" \
+  -F "aspect_ratio=9:16" \
+  -F "width=544" \
+  -F "length=49" \
+  -F "seed=42"
+
+# 16:9 with audio
 curl -X POST .../ltx/i2v \
   -F "image=@my_photo.jpg" \
   -F "prompt=camera slowly zooms in, birds chirping" \
   -F "preset=quality" \
   -F "audio=true" \
-  -F "aspect_ratio=16:9"
-
-# Fast, short clip, no audio
-curl -X POST .../ltx/i2v \
-  -F "image=@my_photo.jpg" \
-  -F "prompt=subtle head movement" \
-  -F "preset=fast" \
-  -F "length=49" \
-  -F "seed=42"
+  -F "aspect_ratio=16:9" \
+  -F "width=1280"
 ```
 
 ---

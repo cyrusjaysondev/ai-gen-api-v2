@@ -381,14 +381,15 @@ async def ltx_image_to_video(
     prompt: str = Form("", description="What should happen in the video"),
     negative_prompt: str = Form(LTX_DEFAULT_NEGATIVE),
     preset: str = Form("fast", description="Speed/quality preset: fast (8 steps single-pass, ~10-15s @544×960) or quality (8+3 steps two-pass with 2× spatial upscale, ~40-60s)"),
-    aspect_ratio: str = Form("9:16", description="Output aspect ratio: original | 16:9 | 9:16 | 1:1 | 4:3 | 3:4 | 3:2 | 2:3 | 21:9 | 9:21"),
-    width: int = Form(544, description="Output width in pixels (height auto-computed if aspect_ratio set). 544 with 9:16 → 544×960"),
-    height: int = Form(960, description="Output height in pixels (ignored if aspect_ratio set)"),
+    aspect_ratio: str = Form("9:16", description="Output aspect ratio: original | 16:9 | 9:16 | 1:1 | 4:3 | 3:4 | 3:2 | 2:3 | 21:9 | 9:21. When set, height is derived from width — see below."),
+    width: int = Form(544, description="Output width in pixels. When aspect_ratio is set, height is COMPUTED from this and `height` is ignored. For 9:16 use 544 (→544×960, fast) or 720 (→720×1280, quality)."),
+    height: int = Form(960, description="Output height in pixels. IGNORED when aspect_ratio is set (only used with aspect_ratio=original)."),
     length: int = Form(121, description="Number of frames — 97 (~4s), 121 (~5s), 161 (~6.7s)"),
     fps: int = Form(24, description="Frames per second"),
     seed: int = Form(-1),
     audio: bool = Form(False, description="Generate audio track with the video (adds overhead)"),
-    enhance_prompt: bool = Form(True, description="Rewrite prompt via Gemma 12B (adds 2-5s + VRAM). Disable for speed when you wrote a detailed prompt."),
+    enhance_prompt: bool = Form(True, description="Rewrite prompt via Gemma 12B using the input image as context (adds 2-5s + VRAM). Recommended ON for short prompts (e.g. 'make her run'); OFF when you've already written a detailed scene description."),
+    inplace_strength: float = Form(0.7, ge=0.3, le=1.0, description="How tightly each frame is pinned to the input image. 0.7 = reference distilled value (good identity, weak motion). Lower it for action prompts: 0.5 ≈ moderate motion, 0.4 ≈ strong motion (some identity drift), 0.3 ≈ near-t2v. Two-pass refine tracks this (= min(1.0, x+0.3))."),
 ):
     if preset not in LTX_PRESETS:
         raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
@@ -407,6 +408,7 @@ async def ltx_image_to_video(
         image_filename=img_filename, prompt=prompt, negative_prompt=negative_prompt,
         width=width, height=height, length=length, fps=fps, seed=seed,
         preset=preset, audio=audio, enhance_prompt=enhance_prompt,
+        inplace_strength=inplace_strength,
     )
 
     job_id = str(uuid.uuid4())
