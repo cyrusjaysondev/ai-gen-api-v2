@@ -191,6 +191,31 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/i2i \
 | `guidance` | 4.0 | FLUX guidance (2.0-6.0) |
 | `lora_strength` | 0.0 | `0` = general edits, `0.5-1.0` = face-focused edits |
 
+### Image to Video (LTX 2.3)
+```bash
+curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/ltx/i2v \
+  -F "image=@my_photo.jpg" \
+  -F "prompt=the person smiles and waves" \
+  -F "preset=fast" \
+  -F "aspect_ratio=9:16" \
+  -F "length=97"
+```
+
+**Parameters** (most-used):
+| Param | Default | Description |
+|-------|---------|-------------|
+| `image` | required | First-frame image |
+| `prompt` | `""` | Motion / scene description (auto-enhanced via Gemma unless `enhance_prompt=false`) |
+| `preset` | `fast` | `fast` (8 steps single-pass) or `quality` (8+3 steps two-pass). Both ~12s warm @544×960 — see [API.md](API.md) |
+| `aspect_ratio` | `9:16` | `original` \| `16:9` \| `9:16` \| `1:1` \| `4:3` \| `3:4` \| `3:2` \| `2:3` \| `21:9` \| `9:21` |
+| `length` | `121` | Frame count. 49≈2s, 97≈4s, 121≈5s @ 24 fps |
+| `fps` | `24` | |
+| `seed` | -1 (random) | Reproducibility seed |
+| `audio` | `false` | Generate audio track (adds ~5-10s) |
+| `enhance_prompt` | `true` | Disable to save 2-5s when you've written a detailed prompt |
+
+See [API.md](API.md) for `/ltx/t2v` (text-to-video) and `/face-animate` (face-swap + animate pipeline).
+
 ### Check Job Status
 ```bash
 # Poll until status is "completed"

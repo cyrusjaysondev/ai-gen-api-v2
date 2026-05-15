@@ -243,25 +243,26 @@ To disable any of these (e.g. for debugging), comment out the relevant line in `
 
 All LTX video endpoints (`/ltx/i2v`, `/ltx/t2v`, `/face-animate`) support `preset` and `audio` parameters.
 
-| Preset | Steps | Pipeline | Speed (5s 720p, warm) | Use case |
-|--------|-------|----------|----------------------|----------|
-| `fast` (default) | 5 | Single pass, no upscale, no audio | ~36s | Previews, rapid iteration |
-| `quality` | 20+5 | Two-pass + spatial upscale | ~100s+ | Final renders, maximum detail |
+| Preset | Steps | Pipeline | Speed (4s @544×960, warm) | Use case |
+|--------|-------|----------|---------------------------|----------|
+| `fast` (default) | 8 | Single pass at target resolution | ~12s | General use, fastest single-pass pipeline |
+| `quality` | 8 + 3 | Two-pass: half-res sampling → 2× spatial upscale → high-res refine | ~12s | Same wall-time as `fast`, slightly sharper detail |
+
+Both presets use the official LTX-2.3 distilled inference profile (sigmas and LoRA strength taken from Lightricks' reference workflows). The 8-step warmup-cluster sigma schedule is what the distilled LoRA was trained against — using fewer steps causes motion/anatomy artifacts and identity drift.
 
 ### Speed tips
 
-- **Lower resolution = faster.** 768x448 generates in ~20s vs ~36s at 1280x720
-- **Shorter clips = faster.** `length=49` (2s) is much faster than `length=121` (5s)
-- **audio=false (default) saves ~5-10s** by skipping the audio VAE entirely
+- **Lower resolution = faster.** Wall time scales roughly with pixel count.
+- **Shorter clips = faster.** `length=49` (2s) is about half the wall time of `length=97` (4s).
+- **`audio=false` (default) saves ~5-10s** by skipping the audio VAE entirely
 - **`enhance_prompt=false` saves 2–5s** on `/ltx/i2v` by skipping the Gemma 12B prompt rewrite. Recommended when you've written a detailed prompt yourself; leave the default `true` for short / generic prompts where the rewrite materially improves output.
-- **First request after pod start is slow** (~3-5 min) because models load into VRAM. All subsequent requests use cached models
-- **Warm model benchmarks (fast preset):**
+- **First request after pod start is slower** (~30-60s extra) because models load into VRAM. All subsequent requests reuse cached models.
+- **Warm benchmarks (either preset, since they're equivalent in speed):**
 
-| Resolution | 2s video | 5s video |
-|------------|----------|----------|
-| 768x448 | ~10s | ~20s |
-| 1024x576 | ~15s | ~28s |
-| 1280x704 | ~22s | ~36s |
+| Resolution | 2s video (`length=49`) | 4s video (`length=97`) | 5s video (`length=121`) |
+|------------|------------------------|------------------------|--------------------------|
+| 544×960 | ~7s | ~12s | ~14s |
+| 768×1344 | ~12s | ~22s | ~27s |
 
 ### Audio control
 
