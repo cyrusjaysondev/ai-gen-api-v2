@@ -132,6 +132,28 @@ curl https://YOUR_POD_ID-7860.proxy.runpod.net/ltx/presets
 
 ---
 
+## Watermarks
+
+Every generation endpoint accepts two optional watermark parameters. They
+are independent and can stack — set both and you get a logo with text
+beside it.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `watermark` | string \| null | `null` | Short text drawn at the bottom-right in bold white with a black outline. `null` / empty = off. Example: `"AI"`. |
+| `watermark_image` | bool | `false` | Composite the **GenReel logo** at the bottom-right. The PNG lives on the network volume at `/workspace/assets/genreel_logo.png` (fetched by `setup.sh`). |
+
+Images stamp in-place via Pillow. Videos re-encode through `libx264` /
+`drawtext` / `overlay` filters with the audio stream-copied — typically
+adds ~1–3 s for a 5 s clip. A missing logo file is logged and silently
+skipped so a network blip during setup never fails a generation.
+
+If a watermark step fails, the job still completes successfully — the
+result will include a `watermark_warning` field on the `/status/{job_id}`
+response.
+
+---
+
 ## POST /t2i — Text to Image
 
 Generate an image from a text prompt using FLUX.2 Klein 9B.
@@ -147,6 +169,8 @@ Generate an image from a text prompt using FLUX.2 Klein 9B.
 | `steps` | int | `4` | Inference steps (4 is ideal for FLUX Klein) |
 | `cfg` | float | `1.0` | CFG scale |
 | `guidance` | float | `4.0` | FLUX guidance strength (2.0 – 6.0) |
+| `watermark` | string \| null | `null` | See [Watermarks](#watermarks). |
+| `watermark_image` | bool | `false` | See [Watermarks](#watermarks). |
 
 ### Example
 
@@ -191,6 +215,8 @@ Replace the head in a target image with a face from a source image using FLUX.2 
 | `cfg` | float | `1.0` | CFG scale |
 | `guidance` | float | `4.0` | FLUX guidance strength (2.0 – 6.0) |
 | `lora_strength` | float | `1.0` | BFS LoRA strength (0.5 – 1.0) |
+| `watermark` | string \| null | `null` | See [Watermarks](#watermarks). |
+| `watermark_image` | bool | `false` | See [Watermarks](#watermarks). |
 
 ### Aspect Ratio Options
 
@@ -239,6 +265,8 @@ Override explicitly with `width` and `height` if you want a fixed canvas.
 | `cfg` | 1.0 | CFG scale |
 | `guidance` | 4.0 | FLUX guidance strength (2.0–6.0) |
 | `lora_strength` | 0.0 | Apply head-swap LoRA. `0` = general edits; `0.5–1.0` = face/head-focused |
+| `watermark` | null | See [Watermarks](#watermarks). |
+| `watermark_image` | false | See [Watermarks](#watermarks). |
 
 ### Example
 
@@ -288,6 +316,8 @@ Generate a video from an input image using LTX 2.3 (22B).
 | `seed` | int | `-1` (random) | Set for reproducible results |
 | `enhance_prompt` | bool | `true` | Rewrite the prompt via Gemma 12B using the input image as context (adds 2-5s + VRAM). Recommended ON for short prompts (`"make her run"`); OFF when you've already written a detailed scene description. |
 | `inplace_strength` | float | `0.7` | How tightly each frame's latent is pinned to the input image. `0.7` is the reference distilled value (best identity, weakest motion). **Lower it for action prompts:** `0.5` ≈ moderate motion, `0.4` ≈ strong motion (some identity drift), `0.3` ≈ near-t2v. Range `0.3`–`1.0`. Two-pass refine tracks this. |
+| `watermark` | string \| null | `null` | See [Watermarks](#watermarks). Video re-encodes via ffmpeg (~1-3s for a 5s clip). |
+| `watermark_image` | bool | `false` | See [Watermarks](#watermarks). |
 
 Default negative prompt: `"low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly"`
 
@@ -397,6 +427,8 @@ Generate a video from a text prompt using LTX 2.3. No input image required.
 | `length` | int | `121` | Number of frames (121 = ~5 sec at 24fps) |
 | `fps` | int | `24` | Frames per second |
 | `seed` | int | `-1` (random) | Set for reproducible results |
+| `watermark` | string \| null | `null` | See [Watermarks](#watermarks). Video re-encodes via ffmpeg (~1-3s for a 5s clip). |
+| `watermark_image` | bool | `false` | See [Watermarks](#watermarks). |
 
 ### Examples
 
@@ -446,6 +478,8 @@ Two-step pipeline: replaces the head/face in a template image (FLUX.2 Klein 9B),
 | `lora_strength` | float | `1.0` | BFS LoRA strength for face swap (0.5–1.0) |
 | `swap_steps` | int | `4` | Face swap inference steps |
 | `swap_guidance` | float | `4.0` | Face swap guidance strength |
+| `watermark` | string \| null | `null` | See [Watermarks](#watermarks). Applied to the final video. |
+| `watermark_image` | bool | `false` | See [Watermarks](#watermarks). Applied to the final video. |
 
 ### How It Works
 

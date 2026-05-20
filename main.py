@@ -73,7 +73,8 @@ jobs = {}
 # ─────────────────────────────────────────────
 
 async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
-                  watermark_text: str | None = None):
+                  watermark_text: str | None = None,
+                  watermark_image: bool = False):
     jobs[job_id] = {**jobs.get(job_id, {}), "status": "processing", "started_at": datetime.now(timezone.utc).isoformat()}
     try:
         client_id = str(uuid.uuid4())
@@ -121,13 +122,25 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                             url = f"{BASE_URL}/image/{filename}"
                         else:
                             url = f"{BASE_URL}/video/{filename}"
-                        # Optional watermark — runs in-place. Failures don't
-                        # nuke the job: the unwatermarked file is still valid.
+                        # Optional watermark — text and/or logo. Both run in
+                        # place. Failures don't nuke the job; the
+                        # unwatermarked file is still valid output.
+                        wm_warnings = []
                         if watermark_text and watermark is not None:
                             try:
                                 watermark.apply(path, watermark_text)
                             except Exception as wm_err:
-                                jobs[job_id] = {**jobs[job_id], "watermark_warning": str(wm_err)}
+                                wm_warnings.append(f"text: {wm_err}")
+                        if watermark_image and watermark is not None:
+                            try:
+                                watermark.apply_logo(path)
+                            except Exception as wm_err:
+                                wm_warnings.append(f"image: {wm_err}")
+                        if wm_warnings:
+                            jobs[job_id] = {
+                                **jobs[job_id],
+                                "watermark_warning": " | ".join(wm_warnings),
+                            }
                         completed_at = datetime.now(timezone.utc)
                         created_at_str = jobs[job_id].get("created_at")
                         duration_seconds = None
@@ -291,6 +304,7 @@ class T2IRequest(BaseModel):
     cfg: float = 1.0
     guidance: float = 4.0
     watermark: str | None = None  # e.g. "AI" — overlay at bottom-right; null/empty = off
+    watermark_image: bool = False  # composite the GenReel logo at bottom-right
 
 @app.post("/t2i")
 async def text_to_image(req: T2IRequest, background_tasks: BackgroundTasks):
@@ -301,7 +315,7 @@ async def text_to_image(req: T2IRequest, background_tasks: BackgroundTasks):
     )
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    background_tasks.add_task(run_job, job_id, workflow, None, req.watermark)
+    background_tasks.add_task(run_job, job_id, workflow, None, req.watermark, req.watermark_image)
     return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
 
@@ -407,6 +421,7 @@ async def ltx_image_to_video(
     enhance_prompt: bool = Form(True, description="Rewrite prompt via Gemma 12B using the input image as context (adds 2-5s + VRAM). Recommended ON for short prompts (e.g. 'make her run'); OFF when you've already written a detailed scene description."),
     inplace_strength: float = Form(0.7, ge=0.3, le=1.0, description="How tightly each frame is pinned to the input image. 0.7 = reference distilled value (good identity, weak motion). Lower it for action prompts: 0.5 ≈ moderate motion, 0.4 ≈ strong motion (some identity drift), 0.3 ≈ near-t2v. Two-pass refine tracks this (= min(1.0, x+0.3))."),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark. Video re-encodes via ffmpeg (~1-3s for a 5s clip)."),
+    watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
 ):
     if preset not in LTX_PRESETS:
         raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
@@ -430,7 +445,7 @@ async def ltx_image_to_video(
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    background_tasks.add_task(run_job, job_id, workflow, [img_path], watermark)
+    background_tasks.add_task(run_job, job_id, workflow, [img_path], watermark, watermark_image)
     return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
 
@@ -452,6 +467,7 @@ async def ltx_text_to_video(
     seed: int = Form(-1),
     audio: bool = Form(False, description="Generate audio track with the video (adds overhead)"),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark. Video re-encodes via ffmpeg (~1-3s for a 5s clip)."),
+    watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
 ):
     if preset not in LTX_PRESETS:
         raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
@@ -469,7 +485,7 @@ async def ltx_text_to_video(
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    background_tasks.add_task(run_job, job_id, workflow, None, watermark)
+    background_tasks.add_task(run_job, job_id, workflow, None, watermark, watermark_image)
     return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
 
@@ -536,6 +552,7 @@ async def run_face_animate_pipeline(
     preset: str = "fast",
     audio: bool = False,
     watermark_text: str | None = None,
+    watermark_image: bool = False,
 ):
     jobs[job_id]["status"] = "processing"
     jobs[job_id]["started_at"] = datetime.now(timezone.utc).isoformat()
@@ -598,13 +615,20 @@ async def run_face_animate_pipeline(
         ext = Path(video_filename).suffix.lower()
         url = f"{BASE_URL}/video/{video_filename}" if ext not in [".png", ".jpg", ".jpeg", ".webp"] else f"{BASE_URL}/image/{video_filename}"
 
-        # Optional watermark — applied to the final video, not the intermediate swap.
-        watermark_warning = None
+        # Optional watermarks — applied to the final video, not the
+        # intermediate swap. Text + logo can both be set; they stack.
+        watermark_warnings: list[str] = []
         if watermark_text and watermark is not None:
             try:
                 watermark.apply(video_full_path, watermark_text)
             except Exception as wm_err:
-                watermark_warning = str(wm_err)
+                watermark_warnings.append(f"text: {wm_err}")
+        if watermark_image and watermark is not None:
+            try:
+                watermark.apply_logo(video_full_path)
+            except Exception as wm_err:
+                watermark_warnings.append(f"image: {wm_err}")
+        watermark_warning = " | ".join(watermark_warnings) if watermark_warnings else None
 
         completed_at = datetime.now(timezone.utc)
         created_at_str = jobs[job_id].get("created_at")
@@ -652,6 +676,7 @@ async def face_animate(
     swap_guidance: float = Form(4.0),
     audio: bool = Form(False, description="Generate audio track with the video (adds overhead)"),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the final video (e.g. 'AI'). Null/empty = no watermark. Re-encodes via ffmpeg (~1-3s for a 5s clip)."),
+    watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right of the final video. Stacks with `watermark` if both are set."),
 ):
     if preset not in LTX_PRESETS:
         raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
@@ -691,7 +716,7 @@ async def face_animate(
         run_face_animate_pipeline,
         job_id, face_swap_workflow, animate_prompt, negative_prompt,
         width, height, length, fps, seed,
-        [target_path, face_path], preset, audio, watermark,
+        [target_path, face_path], preset, audio, watermark, watermark_image,
     )
     return {
         "job_id": job_id,
@@ -717,6 +742,7 @@ async def flux_face_swap(
     face_filter: bool = Form(False, description="Reject the request if either input image matches a face in /workspace/blocklist/. Off by default."),
     logo_filter: bool = Form(False, description="Reject the request if either input image matches a logo/flag in /workspace/blocklist_logos/. Off by default."),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark."),
+    watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
 ):
     seed = seed if seed != -1 else uuid.uuid4().int % 2**32
 
@@ -750,7 +776,7 @@ async def flux_face_swap(
     workflow = get_flux_face_swap_workflow(target_filename, face_filename, seed, megapixels=megapixels, steps=steps, cfg=cfg, guidance=guidance, lora_strength=lora_strength)
 
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    background_tasks.add_task(run_job, job_id, workflow, [target_path, face_path], watermark)
+    background_tasks.add_task(run_job, job_id, workflow, [target_path, face_path], watermark, watermark_image)
     return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
 
@@ -777,6 +803,7 @@ async def flux_image_to_image(
     face_filter: bool = Form(False, description="Reject if any input image matches a face in /workspace/blocklist/. Off by default."),
     logo_filter: bool = Form(False, description="Reject if any input image matches a logo/flag in /workspace/blocklist_logos/. Off by default."),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark."),
+    watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
 ):
     if not 1 <= len(images) <= 5:
         raise HTTPException(400, f"images must be 1–5 files, got {len(images)}")
@@ -811,7 +838,7 @@ async def flux_image_to_image(
     )
 
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    background_tasks.add_task(run_job, job_id, workflow, cleanup_paths, watermark)
+    background_tasks.add_task(run_job, job_id, workflow, cleanup_paths, watermark, watermark_image)
     return {
         "job_id": job_id,
         "status": "queued",

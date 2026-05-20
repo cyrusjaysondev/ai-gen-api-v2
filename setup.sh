@@ -339,6 +339,29 @@ fi
 log "  All 9 models verified at expected sizes"
 
 # ─────────────────────────────────────────────
+# 2b. Brand assets (GenReel logo for the watermark_image option)
+# ─────────────────────────────────────────────
+# Tiny PNG kept on the volume so every pod + serverless worker can find it.
+# watermark.py loads /workspace/assets/genreel_logo.png lazily and silently
+# skips the image overlay if it's missing, so a network blip here is
+# non-fatal.
+ASSETS_DIR="/workspace/assets"
+GENREEL_LOGO="$ASSETS_DIR/genreel_logo.png"
+GENREEL_URL="https://pydizqejihfjbnitybtj.supabase.co/storage/v1/object/public/assets/uploads/1779271551302_GenReel_log.png"
+mkdir -p "$ASSETS_DIR"
+if [ -s "$GENREEL_LOGO" ]; then
+  log "  GenReel logo already on volume ($(stat -c%s "$GENREEL_LOGO" 2>/dev/null || stat -f%z "$GENREEL_LOGO") bytes)"
+else
+  log "  Downloading GenReel logo..."
+  if wget -qO "$GENREEL_LOGO" "$GENREEL_URL"; then
+    log "    Logo saved to $GENREEL_LOGO"
+  else
+    log "    WARN: GenReel logo download failed — watermark_image will be a no-op until present"
+    rm -f "$GENREEL_LOGO"
+  fi
+fi
+
+# ─────────────────────────────────────────────
 # 3. Custom nodes: LanPaint (FLUX face swap) + ComfyUI-KJNodes (ColorMatch for i2v)
 # KJNodes ships with runpod/comfyui:latest at the time of writing — this clone is
 # a defensive fallback in case a future base image drops it.
