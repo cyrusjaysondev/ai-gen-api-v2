@@ -124,17 +124,34 @@ def _apply_image(p: Path, text: str) -> None:
 
 def _probe_height(p: Path) -> int:
     """Return the video's frame height, or 720 as a safe fallback."""
+    return _probe_dimensions(p)[1]
+
+
+def _probe_dimensions(p: Path) -> tuple[int, int]:
+    """Return (width, height), or (1280, 720) as a safe fallback.
+
+    We probe once before building each watermark filter so the filter
+    expression contains only concrete integers — ffmpeg's `-filter_complex`
+    parser treats commas as filter separators, so `max(8, min(w,h)*0.03)`
+    style expressions get mis-tokenised. Computing in Python sidesteps the
+    whole class of bugs.
+    """
     try:
         out = subprocess.run(
             ["ffprobe", "-loglevel", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=height", "-of", "csv=p=0", str(p)],
+             "-show_entries", "stream=width,height",
+             "-of", "csv=p=0:s=x", str(p)],
             capture_output=True, text=True, timeout=10,
         )
-        if out.returncode == 0 and out.stdout.strip().isdigit():
-            return int(out.stdout.strip())
+        if out.returncode == 0:
+            txt = out.stdout.strip()
+            if "x" in txt:
+                w, h = txt.split("x", 1)
+                if w.isdigit() and h.isdigit():
+                    return int(w), int(h)
     except Exception:
         pass
-    return 720
+    return 1280, 720
 
 
 def _apply_video(p: Path, text: str) -> None:
@@ -269,16 +286,24 @@ def _apply_image_logo(p: Path) -> None:
 def _apply_video_logo(p: Path) -> None:
     """Overlay LOGO_PATH onto the video at `p` via ffmpeg `overlay`.
 
-    The logo is scaled to ~14% of the shorter side at runtime via filter
-    expressions, so a single asset works across portrait + landscape.
+    The logo is sized to ~14 % of the video's shorter side, padded ~3 %
+    from the bottom-right. We probe the input first and bake concrete
+    integers into the filter string so ffmpeg's filtergraph parser (which
+    treats commas as filter separators) doesn't mistokenise `max(...,
+    ...)` expressions.
     """
+    w, h = _probe_dimensions(p)
+    shorter = min(w, h)
+    pad = max(8, int(shorter * _EDGE_PAD))
+    target_w = max(64, int(shorter * _LOGO_SCALE))
+
     tmp = p.with_name(f"{p.stem}.wm{p.suffix}")
-    pad_expr = f"max(8, min(main_w,main_h)*{_EDGE_PAD})"
-    target_w_expr = f"max(64, min(main_w,main_h)*{_LOGO_SCALE})"
+    # main_w / main_h / overlay_w / overlay_h are valid overlay-filter
+    # variables and contain no commas; safe to leave as expressions.
     filter_complex = (
-        f"[1:v]scale={target_w_expr}:-1[wm];"
-        f"[0:v][wm]overlay=x=main_w-overlay_w-{pad_expr}:"
-        f"y=main_h-overlay_h-{pad_expr}:format=auto"
+        f"[1:v]scale={target_w}:-1[wm];"
+        f"[0:v][wm]overlay=x=main_w-overlay_w-{pad}:"
+        f"y=main_h-overlay_h-{pad}:format=auto"
     )
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
