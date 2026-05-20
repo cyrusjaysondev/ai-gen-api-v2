@@ -138,8 +138,15 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                 return
             prompt_id = resp.json()["prompt_id"]
 
+        # Disable client-side pings + close timeout so very long generations
+        # (LTX i2v at 1280×2272 = ~3-5 min on RTX 5090) don't get killed by
+        # the websockets library's default 20 s ping timeout. ComfyUI sends
+        # progress messages frequently enough that the connection stays
+        # alive on its own.
         ws_url = f"ws://127.0.0.1:8188/ws?clientId={client_id}"
-        async with websockets.connect(ws_url) as ws:
+        async with websockets.connect(
+            ws_url, ping_interval=None, close_timeout=None, max_size=None
+        ) as ws:
             while True:
                 raw = await ws.recv()
                 if isinstance(raw, bytes):
@@ -650,8 +657,11 @@ async def _submit_and_wait_comfyui(workflow: dict) -> tuple[str, str]:
             raise RuntimeError(f"ComfyUI rejected workflow: {resp.text}")
         prompt_id = resp.json()["prompt_id"]
 
+    # Same long-job-tolerant settings as run_job — see the comment there.
     ws_url = f"ws://127.0.0.1:8188/ws?clientId={client_id}"
-    async with websockets.connect(ws_url) as ws:
+    async with websockets.connect(
+        ws_url, ping_interval=None, close_timeout=None, max_size=None
+    ) as ws:
         while True:
             raw = await ws.recv()
             if isinstance(raw, bytes):
