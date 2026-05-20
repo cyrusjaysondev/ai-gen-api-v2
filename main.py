@@ -345,7 +345,9 @@ class SanaT2IRequest(BaseModel):
     seed: int = -1
     steps: int = 2
     cfg: float = 1.0
-    timestep_shift: float = 4.5
+    # SCM sampler's internal guidance scale (ScmModelSampling.cfg_scale in
+    # ComfyUI). Separate from `cfg` above, which is the outer KSampler CFG.
+    scm_cfg_scale: float = 4.5
     watermark: str | None = None
     watermark_image: bool = False
 
@@ -361,7 +363,7 @@ async def sana_text_to_image(req: SanaT2IRequest, background_tasks: BackgroundTa
         seed=seed,
         steps=req.steps,
         cfg=req.cfg,
-        timestep_shift=req.timestep_shift,
+        scm_cfg_scale=req.scm_cfg_scale,
     )
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}

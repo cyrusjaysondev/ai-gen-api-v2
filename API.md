@@ -222,7 +222,7 @@ restarts (no re-download).
 | `seed` | int | `-1` (random) | Set for reproducible results. |
 | `steps` | int | `2` | SCM steps. Sprint is tuned for 2; values up to ~4 yield marginal gains. |
 | `cfg` | float | `1.0` | Sprint is a distilled / one-step-ish model — keep at 1.0. |
-| `timestep_shift` | float | `4.5` | SCM sampler shift. Defaults from NVlabs reference workflow. |
+| `scm_cfg_scale` | float | `4.5` | SCM sampler's internal CFG scale (`ScmModelSampling.cfg_scale`). Defaults from NVlabs reference workflow. |
 | `watermark` | string \| null | `null` | Stamp this text in the bottom-right corner. `null` / `""` = off. |
 | `watermark_image` | bool | `false` | Composite the GenReel logo at the bottom-right. |
 

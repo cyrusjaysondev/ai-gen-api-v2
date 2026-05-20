@@ -97,10 +97,10 @@ def build_t2i_workflow(prompt: str, width: int, height: int, seed: int,
 # compute without quality gains; that's what 1.5 / 4.8B is for.
 
 SANA_SPRINT_CKPT_REPO = "Efficient-Large-Model/Sana_Sprint_1.6B_1024px"
-SANA_SPRINT_ARCH = "SanaSprint_1600M_P1_D20"
+SANA_SPRINT_ARCH = "SanaMS_1600M_P1_D20"   # arch token expected by ExtraModels' SanaCheckpointLoader
 SANA_GEMMA_REPO = "Efficient-Large-Model/gemma-2-2b-it"
 SANA_VAE_REPO = "mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers"
-SANA_VAE_CLASS = "dcae-f32c32-sana-1.0-diffusers"
+SANA_VAE_TYPE = "dcae-f32c32-sana-1.1-diffusers"
 
 
 def build_sana_t2i_workflow(
@@ -111,30 +111,37 @@ def build_sana_t2i_workflow(
     seed: int = 0,
     steps: int = 2,
     cfg: float = 1.0,
-    timestep_shift: float = 4.5,
+    scm_cfg_scale: float = 4.5,
 ) -> dict:
-    """Sana-Sprint 1.6B text-to-image. ~2 steps, sub-second on RTX 5090."""
+    """Sana-Sprint 1.6B text-to-image. ~2 SCM steps, sub-second on RTX 5090.
+
+    `cfg` is the KSampler CFG (kept at 1.0 for Sprint — it's distilled).
+    `scm_cfg_scale` is the SCM sampler's internal guidance scale, fed into
+    the ScmModelSampling wrapper. Defaults from NVlabs's reference workflow.
+    """
     return {
         # Loaders
         "2": {"class_type": "GemmaLoader", "inputs": {
-            "model_name": SANA_GEMMA_REPO, "device": "cuda", "dtype": "BF16",
+            "model_name": SANA_GEMMA_REPO,
+            "device": "cuda",
+            "dtype": "BF16",
         }},
         "9": {"class_type": "SanaCheckpointLoader", "inputs": {
-            "model_name": SANA_SPRINT_CKPT_REPO,
+            "ckpt_name": SANA_SPRINT_CKPT_REPO,
             "model": SANA_SPRINT_ARCH,
             "dtype": "FP32",
-            "use_dynamic_shifting": True,
+            "enable_cfg_passthrough": True,
         }},
         "10": {"class_type": "ExtraVAELoader", "inputs": {
             "vae_name": SANA_VAE_REPO,
-            "vae_type": SANA_VAE_CLASS,
+            "vae_type": SANA_VAE_TYPE,
             "dtype": "FP32",
         }},
-        # SCM sampler wrap (Sana Sprint-specific)
+        # SCM sampler wrapper (Sana Sprint-specific)
         "17": {"class_type": "ScmModelSampling", "inputs": {
             "model": ["9", 0],
-            "timestep_shift": timestep_shift,
-            "use_sigma_t": False,
+            "cfg_scale": scm_cfg_scale,
+            "zsnr": False,
         }},
         # Latent + conditioning
         "4": {"class_type": "EmptySanaLatentImage", "inputs": {
