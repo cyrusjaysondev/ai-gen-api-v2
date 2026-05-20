@@ -1,4 +1,5 @@
 import re
+import subprocess
 import uuid, json, httpx, os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,6 +71,57 @@ jobs = {}
 
 
 # ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+
+_VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".gif"}
+
+
+def _extract_video_thumbnail(video_path: Path) -> Path | None:
+    """Grab the first frame of `video_path` as a JPG sibling under
+    OUTPUT_DIR/images/. Returns the saved thumbnail path, or None on failure.
+
+    Always uses the very first frame — predictable for /ltx/i2v (the input
+    image) and fast (~50 ms with libx264-decoded mp4). If you need a
+    cinematic mid-frame later, add an `-ss` offset.
+
+    Saved name: `{video_stem}_thumb.jpg`. Lands under OUTPUT_DIR/images/ so
+    the existing GET /image/{filename} handler picks it up without route
+    changes.
+    """
+    if not video_path.exists():
+        return None
+    images_dir = OUTPUT_DIR / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    thumb = images_dir / f"{video_path.stem}_thumb.jpg"
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", str(video_path),
+                "-frames:v", "1",
+                "-q:v", "3",          # 1=best, 31=worst — 3 ≈ visually lossless JPG
+                "-update", "1",
+                str(thumb),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode == 0 and thumb.exists() and thumb.stat().st_size > 0:
+            return thumb
+        # ffmpeg succeeded but produced nothing — log enough to debug without
+        # spamming on every "no video" job.
+        print(
+            f"[thumbnail] ffmpeg rc={proc.returncode} for {video_path.name}: "
+            f"{(proc.stderr or '').strip()[-200:]}"
+        )
+    except Exception as exc:  # noqa: BLE001 — never crash a completed job
+        print(f"[thumbnail] exception on {video_path.name}: {exc}")
+    return None
+
+
+# ─────────────────────────────────────────────
 # Core job runner
 # ─────────────────────────────────────────────
 
@@ -137,6 +189,15 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                                 watermark.apply_logo(path)
                             except Exception as wm_err:
                                 wm_warnings.append(f"image: {wm_err}")
+                        # For video outputs, snap a thumbnail (first frame).
+                        # Runs AFTER watermarks so the thumbnail reflects the
+                        # final, stamped video. Failure is non-fatal — the
+                        # video itself is still returned.
+                        thumbnail_url = None
+                        if ext in _VIDEO_EXTS:
+                            thumb = _extract_video_thumbnail(path)
+                            if thumb is not None:
+                                thumbnail_url = f"{BASE_URL}/image/{thumb.name}"
                         completed_at = datetime.now(timezone.utc)
                         created_at_str = jobs[job_id].get("created_at")
                         duration_seconds = None
@@ -154,6 +215,8 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                             "completed_at": completed_at.isoformat(),
                             "duration_seconds": duration_seconds,
                         }
+                        if thumbnail_url:
+                            completed["thumbnail_url"] = thumbnail_url
                         if wm_warnings:
                             completed["watermark_warning"] = " | ".join(wm_warnings)
                         jobs[job_id] = completed
@@ -195,6 +258,21 @@ async def get_queue():
     active = {jid: info for jid, info in jobs.items() if info.get("status") in ["queued", "processing"]}
     return {"count": len(active), "jobs": [{"job_id": jid, "status": info["status"]} for jid, info in active.items()]}
 
+def _delete_output_files(filename: str) -> int:
+    """Remove the primary output file plus its `_thumb.jpg` sibling, if any.
+    Returns the number of files actually deleted (0–2)."""
+    deleted = 0
+    for path in [OUTPUT_DIR / "video" / filename, OUTPUT_DIR / "images" / filename, OUTPUT_DIR / filename]:
+        if path.exists():
+            path.unlink()
+            deleted += 1
+    thumb = OUTPUT_DIR / "images" / f"{Path(filename).stem}_thumb.jpg"
+    if thumb.exists():
+        thumb.unlink()
+        deleted += 1
+    return deleted
+
+
 @app.delete("/jobs/{job_id}")
 async def delete_job(job_id: str):
     if job_id not in jobs:
@@ -202,11 +280,8 @@ async def delete_job(job_id: str):
     job = jobs[job_id]
     filename = job.get("filename")
     result = {"job_id": job_id, "deleted": True}
-    if filename:
-        for path in [OUTPUT_DIR / "video" / filename, OUTPUT_DIR / "images" / filename, OUTPUT_DIR / filename]:
-            if path.exists():
-                path.unlink()
-                result["file_deleted"] = filename
+    if filename and _delete_output_files(filename):
+        result["file_deleted"] = filename
     del jobs[job_id]
     return result
 
@@ -250,10 +325,7 @@ async def delete_all_jobs(completed_only: bool = True):
             continue
         filename = job.get("filename")
         if filename:
-            for path in [OUTPUT_DIR / "video" / filename, OUTPUT_DIR / "images" / filename, OUTPUT_DIR / filename]:
-                if path.exists():
-                    path.unlink()
-                    deleted_files += 1
+            deleted_files += _delete_output_files(filename)
         del jobs[job_id]
         deleted_jobs += 1
     return {"deleted_jobs": deleted_jobs, "deleted_files": deleted_files}
@@ -267,7 +339,18 @@ async def delete_all_jobs(completed_only: bool = True):
 async def serve_image(filename: str):
     for path in [OUTPUT_DIR / "images" / filename, OUTPUT_DIR / filename]:
         if path.exists():
-            return FileResponse(str(path), media_type="image/png", filename=filename)
+            # Pick a sensible content-type from the extension so .jpg
+            # thumbnails don't get served as image/png and broken in some
+            # clients (Safari is strict about this).
+            ext = path.suffix.lower()
+            mt = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+                ".gif": "image/gif",
+            }.get(ext, "image/png")
+            return FileResponse(str(path), media_type=mt, filename=filename)
     raise HTTPException(404, f"Image not found: {filename}")
 
 @app.get("/video/{filename}")
@@ -282,6 +365,9 @@ async def delete_video(filename: str):
     for path in [OUTPUT_DIR / "video" / filename, OUTPUT_DIR / filename]:
         if path.exists():
             path.unlink()
+            # Drop the thumbnail sibling too (best-effort).
+            thumb = OUTPUT_DIR / "images" / f"{Path(filename).stem}_thumb.jpg"
+            thumb.unlink(missing_ok=True)
             for job_id, info in list(jobs.items()):
                 if info.get("filename") == filename:
                     del jobs[job_id]
@@ -294,9 +380,19 @@ async def list_videos():
     if not video_dir.exists():
         return {"total": 0, "videos": []}
     videos = []
+    images_dir = OUTPUT_DIR / "images"
     for f in sorted(video_dir.glob("*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True):
         stat = f.stat()
-        videos.append({"filename": f.name, "size_mb": round(stat.st_size / 1024 / 1024, 2), "url": f"{BASE_URL}/video/{f.name}", "created_at": stat.st_mtime})
+        entry = {
+            "filename": f.name,
+            "size_mb": round(stat.st_size / 1024 / 1024, 2),
+            "url": f"{BASE_URL}/video/{f.name}",
+            "created_at": stat.st_mtime,
+        }
+        thumb = images_dir / f"{f.stem}_thumb.jpg"
+        if thumb.exists():
+            entry["thumbnail_url"] = f"{BASE_URL}/image/{thumb.name}"
+        videos.append(entry)
     return {"total": len(videos), "videos": videos}
 
 
@@ -682,6 +778,14 @@ async def run_face_animate_pipeline(
                 watermark_warnings.append(f"image: {wm_err}")
         watermark_warning = " | ".join(watermark_warnings) if watermark_warnings else None
 
+        # Thumbnail of the final (post-watermark) video. Skip for the rare
+        # case where the workflow produced an image instead of a video.
+        thumbnail_url = None
+        if ext in _VIDEO_EXTS:
+            thumb = _extract_video_thumbnail(Path(video_full_path))
+            if thumb is not None:
+                thumbnail_url = f"{BASE_URL}/image/{thumb.name}"
+
         completed_at = datetime.now(timezone.utc)
         created_at_str = jobs[job_id].get("created_at")
         duration_seconds = round((completed_at - datetime.fromisoformat(created_at_str)).total_seconds(), 1) if created_at_str else None
@@ -694,6 +798,8 @@ async def run_face_animate_pipeline(
             "completed_at": completed_at.isoformat(),
             "duration_seconds": duration_seconds,
         }
+        if thumbnail_url:
+            result["thumbnail_url"] = thumbnail_url
         if watermark_warning:
             result["watermark_warning"] = watermark_warning
         jobs[job_id] = result

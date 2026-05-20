@@ -589,14 +589,31 @@ curl https://YOUR_POD_ID-7860.proxy.runpod.net/status/{job_id}
 { "status": "processing", "created_at": "...", "started_at": "..." }
 ```
 
-**Completed**
+**Completed (video)**
 ```json
 {
   "status": "completed",
   "url": "https://YOUR_POD_ID-7860.proxy.runpod.net/video/ltx_t2v_42_00001_.mp4",
+  "thumbnail_url": "https://YOUR_POD_ID-7860.proxy.runpod.net/image/ltx_t2v_42_00001__thumb.jpg",
   "filename": "ltx_t2v_42_00001_.mp4",
   "completed_at": "2026-03-28T06:00:40Z",
   "duration_seconds": 36.1
+}
+```
+
+> `thumbnail_url` is present only on video outputs (the four endpoints
+> `/ltx/i2v`, `/ltx/t2v`, `/face-animate`, plus any future video
+> workflows). It's the first frame as a JPG, served from the same domain.
+> If a watermark was applied, the thumbnail reflects it.
+
+**Completed (image)**
+```json
+{
+  "status": "completed",
+  "url": "https://YOUR_POD_ID-7860.proxy.runpod.net/image/t2i_42_00001_.png",
+  "filename": "t2i_42_00001_.png",
+  "completed_at": "2026-03-28T06:00:40Z",
+  "duration_seconds": 1.2
 }
 ```
 
