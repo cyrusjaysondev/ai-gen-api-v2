@@ -127,6 +127,51 @@ def _probe_height(p: Path) -> int:
     return _probe_dimensions(p)[1]
 
 
+# ─── Encoder selection ─────────────────────────────────────────────────────
+
+
+def _detect_nvenc() -> bool:
+    """Probe once for `h264_nvenc` support. RunPod's CUDA ffmpeg builds
+    almost always have it; the legacy 5090 driver definitely does. Cached
+    per process so we don't re-shell on every encode.
+    """
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-encoders"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return "h264_nvenc" in out.stdout
+    except Exception:
+        return False
+
+
+_HAS_NVENC = _detect_nvenc()
+
+
+def _video_encode_args() -> list[str]:
+    """Return ffmpeg `-c:v ...` + preset args.
+
+    GPU re-encode of a 2-5 s clip lands in well under a second on a 5090,
+    vs. 30-80 s with software libx264. Fall back to the latter only if
+    NVENC isn't available (CPU-only pods, or stripped ffmpeg builds).
+    """
+    if _HAS_NVENC:
+        # `-cq` controls quality (lower = better). 22 is visually
+        # indistinguishable from the source for a watermark pass.
+        # `p4` is the balanced NVENC preset; p1 is fastest, p7 is best.
+        return [
+            "-c:v", "h264_nvenc",
+            "-preset", "p4",
+            "-cq", "22",
+            "-tune", "hq",
+        ]
+    return [
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "22",
+    ]
+
+
 def _probe_dimensions(p: Path) -> tuple[int, int]:
     """Return (width, height), or (1280, 720) as a safe fallback.
 
@@ -182,8 +227,8 @@ def _apply_video(p: Path, text: str) -> None:
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(p),
         "-vf", drawtext,
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-preset", "veryfast", "-crf", "18",
+        *_video_encode_args(),
+        "-pix_fmt", "yuv420p",
         "-c:a", "copy",
         "-movflags", "+faststart",
         str(tmp),
@@ -310,8 +355,8 @@ def _apply_video_logo(p: Path) -> None:
         "-i", str(p),
         "-i", str(LOGO_PATH),
         "-filter_complex", filter_complex,
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-preset", "veryfast", "-crf", "18",
+        *_video_encode_args(),
+        "-pix_fmt", "yuv420p",
         "-c:a", "copy",
         "-movflags", "+faststart",
         str(tmp),
