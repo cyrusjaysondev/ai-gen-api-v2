@@ -85,6 +85,91 @@ def build_t2i_workflow(prompt: str, width: int, height: int, seed: int,
 
 
 # ─────────────────────────────────────────────
+# SANA-Sprint 1.6B — fast text-to-image (NVlabs)
+# ─────────────────────────────────────────────
+# Mirrors NVlabs/Sana's docs/ComfyUI/SANA-Sprint.json. The nodes are provided
+# by the lawrence-cj/ComfyUI_ExtraModels custom node (installed by setup.sh).
+# Models live under $HF_HOME (=/workspace/.cache/huggingface) — the loaders
+# below take HuggingFace repo IDs and pull from cache.
+#
+# Sprint is built for *two-step* generation via the SCM sampler — the
+# defaults below match the upstream workflow. Pushing steps beyond ~4 wastes
+# compute without quality gains; that's what 1.5 / 4.8B is for.
+
+SANA_SPRINT_CKPT_REPO = "Efficient-Large-Model/Sana_Sprint_1.6B_1024px"
+SANA_SPRINT_ARCH = "SanaSprint_1600M_P1_D20"
+SANA_GEMMA_REPO = "Efficient-Large-Model/gemma-2-2b-it"
+SANA_VAE_REPO = "mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers"
+SANA_VAE_CLASS = "dcae-f32c32-sana-1.0-diffusers"
+
+
+def build_sana_t2i_workflow(
+    prompt: str,
+    negative_prompt: str = "",
+    width: int = 1024,
+    height: int = 1024,
+    seed: int = 0,
+    steps: int = 2,
+    cfg: float = 1.0,
+    timestep_shift: float = 4.5,
+) -> dict:
+    """Sana-Sprint 1.6B text-to-image. ~2 steps, sub-second on RTX 5090."""
+    return {
+        # Loaders
+        "2": {"class_type": "GemmaLoader", "inputs": {
+            "model_name": SANA_GEMMA_REPO, "device": "cuda", "dtype": "BF16",
+        }},
+        "9": {"class_type": "SanaCheckpointLoader", "inputs": {
+            "model_name": SANA_SPRINT_CKPT_REPO,
+            "model": SANA_SPRINT_ARCH,
+            "dtype": "FP32",
+            "use_dynamic_shifting": True,
+        }},
+        "10": {"class_type": "ExtraVAELoader", "inputs": {
+            "vae_name": SANA_VAE_REPO,
+            "vae_type": SANA_VAE_CLASS,
+            "dtype": "FP32",
+        }},
+        # SCM sampler wrap (Sana Sprint-specific)
+        "17": {"class_type": "ScmModelSampling", "inputs": {
+            "model": ["9", 0],
+            "timestep_shift": timestep_shift,
+            "use_sigma_t": False,
+        }},
+        # Latent + conditioning
+        "4": {"class_type": "EmptySanaLatentImage", "inputs": {
+            "width": width, "height": height, "batch_size": 1,
+        }},
+        "7": {"class_type": "SanaTextEncode", "inputs": {
+            "GEMMA": ["2", 0], "text": prompt,
+        }},
+        "6": {"class_type": "GemmaTextEncode", "inputs": {
+            "GEMMA": ["2", 0], "text": negative_prompt,
+        }},
+        # Sample → decode → save
+        "19": {"class_type": "KSampler", "inputs": {
+            "model": ["17", 0],
+            "positive": ["7", 0],
+            "negative": ["6", 0],
+            "latent_image": ["4", 0],
+            "seed": seed,
+            "steps": steps,
+            "cfg": cfg,
+            "sampler_name": "scm",
+            "scheduler": "sgm_uniform",
+            "denoise": 1.0,
+        }},
+        "1": {"class_type": "VAEDecode", "inputs": {
+            "samples": ["19", 0], "vae": ["10", 0],
+        }},
+        "20": {"class_type": "SaveImage", "inputs": {
+            "images": ["1", 0],
+            "filename_prefix": f"images/sana_{seed}",
+        }},
+    }
+
+
+# ─────────────────────────────────────────────
 # FLUX.2 Klein 9B — Head/Face Swap
 # ─────────────────────────────────────────────
 
