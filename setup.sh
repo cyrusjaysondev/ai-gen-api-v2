@@ -426,10 +426,14 @@ fi
 # The custom node uses HuggingFace Hub at runtime; pre-fetch the three repos
 # so the first /sana/t2i call doesn't spend 5 min downloading. ~13 GB total
 # (Sprint 6.5 GB + Gemma-2-2b 5 GB + DC-AE VAE 1.25 GB).
-$PIP install -q "huggingface_hub[cli]>=0.25" 2>&1 | tail -1 || true
+#
+# Driven through the Python API (`huggingface_hub.snapshot_download`) instead
+# of the `huggingface-cli` CLI: the CLI was deprecated in huggingface_hub
+# 1.13+ in favour of `hf download`, and the old binary now just prints
+# help text — completing in <1 s without downloading anything.
+$PIP install -q -U "huggingface_hub>=0.25" 2>&1 | tail -1 || true
 
 sana_repo_cached() {
-  # Args: $1 = HF repo ID. True if its snapshot dir already has files.
   local repo_dir
   repo_dir="$HF_HOME/hub/models--$(echo "$1" | tr '/' '-')"
   [ -d "$repo_dir/snapshots" ] && [ -n "$(ls -A "$repo_dir/snapshots" 2>/dev/null)" ]
@@ -444,10 +448,22 @@ do
     log "  Sana asset already cached: $SANA_REPO"
   else
     log "  Downloading Sana asset $SANA_REPO ..."
-    if huggingface-cli download "$SANA_REPO" \
-         --token "$TOKEN" \
-         --cache-dir "$HF_HOME/hub" \
-         2>&1 | tail -2 | sed 's/^/    /'; then
+    if HF_HUB_DISABLE_PROGRESS_BARS=1 \
+       "$PYTHON" -c "
+import os, sys
+from huggingface_hub import snapshot_download
+try:
+    snapshot_download(
+        repo_id=sys.argv[1],
+        cache_dir=os.environ['HF_HOME'] + '/hub',
+        token=os.environ.get('TOKEN') or None,
+        max_workers=8,
+    )
+    print('OK')
+except Exception as exc:
+    print(f'FAIL: {exc}', file=sys.stderr)
+    sys.exit(1)
+" "$SANA_REPO" 2>&1 | tail -3 | sed 's/^/    /'; then
       log "    OK"
     else
       log "    WARN: $SANA_REPO download failed — /sana/t2i will retry on first request"
