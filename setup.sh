@@ -423,6 +423,35 @@ else
   log "  ComfyUI_ExtraModels already installed"
 fi
 
+# Diffusers + transformers etc. aren't in ComfyUI_ExtraModels' requirements.txt
+# but are required by its DC-AE / Gemma loaders. Without them /sana/t2i fails
+# with "No module named 'diffusers'" on first request.
+$PIP install -q diffusers accelerate transformers sentencepiece protobuf 2>&1 | tail -1 || true
+
+# Patch the EmptySanaLatentImage node: upstream references `self.device` but
+# subclasses ComfyUI's `EmptyLatentImage`, which no longer sets that
+# attribute — instead its built-in generate() pulls the device from
+# `comfy.model_management.intermediate_device()`. Without this patch every
+# /sana/t2i request fails with
+#   "'EmptySanaLatentImage' object has no attribute 'device'"
+SANA_NODES_FILE="$NODES/ComfyUI_ExtraModels/Sana/nodes.py"
+if [ -f "$SANA_NODES_FILE" ] && grep -q "device=self.device" "$SANA_NODES_FILE"; then
+  log "  Patching EmptySanaLatentImage (self.device → intermediate_device())"
+  "$PYTHON" - "$SANA_NODES_FILE" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+src = p.read_text()
+new = src.replace(
+    "device=self.device",
+    'device=__import__("comfy.model_management", fromlist=["intermediate_device"]).intermediate_device()',
+)
+if new != src:
+    p.write_text(new)
+PYEOF
+  # Purge cached bytecode so the next ComfyUI start loads the patched .py.
+  find "$NODES/ComfyUI_ExtraModels" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+fi
+
 # The custom node uses HuggingFace Hub at runtime; pre-fetch the three repos
 # so the first /sana/t2i call doesn't spend 5 min downloading. ~13 GB total
 # (Sprint 6.5 GB + Gemma-2-2b 5 GB + DC-AE VAE 1.25 GB).
