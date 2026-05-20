@@ -27,8 +27,10 @@ is stream-copied so we don't degrade it.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import urllib.request
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -39,9 +41,14 @@ VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv"}
 _FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 # The single fixed-asset brand mark. setup.sh fetches it to the network
-# volume so every pod / serverless worker sees it; the URL is documented in
-# setup.sh next to the download line.
+# volume so every pod / serverless worker sees it; the URL is duplicated
+# here so apply_logo() can self-heal (lazy-download) when called on a pod
+# where setup.sh hasn't run the asset step yet.
 LOGO_PATH = Path("/workspace/assets/genreel_logo.png")
+LOGO_URL = (
+    "https://pydizqejihfjbnitybtj.supabase.co/storage/v1/object/public/"
+    "assets/uploads/1779271551302_GenReel_log.png"
+)
 
 # Fraction of the image's shorter side used as the logo's width.
 _LOGO_SCALE = 0.14
@@ -180,15 +187,17 @@ def _apply_video(p: Path, text: str) -> None:
 def apply_logo(path) -> None:
     """Composite the GenReel logo onto the file at `path` in place.
 
-    No-op (with a printed warning) when LOGO_PATH is missing — setup.sh is
-    responsible for fetching it. We don't raise: an unwatermarked output is
-    better than a failed job.
+    Self-healing: if LOGO_PATH doesn't exist (e.g. setup.sh's asset step
+    didn't run on this pod), we lazy-download it once from LOGO_URL and
+    cache it on the volume so every subsequent request — and every other
+    worker sharing the volume — finds it instantly.
+
+    If the download itself fails we log and skip the overlay; the
+    unwatermarked file is still a valid result.
     """
     if not LOGO_PATH.exists():
-        # Caller already swallows exceptions; print so it lands in the API
-        # log without forcing a structured logger dependency.
-        print(f"[watermark] logo asset missing at {LOGO_PATH} — skipping image overlay")
-        return
+        if not _try_download_logo():
+            return  # download already logged the reason
 
     p = Path(path)
     ext = p.suffix.lower()
@@ -196,6 +205,35 @@ def apply_logo(path) -> None:
         _apply_image_logo(p)
     elif ext in VIDEO_EXTS:
         _apply_video_logo(p)
+
+
+def _try_download_logo() -> bool:
+    """Fetch LOGO_URL → LOGO_PATH. Returns True on success.
+
+    Uses a .tmp file + atomic rename so two concurrent jobs can't see a
+    half-written PNG. If the temp already exists (another worker mid-fetch)
+    we just bail and let the next request retry — the alternative is
+    serialising every first-image-watermark request behind a file lock.
+    """
+    try:
+        LOGO_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = LOGO_PATH.with_suffix(LOGO_PATH.suffix + ".tmp")
+        if tmp.exists():
+            print(f"[watermark] {tmp} already exists — another worker downloading; skipping this round")
+            return False
+        print(f"[watermark] logo missing at {LOGO_PATH}; fetching from {LOGO_URL}")
+        with urllib.request.urlopen(LOGO_URL, timeout=15) as resp:
+            data = resp.read()
+        if not data:
+            print("[watermark] download returned empty body")
+            return False
+        tmp.write_bytes(data)
+        os.replace(tmp, LOGO_PATH)
+        print(f"[watermark] logo cached at {LOGO_PATH} ({len(data)} bytes)")
+        return True
+    except Exception as exc:
+        print(f"[watermark] logo download failed: {exc}")
+        return False
 
 
 def _apply_image_logo(p: Path) -> None:

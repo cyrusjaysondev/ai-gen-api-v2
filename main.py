@@ -13,6 +13,7 @@ from workflows import (
     LTX_DEFAULT_NEGATIVE,
     LTX_PRESETS,
     build_flux_i2i_workflow,
+    build_sana_t2i_workflow,
     build_t2i_workflow,
     build_ltx_i2v_workflow,
     build_ltx_t2v_workflow,
@@ -125,7 +126,7 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                         # Optional watermark — text and/or logo. Both run in
                         # place. Failures don't nuke the job; the
                         # unwatermarked file is still valid output.
-                        wm_warnings = []
+                        wm_warnings: list[str] = []
                         if watermark_text and watermark is not None:
                             try:
                                 watermark.apply(path, watermark_text)
@@ -136,18 +137,26 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                                 watermark.apply_logo(path)
                             except Exception as wm_err:
                                 wm_warnings.append(f"image: {wm_err}")
-                        if wm_warnings:
-                            jobs[job_id] = {
-                                **jobs[job_id],
-                                "watermark_warning": " | ".join(wm_warnings),
-                            }
                         completed_at = datetime.now(timezone.utc)
                         created_at_str = jobs[job_id].get("created_at")
                         duration_seconds = None
                         if created_at_str:
                             started = datetime.fromisoformat(created_at_str)
                             duration_seconds = round((completed_at - started).total_seconds(), 1)
-                        jobs[job_id] = {"status": "completed", "url": url, "filename": filename, "completed_at": completed_at.isoformat(), "duration_seconds": duration_seconds}
+                        # IMPORTANT: build the completed dict last so we can
+                        # fold the watermark warning into it. Replacing
+                        # jobs[job_id] without this carry would silently
+                        # swallow the warning.
+                        completed = {
+                            "status": "completed",
+                            "url": url,
+                            "filename": filename,
+                            "completed_at": completed_at.isoformat(),
+                            "duration_seconds": duration_seconds,
+                        }
+                        if wm_warnings:
+                            completed["watermark_warning"] = " | ".join(wm_warnings)
+                        jobs[job_id] = completed
                         return
 
         jobs[job_id] = {**jobs[job_id], "status": "failed", "error": "No output found"}
@@ -317,6 +326,47 @@ async def text_to_image(req: T2IRequest, background_tasks: BackgroundTasks):
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
     background_tasks.add_task(run_job, job_id, workflow, None, req.watermark, req.watermark_image)
     return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", "poll_url": f"{BASE_URL}/status/{job_id}"}
+
+
+# ─────────────────────────────────────────────
+# SANA-Sprint 1.6B — fast text-to-image (NVlabs)
+# ─────────────────────────────────────────────
+# Sub-second 1024px generation via the SCM 2-step sampler. Defaults match
+# NVlabs/Sana's docs/ComfyUI/SANA-Sprint.json. Cold start (~30 s on a 5090)
+# loads three HF artifacts the first time: Sana checkpoint (6.5 GB), Gemma
+# 2 2B text encoder (5 GB), DC-AE VAE (1.25 GB). setup.sh pre-fetches them
+# to /workspace/.cache/huggingface so cold start is local-disk-only.
+
+class SanaT2IRequest(BaseModel):
+    prompt: str
+    negative_prompt: str = ""
+    width: int = 1024
+    height: int = 1024
+    seed: int = -1
+    steps: int = 2
+    cfg: float = 1.0
+    timestep_shift: float = 4.5
+    watermark: str | None = None
+    watermark_image: bool = False
+
+
+@app.post("/sana/t2i")
+async def sana_text_to_image(req: SanaT2IRequest, background_tasks: BackgroundTasks):
+    seed = req.seed if req.seed != -1 else uuid.uuid4().int % 2**32
+    workflow = build_sana_t2i_workflow(
+        prompt=req.prompt,
+        negative_prompt=req.negative_prompt,
+        width=req.width,
+        height=req.height,
+        seed=seed,
+        steps=req.steps,
+        cfg=req.cfg,
+        timestep_shift=req.timestep_shift,
+    )
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
+    background_tasks.add_task(run_job, job_id, workflow, None, req.watermark, req.watermark_image)
+    return {"job_id": job_id, "status": "queued", "model": "sana-sprint-1.6b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
 
 # ─────────────────────────────────────────────
