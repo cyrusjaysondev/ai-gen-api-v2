@@ -911,19 +911,137 @@ async def flux_face_swap(
 # image's (rescaled) size, or override via width/height.
 # ─────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+# /flux/i2i composition modes (additive — see API.md "Composition modes")
+#
+# Each mode is a pre-baked prompt template + a recommended lora_strength
+# tuned for that use case. When `composition_mode` is left at the default
+# `"none"`, none of this fires — the existing /flux/i2i behavior is
+# preserved bit-for-bit (caller's prompt is required, caller's
+# lora_strength wins).
+#
+# When set, the mode supplies a template prompt + LoRA default the caller
+# would have had to write themselves. The caller's `prompt` and
+# `lora_strength`, if explicitly provided, always win — modes only fill
+# in blanks.
+# ─────────────────────────────────────────────
+
+_I2I_MODE_PROMPTS: dict[str, str] = {
+    "auto": (
+        "high quality detailed composition of the reference images, "
+        "photorealistic, sharp, natural lighting"
+    ),
+    "scene_blend": (
+        "the subject(s) from the reference images placed naturally in the "
+        "scene shown in the first image, matched lighting, integrated "
+        "shadows, photorealistic, sharp focus, detailed environment"
+    ),
+    "outfit_swap": (
+        "the person from the first image wearing the outfit shown in the "
+        "second image, full body, photorealistic, natural lighting, "
+        "detailed fabric texture"
+    ),
+    "style_transfer": (
+        "the first image reimagined in the artistic style of the second "
+        "image, preserving composition and subject"
+    ),
+}
+
+# Default lora_strength per mode. Only applied when the caller didn't pass
+# an explicit value (sentinel: lora_strength = -1).
+_I2I_MODE_LORA: dict[str, float] = {
+    "auto": 0.0,
+    "scene_blend": 0.5,
+    "outfit_swap": 0.7,
+    "style_transfer": 0.0,
+}
+
+_I2I_QUALITY_PRESET_STEPS: dict[str, int] = {
+    "fast": 4,
+    "balanced": 8,
+    "high": 12,
+}
+
+
+def _resolve_i2i_config(
+    *,
+    composition_mode: str,
+    prompt: str,
+    lora_strength: float,
+    steps: int,
+    quality_preset: str,
+    scene_image_index: int,
+    n_images: int,
+) -> tuple[str, float, int, list[int]]:
+    """Translate the public knobs into the final (prompt, lora, steps,
+    image_order) tuple the workflow builder consumes.
+
+    `composition_mode = "none"` (the default) means: no mode logic — return
+    the caller's values verbatim, leave image order untouched. This is
+    what lets us add the feature without changing existing callers.
+
+    For any other mode:
+    * If `prompt` is empty, substitute the mode's template prompt.
+    * If `lora_strength < 0` (sentinel), substitute the mode's default.
+    * If `quality_preset` is one of fast/balanced/high, use its step
+      count, overriding the `steps` argument.
+    * For `scene_blend` with 2+ images, reorder so the scene image (last
+      by default, or the explicit `scene_image_index`) becomes the FLUX
+      canvas (index 0).
+    """
+    # Auto mode if caller asked for no template but also didn't send a prompt.
+    effective_mode = composition_mode
+    if effective_mode == "none" and not prompt.strip():
+        effective_mode = "auto"
+
+    # Prompt: caller wins, then template, then auto fallback.
+    if prompt.strip():
+        final_prompt = prompt
+    else:
+        final_prompt = _I2I_MODE_PROMPTS.get(effective_mode) or _I2I_MODE_PROMPTS["auto"]
+
+    # LoRA: explicit (>=0) wins, else mode default, else 0.
+    if lora_strength >= 0:
+        final_lora = lora_strength
+    else:
+        final_lora = _I2I_MODE_LORA.get(effective_mode, 0.0)
+
+    # Steps: preset wins when one is selected, else caller's `steps`.
+    if quality_preset in _I2I_QUALITY_PRESET_STEPS:
+        final_steps = _I2I_QUALITY_PRESET_STEPS[quality_preset]
+    else:
+        final_steps = steps
+
+    # Image order: only scene_blend reshuffles, and only when we have
+    # something to reshuffle. The scene image becomes the canvas (index 0).
+    indices = list(range(n_images))
+    if effective_mode == "scene_blend" and n_images >= 2:
+        # `-1` (the default) means "last image", which matches how the
+        # frontend uploads user photos first and the library scene last.
+        scene_idx = scene_image_index if scene_image_index >= 0 else n_images - 1
+        scene_idx = max(0, min(scene_idx, n_images - 1))
+        if scene_idx != 0:
+            indices = [scene_idx] + [i for i in indices if i != scene_idx]
+
+    return final_prompt, final_lora, final_steps, indices
+
+
 @app.post("/flux/i2i")
 async def flux_image_to_image(
     background_tasks: BackgroundTasks,
-    prompt: str = Form(..., description="What to do — edit instructions"),
     images: list[UploadFile] = File(..., description="1 to 5 reference images. The first one's dimensions (after rescale) are used as the output canvas unless width/height are set."),
+    prompt: str = Form("", description="What to do — edit instructions. Optional when `composition_mode` is set (server fills in a mode-specific template)."),
     seed: int = Form(-1),
     megapixels: float = Form(2.0, description="Resolution per reference image in megapixels (0.5–4.0)"),
     width: int = Form(0, description="Output width — 0 (default) means: derive from the first image"),
     height: int = Form(0, description="Output height — 0 (default) means: derive from the first image"),
-    steps: int = Form(4),
+    steps: int = Form(4, description="Inference steps. 4 is fine for FLUX Klein. Overridden by `quality_preset` when set."),
     cfg: float = Form(1.0),
     guidance: float = Form(4.0),
-    lora_strength: float = Form(0.0, description="Apply the head-swap LoRA. 0 = off (general edits). Set 0.5–1.0 for face/head-focused edits."),
+    lora_strength: float = Form(-1.0, description="Apply the head-swap LoRA. 0 = off (general edits). 0.5–1.0 for face/head-focused edits. -1 (default) = use the mode's recommended value (0 for `none`/`auto`, 0.5 for `scene_blend`, 0.7 for `outfit_swap`).", ge=-1.0, le=1.5),
+    composition_mode: str = Form("none", description="Pre-baked prompt + LoRA preset for prompt-less callers. `none` (default) = no template, behaves like before. `auto` | `scene_blend` | `outfit_swap` | `style_transfer` = use that mode's template. See API.md → Composition modes."),
+    quality_preset: str = Form("none", description="`none` (default) = use `steps` directly. `fast` = 4 steps, `balanced` = 8 steps, `high` = 12 steps. Overrides `steps` when set."),
+    scene_image_index: int = Form(-1, description="For `composition_mode=scene_blend` only: which input image is the scene/canvas. -1 (default) = last image, which matches the typical 'user uploads first, library scene last' UI flow. Ignored for other modes.", ge=-1, le=4),
     face_filter: bool = Form(False, description="Reject if any input image matches a face in /workspace/blocklist/. Off by default."),
     logo_filter: bool = Form(False, description="Reject if any input image matches a logo/flag in /workspace/blocklist_logos/. Off by default."),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark."),
@@ -932,11 +1050,41 @@ async def flux_image_to_image(
     if not 1 <= len(images) <= 5:
         raise HTTPException(400, f"images must be 1–5 files, got {len(images)}")
 
+    # Validate mode-ish inputs early so a typo doesn't silently behave as
+    # `none`/`steps` (which would mask the bug for the caller).
+    valid_modes = {"none", *_I2I_MODE_PROMPTS}
+    if composition_mode not in valid_modes:
+        raise HTTPException(
+            400,
+            f"composition_mode must be one of {sorted(valid_modes)}, got {composition_mode!r}",
+        )
+    valid_presets = {"none", *_I2I_QUALITY_PRESET_STEPS}
+    if quality_preset not in valid_presets:
+        raise HTTPException(
+            400,
+            f"quality_preset must be one of {sorted(valid_presets)}, got {quality_preset!r}",
+        )
+
     seed = seed if seed != -1 else uuid.uuid4().int % 2**32
+
+    final_prompt, final_lora, final_steps, image_order = _resolve_i2i_config(
+        composition_mode=composition_mode,
+        prompt=prompt,
+        lora_strength=lora_strength,
+        steps=steps,
+        quality_preset=quality_preset,
+        scene_image_index=scene_image_index,
+        n_images=len(images),
+    )
 
     image_bytes_list: list[bytes] = []
     for up in images:
         image_bytes_list.append(await up.read())
+
+    # Apply the mode-driven image reorder (scene_blend only; identity
+    # otherwise). The blocklist filters and the workflow both see the
+    # post-reorder list so logging / canvas selection stay consistent.
+    image_bytes_list = [image_bytes_list[i] for i in image_order]
 
     job_id = str(uuid.uuid4())
     labeled = [(b, f"images[{i}]") for i, b in enumerate(image_bytes_list)]
@@ -954,11 +1102,11 @@ async def flux_image_to_image(
         cleanup_paths.append(p)
 
     workflow = build_flux_i2i_workflow(
-        input_filenames, prompt, seed,
+        input_filenames, final_prompt, seed,
         megapixels=megapixels,
         output_width=width, output_height=height,
-        steps=steps, cfg=cfg, guidance=guidance,
-        lora_strength=lora_strength,
+        steps=final_steps, cfg=cfg, guidance=guidance,
+        lora_strength=final_lora,
     )
 
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
@@ -968,6 +1116,14 @@ async def flux_image_to_image(
         "status": "queued",
         "model": "flux2-klein-9b",
         "ref_count": len(images),
+        "composition_mode": composition_mode,
+        "resolved": {
+            # Surfaced so callers can confirm what the server decided when
+            # they passed prompt-less / mode-only requests.
+            "prompt_used": final_prompt[:120] + ("…" if len(final_prompt) > 120 else ""),
+            "lora_strength": final_lora,
+            "steps": final_steps,
+        },
         "poll_url": f"{BASE_URL}/status/{job_id}",
     }
 

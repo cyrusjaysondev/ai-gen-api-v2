@@ -253,24 +253,49 @@ Output canvas dimensions default to the **first image's rescaled size**, so
 you can use the first image as the "edit target" and the rest as references.
 Override explicitly with `width` and `height` if you want a fixed canvas.
 
+> **New: composition modes for prompt-less callers** — set
+> [`composition_mode`](#composition-modes) and you can leave `prompt`
+> empty. The server fills in a mode-specific template prompt and a
+> recommended `lora_strength`. Useful when the caller can't (or shouldn't)
+> craft a prompt themselves — frontends that only let the user upload a
+> photo + pick a library scene, for example.
+
 ### Parameters (multipart/form-data)
 
 | Param | Default | Description |
 |-------|---------|-------------|
-| `prompt` | required | The edit instruction |
-| `images` | required | 1 to 5 image files. First image's dimensions are used as the canvas unless `width`/`height` are set |
+| `images` | required | 1 to 5 image files. First image's dimensions are used as the canvas unless `width`/`height` are set. For `composition_mode=scene_blend`, the **scene image** becomes the canvas (server-side reorder — see [scene_image_index](#composition-modes)). |
+| `prompt` | `""` (now optional) | The edit instruction. Optional when `composition_mode` is set — server fills in a mode template. |
+| `composition_mode` | `"none"` | `none` \| `auto` \| `scene_blend` \| `outfit_swap` \| `style_transfer`. See [Composition modes](#composition-modes). |
+| `quality_preset` | `"none"` | `none` \| `fast` (4 steps) \| `balanced` (8 steps) \| `high` (12 steps). When set, overrides `steps`. |
+| `scene_image_index` | `-1` | Only used with `composition_mode=scene_blend`. Which input image is the scene/canvas. `-1` = last (matches "user uploads first, library scene last" UI flow). |
 | `seed` | -1 (random) | Reproducibility seed |
 | `megapixels` | 2.0 | Resolution per reference image (0.5–4.0) |
 | `width` | 0 | Output width — `0` means "derive from first image" |
 | `height` | 0 | Output height — `0` means "derive from first image" |
-| `steps` | 4 | Inference steps |
+| `steps` | 4 | Inference steps. Overridden by `quality_preset` when one is selected. |
 | `cfg` | 1.0 | CFG scale |
 | `guidance` | 4.0 | FLUX guidance strength (2.0–6.0) |
-| `lora_strength` | 0.0 | Apply head-swap LoRA. `0` = general edits; `0.5–1.0` = face/head-focused |
+| `lora_strength` | `-1` (= mode default) | `-1` (default) → server picks based on `composition_mode` (0 for none/auto, 0.5 for scene_blend, 0.7 for outfit_swap). Pass `0`–`1.5` to override. |
 | `watermark` | null | See [Watermarks](#watermarks). |
 | `watermark_image` | false | See [Watermarks](#watermarks). |
 
-### Example
+### Composition modes
+
+Mode templates are applied **only when the caller leaves `prompt` empty**.
+If you provide a `prompt`, the caller wins — the mode just supplies the
+LoRA strength default. Likewise `lora_strength` honors any explicit value
+≥ 0; only the sentinel `-1` falls back to the mode default.
+
+| Mode | When to use | Template prompt | Default `lora_strength` | Image role layout |
+|------|-------------|-----------------|------------------------|--------------------|
+| `none` *(default)* | Existing callers. No template applied; behaves exactly like before. | — | (caller's value, or 0) | unchanged |
+| `auto` | "I have a few photos, just blend them sensibly." | *"high quality detailed composition of the reference images, photorealistic, sharp, natural lighting"* | 0 | all equal |
+| **`scene_blend`** | User uploads subject photo(s); picks a scene from a library. The most common no-prompt case. | *"the subject(s) from the reference images placed naturally in the scene shown in the first image, matched lighting, integrated shadows, photorealistic, sharp focus, detailed environment"* | 0.5 | **scene = canvas** (server reorders so the image at `scene_image_index` is at slot 0). All other images are subjects placed into it. |
+| `outfit_swap` | Person + outfit reference. | *"the person from the first image wearing the outfit shown in the second image, full body, photorealistic, natural lighting, detailed fabric texture"* | 0.7 | image[0] = person, image[1] = outfit |
+| `style_transfer` | Image 1 painted in image 2's style. | *"the first image reimagined in the artistic style of the second image, preserving composition and subject"* | 0.0 | image[0] = content, image[1] = style ref |
+
+### Example — classic prompted call (unchanged)
 
 ```bash
 curl -X POST "$POD/flux/i2i" \
@@ -282,16 +307,43 @@ curl -X POST "$POD/flux/i2i" \
   -F "seed=42"
 ```
 
-Response shape is the standard job-queue response:
+### Example — prompt-less, scene from library
+
+User uploads a photo of themselves and a photo of their car, then picks
+"Beach" from the library. The frontend POSTs all three with the library
+scene last; the server places `beach_scene.png` at canvas slot 0.
+
+```bash
+curl -X POST "$POD/flux/i2i" \
+  -F "images=@user_photo.png" \
+  -F "images=@user_car.png" \
+  -F "images=@beach_scene.png" \
+  -F "composition_mode=scene_blend" \
+  -F "quality_preset=balanced"
+# prompt left empty; lora_strength defaults to 0.5; scene_image_index defaults to -1 (=last).
+```
+
+### Response
+
 ```json
 {
   "job_id": "...",
   "status": "queued",
   "model": "flux2-klein-9b",
   "ref_count": 3,
+  "composition_mode": "scene_blend",
+  "resolved": {
+    "prompt_used": "the subject(s) from the reference images placed naturally in the scene shown in the first image…",
+    "lora_strength": 0.5,
+    "steps": 8
+  },
   "poll_url": "https://YOUR_POD_ID-7860.proxy.runpod.net/status/..."
 }
 ```
+
+The new `resolved` block lets the caller verify what the server actually
+decided — useful for prompt-less flows where the caller never wrote a
+prompt themselves.
 
 Poll `/status/{job_id}` for the result URL, just like the other endpoints.
 
