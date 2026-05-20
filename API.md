@@ -12,7 +12,6 @@ Interactive docs (Swagger UI): `https://YOUR_POD_ID-7860.proxy.runpod.net/docs`
 |--------|------|-------------|
 | GET | `/health` | Health check |
 | POST | `/t2i` | Text to image (FLUX.2 Klein 9B) |
-| POST | `/sana/t2i` | Text to image (SANA-Sprint 1.6B — ~sub-second on RTX 5090) |
 | POST | `/flux/face-swap` | Head / face swap (FLUX.2 Klein 9B) |
 | POST | `/flux/i2i` | Multi-reference image editing — 1 to 5 input images (FLUX.2 Klein 9B) |
 | GET | `/admin/blocklist` | List blocked face identities (admin auth) |
@@ -198,55 +197,6 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/t2i \
 ```
 
 ---
-
-## POST /sana/t2i — Text to Image (SANA-Sprint 1.6B)
-
-NVIDIA's SANA-Sprint 1.6B does 1024px text-to-image in 2 SCM steps. On an RTX 5090 a warm
-worker returns in **well under a second per image** — use this when you want previews or
-high-volume generation. For best fidelity / large compositions, prefer `/t2i` (FLUX.2).
-
-**Cold start:** ~30 s the first time after a pod starts — ComfyUI loads the Sana checkpoint
-(6.5 GB), Gemma-2-2b text encoder (5 GB), and DC-AE VAE (1.25 GB) into VRAM. Subsequent
-calls reuse the cached models. All three artifacts live in
-`$HF_HOME=/workspace/.cache/huggingface` on the network volume, so they survive pod
-restarts (no re-download).
-
-### Parameters
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `prompt` | string | **required** | What to generate |
-| `negative_prompt` | string | `""` | Optional. Encoded by Gemma as a negative conditioning. |
-| `width` | int | `1024` | Output width in pixels. 1024 is the trained resolution. |
-| `height` | int | `1024` | Output height in pixels. |
-| `seed` | int | `-1` (random) | Set for reproducible results. |
-| `steps` | int | `2` | SCM steps. Sprint is tuned for 2; values up to ~4 yield marginal gains. |
-| `cfg` | float | `1.0` | Sprint is a distilled / one-step-ish model — keep at 1.0. |
-| `scm_cfg_scale` | float | `4.5` | SCM sampler's internal CFG scale (`ScmModelSampling.cfg_scale`). Defaults from NVlabs reference workflow. |
-| `watermark` | string \| null | `null` | Stamp this text in the bottom-right corner. `null` / `""` = off. |
-| `watermark_image` | bool | `false` | Composite the GenReel logo at the bottom-right. |
-
-### Example
-
-```bash
-curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/sana/t2i \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "a tiny astronaut hatching from an egg on the moon, photoreal, dramatic light",
-    "width": 1024,
-    "height": 1024
-  }'
-```
-
-**Response**
-```json
-{
-  "job_id": "b2c3d4e5-...",
-  "status": "queued",
-  "model": "sana-sprint-1.6b",
-  "poll_url": "https://YOUR_POD_ID-7860.proxy.runpod.net/status/b2c3d4e5-..."
-}
-```
 
 ---
 

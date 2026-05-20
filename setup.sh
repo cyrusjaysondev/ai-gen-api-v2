@@ -397,109 +397,6 @@ else
   log "  ComfyUI-KJNodes already installed"
 fi
 
-# ─────────────────────────────────────────────
-# 3b. SANA (NVlabs) — fast text-to-image via ComfyUI_ExtraModels
-# ─────────────────────────────────────────────
-# Sana-Sprint 1.6B does 1024px text-to-image in ~2 steps. The official ComfyUI
-# integration is lawrence-cj/ComfyUI_ExtraModels; it downloads the checkpoints
-# via HuggingFace Hub at runtime, so we set HF_HOME to a path *on the volume*
-# and pre-fetch the three artifacts here. Without this, the cache lives on
-# /root/.cache/huggingface (container disk) and gets wiped on every pod
-# restart, forcing a 13 GB re-download into VRAM-warmup time.
-export HF_HOME="/workspace/.cache/huggingface"
-mkdir -p "$HF_HOME"
-
-if [ ! -d "$NODES/ComfyUI_ExtraModels" ]; then
-  log "  Installing ComfyUI_ExtraModels (Sana / DC-AE / Gemma loaders)..."
-  (
-    cd "$NODES"
-    git clone -q https://github.com/lawrence-cj/ComfyUI_ExtraModels
-    if [ -f "ComfyUI_ExtraModels/requirements.txt" ]; then
-      $PIP install -q -r ComfyUI_ExtraModels/requirements.txt 2>&1 | tail -1
-    fi
-  )
-  log "  ComfyUI_ExtraModels installed"
-else
-  log "  ComfyUI_ExtraModels already installed"
-fi
-
-# Diffusers + transformers etc. aren't in ComfyUI_ExtraModels' requirements.txt
-# but are required by its DC-AE / Gemma loaders. Without them /sana/t2i fails
-# with "No module named 'diffusers'" on first request.
-$PIP install -q diffusers accelerate transformers sentencepiece protobuf 2>&1 | tail -1 || true
-
-# Patch the EmptySanaLatentImage node: upstream references `self.device` but
-# subclasses ComfyUI's `EmptyLatentImage`, which no longer sets that
-# attribute — instead its built-in generate() pulls the device from
-# `comfy.model_management.intermediate_device()`. Without this patch every
-# /sana/t2i request fails with
-#   "'EmptySanaLatentImage' object has no attribute 'device'"
-SANA_NODES_FILE="$NODES/ComfyUI_ExtraModels/Sana/nodes.py"
-if [ -f "$SANA_NODES_FILE" ] && grep -q "device=self.device" "$SANA_NODES_FILE"; then
-  log "  Patching EmptySanaLatentImage (self.device → intermediate_device())"
-  "$PYTHON" - "$SANA_NODES_FILE" <<'PYEOF'
-import pathlib, sys
-p = pathlib.Path(sys.argv[1])
-src = p.read_text()
-new = src.replace(
-    "device=self.device",
-    'device=__import__("comfy.model_management", fromlist=["intermediate_device"]).intermediate_device()',
-)
-if new != src:
-    p.write_text(new)
-PYEOF
-  # Purge cached bytecode so the next ComfyUI start loads the patched .py.
-  find "$NODES/ComfyUI_ExtraModels" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
-fi
-
-# The custom node uses HuggingFace Hub at runtime; pre-fetch the three repos
-# so the first /sana/t2i call doesn't spend 5 min downloading. ~13 GB total
-# (Sprint 6.5 GB + Gemma-2-2b 5 GB + DC-AE VAE 1.25 GB).
-#
-# Driven through the Python API (`huggingface_hub.snapshot_download`) instead
-# of the `huggingface-cli` CLI: the CLI was deprecated in huggingface_hub
-# 1.13+ in favour of `hf download`, and the old binary now just prints
-# help text — completing in <1 s without downloading anything.
-$PIP install -q -U "huggingface_hub>=0.25" 2>&1 | tail -1 || true
-
-sana_repo_cached() {
-  local repo_dir
-  repo_dir="$HF_HOME/hub/models--$(echo "$1" | tr '/' '-')"
-  [ -d "$repo_dir/snapshots" ] && [ -n "$(ls -A "$repo_dir/snapshots" 2>/dev/null)" ]
-}
-
-for SANA_REPO in \
-    "Efficient-Large-Model/Sana_Sprint_1.6B_1024px" \
-    "Efficient-Large-Model/gemma-2-2b-it" \
-    "mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers"
-do
-  if sana_repo_cached "$SANA_REPO"; then
-    log "  Sana asset already cached: $SANA_REPO"
-  else
-    log "  Downloading Sana asset $SANA_REPO ..."
-    if HF_HUB_DISABLE_PROGRESS_BARS=1 \
-       "$PYTHON" -c "
-import os, sys
-from huggingface_hub import snapshot_download
-try:
-    snapshot_download(
-        repo_id=sys.argv[1],
-        cache_dir=os.environ['HF_HOME'] + '/hub',
-        token=os.environ.get('TOKEN') or None,
-        max_workers=8,
-    )
-    print('OK')
-except Exception as exc:
-    print(f'FAIL: {exc}', file=sys.stderr)
-    sys.exit(1)
-" "$SANA_REPO" 2>&1 | tail -3 | sed 's/^/    /'; then
-      log "    OK"
-    else
-      log "    WARN: $SANA_REPO download failed — /sana/t2i will retry on first request"
-    fi
-  fi
-done
-
 # (The conditional LanPaint-only ComfyUI relaunch that used to live here
 # is now subsumed by the start_comfy.sh supervisor below: it unconditionally
 # kills /start.sh's unsupervised ComfyUI and relaunches under flock'd
@@ -545,10 +442,6 @@ COMFY_ROOT=$COMFY_ROOT
 PYTHON=$PYTHON
 PIP=$PIP
 API_REPO=$API_REPO
-# HuggingFace cache lives on the volume so the 13 GB of Sana assets
-# (Sprint 1.6B + Gemma-2-2b + DC-AE VAE) survive pod restarts. ComfyUI_ExtraModels
-# downloads via HF Hub at runtime, which respects this env var.
-HF_HOME=/workspace/.cache/huggingface
 CONFEOF
 
 # ─────────────────────────────────────────────
@@ -593,12 +486,7 @@ if [ ! -f /workspace/api/config.env ]; then
   log "ERROR: /workspace/api/config.env missing — setup.sh did not complete"
   exit 1
 fi
-# `set -a` makes every var sourced from config.env get auto-exported, so
-# ComfyUI (the child) sees HF_HOME and parks the Sana / Gemma caches on the
-# volume instead of /root/.cache (which is container-disk, wiped on restart).
-set -a
 source /workspace/api/config.env
-set +a
 
 if [ -z "$PYTHON" ] || [ -z "$COMFY_ROOT" ]; then
   log "ERROR: PYTHON or COMFY_ROOT not set in config.env"
