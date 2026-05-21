@@ -1257,17 +1257,22 @@ async def admin_upload_blocklist(
     except RuntimeError as e:
         raise HTTPException(503, f"image normalizer unavailable: {e}")
 
-    # Validate the face is detectable BEFORE writing to disk. Use the
-    # detect-only helper: check_image short-circuits to face_count=0 when
-    # the blocklist is empty, which would block the very first upload.
-    try:
-        face_count = face_safety.detect_face_count(norm_bytes)
-    except RuntimeError as e:
-        raise HTTPException(503, f"face filter unavailable: {e}")
-    if face_count == 0:
-        raise HTTPException(400, "no face detected in the uploaded image — pick a clearer crop")
-    if face_count > 1:
-        raise HTTPException(400, f"detected {face_count} faces — please upload an image with exactly one clearly-visible face")
+    # Validate face count ONLY for new entries. Overwrites of an existing
+    # identity skip this — the admin already vetted the person when the
+    # identity was first added, and SCRFD can flake on re-detection
+    # (different photo of the same person, different lighting, etc.).
+    # Trusting the overwrite path also lets the CMS sync resilience
+    # against detector regressions: a face that worked before will keep
+    # working after a re-sync.
+    if not existing:
+        try:
+            face_count = face_safety.detect_face_count(norm_bytes)
+        except RuntimeError as e:
+            raise HTTPException(503, f"face filter unavailable: {e}")
+        if face_count == 0:
+            raise HTTPException(400, "no face detected in the uploaded image — pick a clearer crop")
+        if face_count > 1:
+            raise HTTPException(400, f"detected {face_count} faces — please upload an image with exactly one clearly-visible face")
 
     if existing:
         existing.unlink()

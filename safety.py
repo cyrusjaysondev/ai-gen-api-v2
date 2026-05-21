@@ -150,20 +150,42 @@ def _build_filter():
     print(f"[face-filter] ready: {len(blocklist)} identities loaded from {blocklist_dir}, threshold={threshold}")
 
 
+# Smallest fraction of the image area a detected bbox must cover to count
+# as a "real" face. Below this, we treat the detection as noise — at the
+# permissive detector settings we run (det_thresh=0.1), SCRFD sometimes
+# reports a tiny background artifact as a low-confidence face, which used
+# to manifest as spurious "detected 2 faces" rejections on otherwise clean
+# portraits. 3% of the image area corresponds to a ~177×177 face inside
+# a 1024×1024 frame — well below any reasonable portrait crop.
+MIN_FACE_AREA_RATIO = float(os.environ.get("FACE_MIN_AREA_RATIO", "0.03"))
+
+
+def _count_significant_faces(faces, img_area: int) -> int:
+    """Count faces whose bbox covers at least MIN_FACE_AREA_RATIO of the
+    image. Filters out background noise that the permissive detector
+    sometimes catches. Returns 0 if `faces` is empty.
+    """
+    n = 0
+    for f in faces:
+        x1, y1, x2, y2 = f.bbox
+        area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        if img_area > 0 and (area / img_area) >= MIN_FACE_AREA_RATIO:
+            n += 1
+    return n
+
+
 def detect_face_count(image_bytes: bytes) -> int:
-    """Run face detection on an image and return the number of faces found.
+    """Count significant faces in the image.
 
-    Used by the admin upload endpoint to validate a blocklist entry without
-    requiring the blocklist to be non-empty — `check_image` short-circuits
-    on empty blocklist for perf and would otherwise report face_count=0
-    for the very first upload.
+    Used by the admin upload endpoint to validate a blocklist entry. We
+    filter detections by bbox area so background noise (a tiny artifact
+    that the detector picks up at low det_thresh) doesn't get counted
+    as a second face and trigger a false "detected 2 faces" rejection.
 
-    If the first detection pass returns 0 faces we retry on a
-    contrast-equalized + auto-leveled copy of the image. Older photos and
-    scanned portraits often have washed-out colour that SCRFD silently
-    drops below its detection floor, but bumping local contrast usually
-    unlocks them. The retry only kicks in when the cheap path failed, so
-    the common case is unaffected.
+    If the first pass returns 0 significant faces, we retry on a
+    contrast-equalized copy of the image. Older / washed-out portraits
+    often fall below SCRFD's detection floor at default exposure but
+    pass after a histogram stretch.
     """
     _maybe_reload()
     if _FILTER is None:
@@ -177,19 +199,21 @@ def detect_face_count(image_bytes: bytes) -> int:
         return 0
 
     arr = np.array(pil)
-    n = len(app.get(arr))
+    img_h, img_w = arr.shape[:2]
+    img_area = img_h * img_w
+
+    n = _count_significant_faces(app.get(arr), img_area)
     if n > 0:
         return n
 
     # Fallback: enhance and retry. ImageOps.autocontrast stretches the
     # histogram per channel so washed-out faces look closer to standard
     # exposure; that alone catches a lot of the "elderly photo" misses.
-    # We import ImageOps lazily so the happy path doesn't pay the import.
     try:
         from PIL import ImageOps
         enhanced = ImageOps.autocontrast(pil, cutoff=2)
         arr2 = np.array(enhanced)
-        n2 = len(app.get(arr2))
+        n2 = _count_significant_faces(app.get(arr2), img_area)
         if n2 > 0:
             print(f"[face-filter] detection recovered via autocontrast fallback (found {n2})")
             return n2
