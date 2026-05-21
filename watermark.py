@@ -19,7 +19,7 @@ Style:
   * Text: bold white with a black outline at the bottom-right. Size scales
     to ~4% of image height (min 24 px), padded ~3% from the edges.
   * Logo: PNG with transparency, placed at the bottom-right. Width scales
-    to ~14% of the image's shorter side (min 64 px) so it's visible without
+    to ~7% of the image's shorter side (min 32 px) so it's visible without
     dominating the frame.
 
 Video paths re-encode through libx264 (CRF 18, veryfast). Audio, if present,
@@ -51,7 +51,10 @@ LOGO_URL = (
 )
 
 # Fraction of the image's shorter side used as the logo's width.
-_LOGO_SCALE = 0.14
+# 0.07 = ~7% of the shorter side; halved from the original 0.14 to make
+# the GenReel mark less dominant. Both width and height scale together so
+# this also halves the rendered height.
+_LOGO_SCALE = 0.07
 # Padding from the edge, as a fraction of the shorter side.
 _EDGE_PAD = 0.03
 
@@ -305,9 +308,9 @@ def _apply_image_logo(p: Path) -> None:
 
     logo = Image.open(LOGO_PATH).convert("RGBA")
     shorter = min(base.width, base.height)
-    target_w = max(64, int(shorter * _LOGO_SCALE))
+    target_w = max(32, int(shorter * _LOGO_SCALE))
     ratio = target_w / logo.width
-    target_h = max(16, int(logo.height * ratio))
+    target_h = max(8, int(logo.height * ratio))
     logo = logo.resize((target_w, target_h), Image.LANCZOS)
 
     pad = max(8, int(shorter * _EDGE_PAD))
@@ -331,7 +334,7 @@ def _apply_image_logo(p: Path) -> None:
 def _apply_video_logo(p: Path) -> None:
     """Overlay LOGO_PATH onto the video at `p` via ffmpeg `overlay`.
 
-    The logo is sized to ~14 % of the video's shorter side, padded ~3 %
+    The logo is sized to ~7 % of the video's shorter side, padded ~3 %
     from the bottom-right. We probe the input first and bake concrete
     integers into the filter string so ffmpeg's filtergraph parser (which
     treats commas as filter separators) doesn't mistokenise `max(...,
@@ -340,7 +343,7 @@ def _apply_video_logo(p: Path) -> None:
     w, h = _probe_dimensions(p)
     shorter = min(w, h)
     pad = max(8, int(shorter * _EDGE_PAD))
-    target_w = max(64, int(shorter * _LOGO_SCALE))
+    target_w = max(32, int(shorter * _LOGO_SCALE))
 
     tmp = p.with_name(f"{p.stem}.wm{p.suffix}")
     # main_w / main_h / overlay_w / overlay_h are valid overlay-filter
