@@ -97,14 +97,16 @@ def _build_filter():
     blocklist_dir = _blocklist_dir()
     model_root    = os.environ.get("INSIGHTFACE_MODEL_ROOT", "/workspace/insightface_models")
     threshold     = float(os.environ.get("FACE_FILTER_THRESHOLD", "0.6"))
-    # InsightFace's default detection threshold (0.5) was rejecting clearly-
-    # visible faces in older/lower-quality portraits — particularly elderly
-    # subjects, slightly grainy scans, and photos with washed-out colour.
-    # 0.3 catches those without producing meaningful false positives at the
-    # blocklist-upload stage (admins eyeball the image themselves before
-    # confirming). The MATCHING threshold above is independent — it's a
-    # cosine-similarity cutoff on the embedding, not on detection.
-    det_thresh    = float(os.environ.get("FACE_DETECTOR_THRESHOLD", "0.3"))
+    # InsightFace's default detection threshold (0.5) — and even our earlier
+    # bump to 0.3 — kept rejecting clearly-visible elderly faces. SCRFD-10G
+    # under-trains on older subjects and on photos with washed-out colour,
+    # so we set the floor much lower (0.1) and use a larger detection canvas
+    # (1024² instead of 640²) which dramatically improves recall on small or
+    # low-contrast faces. The MATCHING threshold (FACE_FILTER_THRESHOLD)
+    # above is independent — it's a cosine-similarity cutoff on the embedding,
+    # not on detection, so a more permissive detector doesn't loosen blocking.
+    det_thresh    = float(os.environ.get("FACE_DETECTOR_THRESHOLD", "0.1"))
+    det_size_edge = int(os.environ.get("FACE_DETECTOR_SIZE", "1024"))
 
     # Reuse the FaceAnalysis instance across reloads — the model load is
     # ~5s on first call. The blocklist itself is cheap to rescan.
@@ -112,7 +114,7 @@ def _build_filter():
         try:
             _CACHED_APP = FaceAnalysis(name="buffalo_l", root=model_root,
                                providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-            _CACHED_APP.prepare(ctx_id=0, det_size=(640, 640), det_thresh=det_thresh)
+            _CACHED_APP.prepare(ctx_id=0, det_size=(det_size_edge, det_size_edge), det_thresh=det_thresh)
         except Exception as e:
             _FILTER_INIT_ERROR = f"failed to initialize InsightFace: {e}"
             return
@@ -155,6 +157,13 @@ def detect_face_count(image_bytes: bytes) -> int:
     requiring the blocklist to be non-empty — `check_image` short-circuits
     on empty blocklist for perf and would otherwise report face_count=0
     for the very first upload.
+
+    If the first detection pass returns 0 faces we retry on a
+    contrast-equalized + auto-leveled copy of the image. Older photos and
+    scanned portraits often have washed-out colour that SCRFD silently
+    drops below its detection floor, but bumping local contrast usually
+    unlocks them. The retry only kicks in when the cheap path failed, so
+    the common case is unaffected.
     """
     _maybe_reload()
     if _FILTER is None:
@@ -163,10 +172,31 @@ def detect_face_count(image_bytes: bytes) -> int:
     np    = _FILTER["np"]
     Image = _FILTER["Image"]
     try:
-        arr = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
+        pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception:
         return 0
-    return len(app.get(arr))
+
+    arr = np.array(pil)
+    n = len(app.get(arr))
+    if n > 0:
+        return n
+
+    # Fallback: enhance and retry. ImageOps.autocontrast stretches the
+    # histogram per channel so washed-out faces look closer to standard
+    # exposure; that alone catches a lot of the "elderly photo" misses.
+    # We import ImageOps lazily so the happy path doesn't pay the import.
+    try:
+        from PIL import ImageOps
+        enhanced = ImageOps.autocontrast(pil, cutoff=2)
+        arr2 = np.array(enhanced)
+        n2 = len(app.get(arr2))
+        if n2 > 0:
+            print(f"[face-filter] detection recovered via autocontrast fallback (found {n2})")
+            return n2
+    except Exception as e:
+        print(f"[face-filter] autocontrast fallback errored: {e}")
+
+    return 0
 
 
 # Max edge length we store for a blocklist entry. Embeddings are computed by
