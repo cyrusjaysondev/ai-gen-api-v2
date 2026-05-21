@@ -1225,14 +1225,26 @@ async def admin_list_blocklist(authorization: str = Header(default=None)):
 
 @app.post("/admin/blocklist")
 async def admin_upload_blocklist(
-    image: UploadFile = File(..., description="Face image of the identity to block. Must contain exactly one clearly-visible face."),
+    image: UploadFile = File(..., description="Face image of the identity to block."),
     identity: str = Form(..., description="Stable identifier (used to delete later, and returned in block responses). [A-Za-z0-9_-]{1,64}"),
-    overwrite: bool = Form(False, description="If true, replace an existing entry with the same identity"),
+    overwrite: bool = Form(True, description="If true (default), replace an existing entry with the same identity. Set false to error 409 instead."),
     authorization: str = Header(default=None),
 ):
-    """Add a face to the blocklist. Validates the image contains exactly one
-    detectable face before accepting — if face detection fails the upload
-    is rejected so admins know the entry would have been silently skipped."""
+    """Add a face to the blocklist.
+
+    The upload is accepted regardless of whether the face detector can
+    find a face — the admin has eyeballed the image and knows what they
+    intend to block; rejecting valid admin intent because SCRFD flaked is
+    worse UX than accepting an entry that may turn out to be non-functional.
+    The face filter loader (`_build_filter` in safety.py) does its own
+    detection pass when it reads `/workspace/blocklist/` and warns + skips
+    any file it can't embed, so undetectable entries fail closed (they
+    won't crash the filter, they just won't block anything).
+
+    The response includes `face_count` so callers can surface a soft
+    warning when detection found 0 or 2+ faces — useful for the CMS
+    badge but not a hard error.
+    """
     _require_admin(authorization)
     _validate_identity(identity)
     BLOCKLIST_DIR.mkdir(parents=True, exist_ok=True)
@@ -1244,7 +1256,7 @@ async def admin_upload_blocklist(
     raw_bytes = await image.read()
 
     if face_safety is None:
-        raise HTTPException(503, "face filter module unavailable — cannot validate the uploaded image")
+        raise HTTPException(503, "face filter module unavailable — cannot normalize the uploaded image")
 
     # Normalize first: EXIF-rotate + downscale to BLOCKLIST_MAX_EDGE + re-encode
     # as PNG. Lets the caller upload phone photos / 4K crops / odd formats
@@ -1257,22 +1269,14 @@ async def admin_upload_blocklist(
     except RuntimeError as e:
         raise HTTPException(503, f"image normalizer unavailable: {e}")
 
-    # Validate face count ONLY for new entries. Overwrites of an existing
-    # identity skip this — the admin already vetted the person when the
-    # identity was first added, and SCRFD can flake on re-detection
-    # (different photo of the same person, different lighting, etc.).
-    # Trusting the overwrite path also lets the CMS sync resilience
-    # against detector regressions: a face that worked before will keep
-    # working after a re-sync.
-    if not existing:
-        try:
-            face_count = face_safety.detect_face_count(norm_bytes)
-        except RuntimeError as e:
-            raise HTTPException(503, f"face filter unavailable: {e}")
-        if face_count == 0:
-            raise HTTPException(400, "no face detected in the uploaded image — pick a clearer crop")
-        if face_count > 1:
-            raise HTTPException(400, f"detected {face_count} faces — please upload an image with exactly one clearly-visible face")
+    # Detection is now informational, not a gate. We still run it so the
+    # response can include a soft warning, but neither 0 nor 2+ faces
+    # rejects the upload.
+    face_count = -1
+    try:
+        face_count = face_safety.detect_face_count(norm_bytes)
+    except Exception as e:
+        print(f"[admin_upload_blocklist] detector raised, treating as unknown: {e}")
 
     if existing:
         existing.unlink()
@@ -1280,12 +1284,20 @@ async def admin_upload_blocklist(
     target = BLOCKLIST_DIR / f"{identity}{ext}"
     target.write_bytes(norm_bytes)
 
+    warning = None
+    if face_count == 0:
+        warning = "no face detected by the model — entry stored but may not actually filter generations until you re-upload with a clearer crop"
+    elif face_count > 1:
+        warning = f"detected {face_count} faces — the filter will pick the largest for matching"
+
     return {
         "status": "replaced" if existing else "added",
         "identity": identity,
         "filename": target.name,
         "size_bytes": target.stat().st_size,
         "blocklist_count": _blocklist_count(),
+        "face_count": face_count,
+        "warning": warning,
     }
 
 
