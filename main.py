@@ -4,6 +4,7 @@ import uuid, json, httpx, os
 from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks, Header
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import websockets
@@ -46,6 +47,27 @@ except ImportError:
     watermark = None
 
 app = FastAPI(title="AI Gen API v2")
+
+# Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
+# can call /admin/blocklist directly across the multi-pod registry. We
+# previously routed everything through the face-swap-proxy edge function,
+# but the proxy was timing out for admin paths and routing through it adds
+# a hop for what's already an admin-only operation. With CORS on the pod
+# itself, the CMS can fan out to every registered pod URL in parallel.
+#
+# allow_origins=["*"] is acceptable because:
+#   - /admin/* endpoints will require ADMIN_API_TOKEN when set (future)
+#   - All other endpoints are already meant to be reachable from app browsers
+#   - RunPod's pod hostnames aren't truly secret but aren't published either
+# If we add auth later we can lock origins down.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
+)
 
 COMFYUI_URL = "http://127.0.0.1:8188"
 POD_ID = os.environ.get("RUNPOD_POD_ID", "RUNPOD_POD_ID_PLACEHOLDER")
