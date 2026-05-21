@@ -526,3 +526,139 @@ def build_ltx_t2v_workflow(prompt: str, negative_prompt: str,
         high_res_video_src=["253", 0],
         prefix="ltx_t2v", preset=preset, audio=audio
     )
+
+
+# ─────────────────────────────────────────────
+# LTX-2.3 — Motion Control (workflow assembly)
+#
+# Kling-style motion transfer: take an image (identity) + a reference
+# video (motion source) and produce a new video where the image animates
+# along the motion structure of the reference. Implementation strategy:
+#
+#   1. VHS_LoadVideo decodes the reference clip into a frame tensor.
+#   2. The same ResizeImageMaskNode + LTXVPreprocess chain that i2v uses
+#      preps the character image at the target resolution.
+#   3. VAEEncode (with the LTX VAE) encodes the reference frame batch into
+#      a motion latent — same shape as EmptyLTXVLatentVideo would produce,
+#      but with the reference's motion baked into the noise space instead
+#      of pure Gaussian. The sampler then preserves that motion structure
+#      while denoising toward the conditioning prompt + image.
+#   4. LTXVImgToVideoInplace mixes the character image latent in at the
+#      configured `inplace_strength` — high values stick to the identity
+#      hard (preserves face but flatter motion); low values let motion
+#      dominate (better dance fidelity but identity drift).
+#   5. Standard LTX two-pass / single-pass sampler from ltx_base_nodes.
+#
+# Reference video preprocessing happens server-side (in main.py) before
+# we reach this builder — we trim + resample to fit LTX's `length` cap
+# (typically 97 frames) and downscale to the target resolution.
+# ─────────────────────────────────────────────
+
+def build_ltx_motion_workflow(reference_video_filename: str,
+                              character_image_filename: str,
+                              prompt: str, negative_prompt: str,
+                              width: int, height: int, length: int, fps: int, seed: int,
+                              preset: str = "fast", audio: bool = False,
+                              enhance_prompt: bool = True,
+                              inplace_strength: float = 0.5,
+                              motion_strength: float = 1.0) -> dict:
+    """Build the LTX 2.3 motion-control workflow.
+
+    `reference_video_filename` and `character_image_filename` must already
+    exist in ComfyUI's input dir (main.py writes them there before calling).
+
+    `inplace_strength`  — identity pinning. 0.7 = strong identity (i2v
+                          default), 0.5 = balanced (motion-control default),
+                          0.3 = motion dominates.
+    `motion_strength`   — multiplier on the encoded video latent before
+                          mixing. 1.0 = use motion as-is; <1 dampens it;
+                          >1 amplifies (risk of artifacts). Today wired
+                          via LatentMultiply between the VAE encode and
+                          the inplace mixer; can be removed once we know
+                          1.0 is right.
+    """
+    two_pass = LTX_PRESETS[preset]["two_pass"]
+    refine_strength = min(1.0, inplace_strength + 0.3)
+
+    img_nodes = {
+        # Character image — same chain as i2v.
+        "269": {"class_type": "LoadImage", "inputs": {"image": character_image_filename}},
+        "238": {"class_type": "ResizeImageMaskNode", "inputs": {
+            "input": ["269", 0], "resize_type": "scale dimensions",
+            "resize_type.width": width, "resize_type.height": height,
+            "resize_type.crop": "center", "scale_method": "lanczos"
+        }},
+        "235": {"class_type": "ResizeImagesByLongerEdge", "inputs": {"images": ["238", 0], "longer_edge": 1536}},
+        "248": {"class_type": "LTXVPreprocess", "inputs": {"image": ["235", 0], "img_compression": 18}},
+
+        # Reference video — load via VHS, resize to match target dims, then
+        # VAE-encode into motion latents. force_size locks to the LTX
+        # canvas; frame_load_cap caps at `length` so a 30s upload becomes
+        # the requested clip duration.
+        "310": {"class_type": "VHS_LoadVideo", "inputs": {
+            "video": reference_video_filename,
+            "force_rate": float(fps),
+            "force_size": "Disabled",
+            "frame_load_cap": length,
+            "skip_first_frames": 0,
+            "select_every_nth": 1,
+        }},
+        "311": {"class_type": "ResizeImageMaskNode", "inputs": {
+            "input": ["310", 0], "resize_type": "scale dimensions",
+            "resize_type.width": width, "resize_type.height": height,
+            "resize_type.crop": "center", "scale_method": "lanczos"
+        }},
+        "312": {"class_type": "VAEEncode", "inputs": {"pixels": ["311", 0], "vae": ["236", 2]}},
+
+        # Motion-strength scaler. Identity multiply when 1.0 — kept in the
+        # graph so we can adjust without editing the workflow shape later.
+        "313": {"class_type": "LatentMultiply", "inputs": {"samples": ["312", 0], "multiplier": motion_strength}},
+
+        # Mix character identity into the motion latent — same node i2v
+        # uses, but the `latent` input is the encoded reference (with
+        # motion structure) instead of an empty tensor.
+        "249": {"class_type": "LTXVImgToVideoInplace", "inputs": {
+            "vae": ["236", 2], "image": ["248", 0], "latent": ["313", 0],
+            "strength": inplace_strength, "bypass": False
+        }},
+    }
+
+    if enhance_prompt:
+        # Same Gemma-driven prompt enhancement as i2v — it uses the
+        # character image as visual context so the enhanced prompt
+        # references the actual subject.
+        img_nodes["274"] = {"class_type": "TextGenerateLTX2Prompt", "inputs": {
+            "clip": ["272", 1], "image": ["269", 0], "prompt": prompt,
+            "max_length": 256, "sampling_mode": "on",
+            "sampling_mode.temperature": 0.7, "sampling_mode.top_k": 64,
+            "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
+            "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": seed
+        }}
+        img_nodes["240"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["243", 0], "text": ["274", 0]}}
+
+    if two_pass:
+        img_nodes["230"] = {"class_type": "LTXVImgToVideoInplace", "inputs": {
+            "vae": ["236", 2], "image": ["248", 0], "latent": ["253", 0], "strength": refine_strength, "bypass": False
+        }}
+        high_res_src = ["230", 0]
+    else:
+        high_res_src = None
+
+    workflow = ltx_base_nodes(
+        prompt, negative_prompt, width, height, length, fps, seed,
+        low_res_video_src=["249", 0], high_res_video_src=high_res_src,
+        prefix="ltx_motion", preset=preset, audio=audio
+    )
+    workflow.update(img_nodes)
+
+    # Color-match each generated frame back to the input image (same
+    # rationale as i2v — fp8 VAE round-trip drifts warm; ColorMatch closes
+    # the gap without affecting motion).
+    workflow["280"] = {"class_type": "ColorMatch", "inputs": {
+        "image_ref":    ["269", 0],
+        "image_target": ["251", 0],
+        "method":       "mkl",
+        "strength":     1.0,
+    }}
+    workflow["242"]["inputs"]["images"] = ["280", 0]
+    return workflow

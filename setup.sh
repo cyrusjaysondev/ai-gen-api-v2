@@ -397,6 +397,26 @@ else
   log "  ComfyUI-KJNodes already installed"
 fi
 
+# ComfyUI-VideoHelperSuite — provides VHS_LoadVideo / VHS_VideoCombine for
+# the /ltx/motion endpoint. Reads a reference video into a frame tensor that
+# the LTX VAE can encode into motion latents, then writes the LTX sampler's
+# output back out as mp4. Without this the motion-control workflow can't
+# load the reference. Pinned to upstream main; the pod auto-pulls on each
+# boot via this block.
+if [ ! -d "$NODES/ComfyUI-VideoHelperSuite" ]; then
+  log "  Installing ComfyUI-VideoHelperSuite (provides VHS_LoadVideo for /ltx/motion)..."
+  (
+    cd "$NODES"
+    git clone -q https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
+    if [ -f "ComfyUI-VideoHelperSuite/requirements.txt" ]; then
+      $PIP install -q -r ComfyUI-VideoHelperSuite/requirements.txt 2>&1 | tail -1
+    fi
+  )
+  log "  ComfyUI-VideoHelperSuite installed"
+else
+  log "  ComfyUI-VideoHelperSuite already installed"
+fi
+
 # (The conditional LanPaint-only ComfyUI relaunch that used to live here
 # is now subsumed by the start_comfy.sh supervisor below: it unconditionally
 # kills /start.sh's unsupervised ComfyUI and relaunches under flock'd

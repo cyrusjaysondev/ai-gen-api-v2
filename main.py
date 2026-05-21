@@ -17,6 +17,7 @@ from workflows import (
     build_flux_i2i_workflow,
     build_t2i_workflow,
     build_ltx_i2v_workflow,
+    build_ltx_motion_workflow,
     build_ltx_t2v_workflow,
     compute_dimensions,
     compute_ltx_dimensions,
@@ -620,6 +621,140 @@ async def ltx_text_to_video(
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
     background_tasks.add_task(run_job, job_id, workflow, None, watermark, watermark_image)
     return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", "poll_url": f"{BASE_URL}/status/{job_id}"}
+
+
+# ─────────────────────────────────────────────
+# LTX-2.3 Motion Control (Kling-style)
+#
+# Take a character image + a reference video of motion (dance, gesture,
+# action) and produce a new video where the character does what the
+# reference does. The reference video's motion structure is baked into
+# the LTX latent space via VAE-encoded frames; the character image is
+# mixed in via the same LTXVImgToVideoInplace node /ltx/i2v uses.
+#
+# Reference video constraints:
+#   - Caller can upload any length / resolution; we trim to `length`
+#     frames and downscale to the target canvas server-side via ffmpeg
+#     before handing to ComfyUI. Anything longer than `length / fps`
+#     seconds gets the leading clip; tail is dropped.
+#   - For Kling-style 30s dance refs, capture the first ~5s — that's
+#     usually one motion cycle which is what LTX can model in one shot.
+# ─────────────────────────────────────────────
+
+@app.post("/ltx/motion")
+async def ltx_motion_control(
+    background_tasks: BackgroundTasks,
+    reference_video: UploadFile = File(..., description="Reference video whose motion the character should mimic. Any length/resolution accepted — server trims and downscales to fit LTX's frame budget."),
+    image: UploadFile = File(..., description="Character image — identity / appearance source. Same role as /ltx/i2v's image."),
+    prompt: str = Form("", description="Free-form description of the action. Enhanced by Gemma using the character image as context unless enhance_prompt=false."),
+    negative_prompt: str = Form(LTX_DEFAULT_NEGATIVE),
+    preset: str = Form("fast", description="Speed/quality preset: fast (8 steps single-pass, ~50s @544×960) or quality (8+3 steps two-pass, ~130s)"),
+    aspect_ratio: str = Form("9:16", description="Output aspect ratio: original | 16:9 | 9:16 | 1:1 | 4:3 | 3:4 | 3:2 | 2:3 | 21:9 | 9:21"),
+    width: int = Form(544, description="Output width — height is derived from aspect_ratio. For 9:16 dance refs the 544×960 fast / 720×1280 quality presets are tuned for clean motion."),
+    height: int = Form(960, description="Only used when aspect_ratio=original."),
+    length: int = Form(121, description="Number of output frames (also caps reference-video frames pulled in). 97≈4s, 121≈5s, 161≈6.7s @24fps."),
+    fps: int = Form(24, description="Frames per second for both reference decode and output."),
+    seed: int = Form(-1),
+    audio: bool = Form(False),
+    enhance_prompt: bool = Form(True, description="Rewrite the prompt via Gemma using the character image as visual context. Recommended ON unless you've written a long detailed motion description yourself."),
+    inplace_strength: float = Form(0.5, ge=0.3, le=1.0, description="Identity-vs-motion balance. 0.7 = identity dominates (cleaner face, weaker motion fidelity). 0.5 = balanced (default for motion control). 0.3 = motion dominates (best dance match, identity drift possible)."),
+    motion_strength: float = Form(1.0, ge=0.0, le=1.5, description="Multiplier on the encoded reference latent. 1.0 = use motion as-encoded. <1.0 attenuates (subtler motion). >1.0 amplifies (risk of artifacts > 1.2)."),
+    watermark: str | None = Form(None, description="Optional text overlay at bottom-right. Stripped by Supabase proxies in prod."),
+    watermark_image: bool = Form(False, description="Composite the GenReel logo at the bottom-right."),
+):
+    """Kling-style motion control via LTX 2.3.
+
+    Pipeline:
+      1. Save uploaded reference video + character image to ComfyUI input dir.
+      2. ffmpeg normalize the reference: resample to `fps`, trim to `length`
+         frames, downscale to fit the target canvas (saves VAE encode time
+         + VRAM for refs that arrive as 4K phone clips).
+      3. Build the LTX motion workflow — VHS_LoadVideo reads the normalized
+         clip, the LTX VAE encodes its frames into a motion latent,
+         LTXVImgToVideoInplace mixes the character image identity in, and
+         the standard LTX sampler denoises toward the prompt + image.
+      4. Enqueue as a background job; client polls /status/<job_id>.
+    """
+    if preset not in LTX_PRESETS:
+        raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
+    if aspect_ratio != "original" and aspect_ratio not in LTX_ASPECT_RATIOS:
+        raise HTTPException(400, f"Invalid aspect_ratio. Valid: original, {', '.join(LTX_ASPECT_RATIOS)}")
+
+    seed = seed if seed != -1 else uuid.uuid4().int % 2**32
+    width, height = compute_ltx_dimensions(width, height, aspect_ratio)
+
+    # Persist the character image into ComfyUI's input dir under a stable
+    # name — same pattern as /ltx/i2v. The cleanup list at the end ensures
+    # both this and the normalized video get deleted after the job runs.
+    img_bytes = await image.read()
+    img_filename = f"ltx_motion_img_{uuid.uuid4().hex}.png"
+    img_path = str(INPUT_DIR / img_filename)
+    Path(img_path).write_bytes(img_bytes)
+
+    # Reference video — save the raw upload, then ffmpeg-normalize into the
+    # canvas / fps / length the workflow expects. The intermediate raw file
+    # is dropped after normalize completes; only the normalized clip is fed
+    # to ComfyUI. ffmpeg is preinstalled by setup.sh.
+    raw_video_bytes = await reference_video.read()
+    raw_video_ext = (reference_video.filename or "").lower().rsplit(".", 1)[-1] or "mp4"
+    raw_video_path = str(INPUT_DIR / f"ltx_motion_ref_raw_{uuid.uuid4().hex}.{raw_video_ext}")
+    Path(raw_video_path).write_bytes(raw_video_bytes)
+
+    ref_video_filename = f"ltx_motion_ref_{uuid.uuid4().hex}.mp4"
+    ref_video_path = str(INPUT_DIR / ref_video_filename)
+
+    # ffmpeg pre-step: resample fps, force resolution to the LTX canvas
+    # (scale-to-fit + pad black to preserve aspect), and trim to length
+    # frames. `-an` strips audio since we only use the visual track for
+    # motion — LTX's audio path is separate (`audio=True` synthesizes
+    # a fresh track to match the visual output).
+    import subprocess
+    ffmpeg_cmd = [
+        "ffmpeg", "-y", "-loglevel", "error", "-i", raw_video_path,
+        "-vf", (
+            f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"fps={fps}"
+        ),
+        "-frames:v", str(length),
+        "-an",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+        ref_video_path,
+    ]
+    try:
+        subprocess.run(ffmpeg_cmd, check=True, capture_output=True, timeout=120)
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or b"").decode(errors="replace")[:500]
+        Path(raw_video_path).unlink(missing_ok=True)
+        Path(img_path).unlink(missing_ok=True)
+        raise HTTPException(400, f"could not decode reference video: {stderr or 'ffmpeg failed'}")
+    except subprocess.TimeoutExpired:
+        Path(raw_video_path).unlink(missing_ok=True)
+        Path(img_path).unlink(missing_ok=True)
+        raise HTTPException(408, "reference video normalization timed out (>120s) — try a shorter / lower-res upload")
+
+    # Raw upload no longer needed once we have the normalized clip.
+    Path(raw_video_path).unlink(missing_ok=True)
+
+    workflow = build_ltx_motion_workflow(
+        reference_video_filename=ref_video_filename,
+        character_image_filename=img_filename,
+        prompt=prompt, negative_prompt=negative_prompt,
+        width=width, height=height, length=length, fps=fps, seed=seed,
+        preset=preset, audio=audio, enhance_prompt=enhance_prompt,
+        inplace_strength=inplace_strength, motion_strength=motion_strength,
+    )
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
+    # Both input files get cleaned up after the job completes (or fails) —
+    # same cleanup contract as the existing /ltx/i2v + /flux/face-swap.
+    background_tasks.add_task(run_job, job_id, workflow, [img_path, ref_video_path], watermark, watermark_image)
+    return {
+        "job_id": job_id, "status": "queued", "model": "ltx-2.3-22b",
+        "poll_url": f"{BASE_URL}/status/{job_id}",
+        "ref_video_normalized_to": {"width": width, "height": height, "fps": fps, "max_frames": length},
+    }
 
 
 # ─────────────────────────────────────────────
