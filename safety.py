@@ -96,7 +96,15 @@ def _build_filter():
 
     blocklist_dir = _blocklist_dir()
     model_root    = os.environ.get("INSIGHTFACE_MODEL_ROOT", "/workspace/insightface_models")
-    threshold     = float(os.environ.get("FACE_FILTER_THRESHOLD", "0.6"))
+    # Cosine-similarity cutoff for "this detected face matches a blocked
+    # identity". Was 0.6, bumped to 0.7 after a confirmed false-positive
+    # (unrelated woman scoring 0.666 against a Hun Sen entry). 0.7 is the
+    # practical sweet spot for buffalo_l/Arcface — genuine same-person
+    # matches typically land at 0.75–0.9, so the threshold catches real
+    # hits while shaking off coincidental similarity between two faces of
+    # similar demographics. If a known real identity slips past 0.7, drop
+    # FACE_FILTER_THRESHOLD via env to widen the net for that pod only.
+    threshold     = float(os.environ.get("FACE_FILTER_THRESHOLD", "0.7"))
     # InsightFace's default detection threshold (0.5) — and even our earlier
     # bump to 0.3 — kept rejecting clearly-visible elderly faces. SCRFD-10G
     # under-trains on older subjects and on photos with washed-out colour,
@@ -285,8 +293,25 @@ def check_image(image_bytes: bytes) -> FilterResult:
         # Unparseable image → let the workflow caller surface its own error
         return FilterResult(False, None, 0.0, 0)
 
-    faces = app.get(arr)
+    img_h, img_w = arr.shape[:2]
+    img_area = img_h * img_w
+
+    raw_faces = app.get(arr)
+    if not raw_faces:
+        return FilterResult(False, None, 0.0, 0)
+
+    # Filter detections by area before matching. At det_thresh=0.1 the
+    # detector occasionally produces low-confidence pseudo-faces from
+    # background texture; those have garbage embeddings that can match
+    # blocklist entries by chance and produce false positives. The same
+    # MIN_FACE_AREA_RATIO that gates uploads also applies here so the
+    # detect/match policy stays consistent.
+    faces = [
+        f for f in raw_faces
+        if (max(0.0, f.bbox[2] - f.bbox[0]) * max(0.0, f.bbox[3] - f.bbox[1]) / max(1, img_area)) >= MIN_FACE_AREA_RATIO
+    ]
     if not faces:
+        # Detector saw only noise — nothing significant to match.
         return FilterResult(False, None, 0.0, 0)
 
     best_score = -1.0
