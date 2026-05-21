@@ -696,6 +696,18 @@ async def ltx_motion_control(
     # is dropped after normalize completes; only the normalized clip is fed
     # to ComfyUI. ffmpeg is preinstalled by setup.sh.
     raw_video_bytes = await reference_video.read()
+    # Defensive cap: anything beyond ~100MB is almost certainly someone
+    # uploading a 4K phone clip we can't process inside Supabase's edge-
+    # function body limit anyway. Reject early so the pod doesn't churn
+    # ffmpeg on it for 60s only to fail downstream.
+    REF_VIDEO_MAX_BYTES = 100 * 1024 * 1024
+    if len(raw_video_bytes) > REF_VIDEO_MAX_BYTES:
+        Path(img_path).unlink(missing_ok=True)
+        raise HTTPException(
+            413,
+            f"reference video too large: {len(raw_video_bytes) // (1024*1024)} MB > 100 MB. "
+            f"Trim to ~5s and downscale to <1080p before upload.",
+        )
     raw_video_ext = (reference_video.filename or "").lower().rsplit(".", 1)[-1] or "mp4"
     raw_video_path = str(INPUT_DIR / f"ltx_motion_ref_raw_{uuid.uuid4().hex}.{raw_video_ext}")
     Path(raw_video_path).write_bytes(raw_video_bytes)
@@ -703,14 +715,28 @@ async def ltx_motion_control(
     ref_video_filename = f"ltx_motion_ref_{uuid.uuid4().hex}.mp4"
     ref_video_path = str(INPUT_DIR / ref_video_filename)
 
-    # ffmpeg pre-step: resample fps, force resolution to the LTX canvas
-    # (scale-to-fit + pad black to preserve aspect), and trim to length
-    # frames. `-an` strips audio since we only use the visual track for
-    # motion — LTX's audio path is separate (`audio=True` synthesizes
-    # a fresh track to match the visual output).
+    # ffmpeg pre-step: normalize the reference to exactly `length` frames
+    # at `fps` at the LTX canvas.
+    #
+    # `-stream_loop -1` BEFORE `-i` loops the input infinitely; combined
+    # with `-frames:v length` the output is guaranteed to have exactly
+    # `length` frames even if the source is shorter than `length / fps`
+    # seconds. Without this, a 2s clip with length=121 would give 48
+    # frames and the VAE-encoded motion latent would have the wrong
+    # temporal dimension for the LTX sampler.
+    #
+    # `-an` strips audio since we only use the visual track for motion —
+    # LTX's audio path is separate (`audio=True` synthesizes a fresh
+    # track to match the visual output).
+    #
+    # NOTE: the synchronous subprocess.run call is offloaded to a thread
+    # pool below so it doesn't block the FastAPI event loop while ffmpeg
+    # is encoding (can take 10-60s on a long source).
+    import asyncio
     import subprocess
     ffmpeg_cmd = [
-        "ffmpeg", "-y", "-loglevel", "error", "-i", raw_video_path,
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-stream_loop", "-1", "-i", raw_video_path,
         "-vf", (
             f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
@@ -721,8 +747,12 @@ async def ltx_motion_control(
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
         ref_video_path,
     ]
+
+    def _run_ffmpeg() -> subprocess.CompletedProcess:
+        return subprocess.run(ffmpeg_cmd, check=True, capture_output=True, timeout=120)
+
     try:
-        subprocess.run(ffmpeg_cmd, check=True, capture_output=True, timeout=120)
+        await asyncio.to_thread(_run_ffmpeg)
     except subprocess.CalledProcessError as e:
         stderr = (e.stderr or b"").decode(errors="replace")[:500]
         Path(raw_video_path).unlink(missing_ok=True)

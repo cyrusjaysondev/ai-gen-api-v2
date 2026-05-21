@@ -617,6 +617,21 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         # Mix character identity into the motion latent — same node i2v
         # uses, but the `latent` input is the encoded reference (with
         # motion structure) instead of an empty tensor.
+        #
+        # ⚠️ UNTESTED ASSUMPTION: the node was designed for empty
+        # latents (from EmptyLTXVLatentVideo). Whether it accepts a
+        # VAE-encoded video latent here is the riskiest unknown in this
+        # workflow. If ComfyUI errors with a shape/type mismatch on
+        # this node, the fix is to either:
+        #   (a) Replace with a different LTX node that explicitly takes
+        #       video latents (LTXVVideoExtend if available), OR
+        #   (b) Skip "313"/"312" and pass ["228", 0] (empty latent)
+        #       here, then plumb the motion latent as an extra
+        #       conditioning signal via LTXVConditioning. That preserves
+        #       i2v shape compatibility while still using the reference
+        #       for guidance.
+        # Either way, the API contract + the rest of the pipeline doesn't
+        # change — only this node's wiring.
         "249": {"class_type": "LTXVImgToVideoInplace", "inputs": {
             "vae": ["236", 2], "image": ["248", 0], "latent": ["313", 0],
             "strength": inplace_strength, "bypass": False
