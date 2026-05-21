@@ -182,6 +182,42 @@ def _count_significant_faces(faces, img_area: int) -> int:
     return n
 
 
+def force_reload_filter() -> dict:
+    """Wipe the cached `_FILTER` and re-run `_build_filter()` immediately.
+
+    Lets `/admin/reload-filter` apply config changes (FACE_FILTER_THRESHOLD,
+    FACE_DETECTOR_THRESHOLD, FACE_MIN_AREA_RATIO env vars, or new blocklist
+    files dropped on disk out-of-band) without restarting uvicorn.
+
+    The underlying FaceAnalysis model instance (`_CACHED_APP`) is preserved
+    so we don't pay the ~5s model-load tax on every reload; we only
+    re-read the env-tunable knobs and re-scan the blocklist directory for
+    embedding extraction.
+
+    Returns a dict the admin endpoint can echo back so the caller sees the
+    new threshold + identity count and knows the reload actually took.
+    """
+    global _FILTER, _FILTER_BLOCKLIST_MTIME
+    # Force the next _maybe_reload to fall through to _build_filter even if
+    # the blocklist dir mtime hasn't moved.
+    _FILTER = None
+    _FILTER_BLOCKLIST_MTIME = 0.0
+    _build_filter()
+    if _FILTER is None:
+        return {
+            "ok": False,
+            "error": _FILTER_INIT_ERROR or "filter rebuild produced no state",
+        }
+    return {
+        "ok": True,
+        "threshold": _FILTER["threshold"],
+        "blocklist_count": len(_FILTER["blocklist"]),
+        # Surface a small sample so admins eyeballing the response can
+        # confirm the entries they expect are loaded.
+        "sample_identities": sorted(_FILTER["blocklist"].keys())[:10],
+    }
+
+
 def detect_face_count(image_bytes: bytes) -> int:
     """Count significant faces in the image.
 

@@ -1206,6 +1206,23 @@ def _blocklist_count() -> int:
                if p.is_file() and p.suffix.lower() in ALLOWED_BLOCKLIST_EXTS)
 
 
+@app.post("/admin/reload-filter")
+async def admin_reload_filter(authorization: str = Header(default=None)):
+    """Force `safety._build_filter()` to re-run without a uvicorn restart.
+
+    Use after changing FACE_FILTER_THRESHOLD / FACE_DETECTOR_THRESHOLD /
+    FACE_MIN_AREA_RATIO env vars on the pod, or after a manual blocklist
+    mutation that bypassed the /admin/blocklist endpoints (rsync, scp,
+    etc.). The InsightFace model itself stays loaded — only the cached
+    `_FILTER` dict and the blocklist embeddings are rebuilt, so this is
+    fast (~50ms + ~10ms per blocklist entry).
+    """
+    _require_admin(authorization)
+    if face_safety is None:
+        raise HTTPException(503, "face filter module unavailable")
+    return face_safety.force_reload_filter()
+
+
 @app.get("/admin/blocklist")
 async def admin_list_blocklist(authorization: str = Header(default=None)):
     """List all identities currently on the blocklist."""
