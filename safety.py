@@ -97,6 +97,14 @@ def _build_filter():
     blocklist_dir = _blocklist_dir()
     model_root    = os.environ.get("INSIGHTFACE_MODEL_ROOT", "/workspace/insightface_models")
     threshold     = float(os.environ.get("FACE_FILTER_THRESHOLD", "0.6"))
+    # InsightFace's default detection threshold (0.5) was rejecting clearly-
+    # visible faces in older/lower-quality portraits — particularly elderly
+    # subjects, slightly grainy scans, and photos with washed-out colour.
+    # 0.3 catches those without producing meaningful false positives at the
+    # blocklist-upload stage (admins eyeball the image themselves before
+    # confirming). The MATCHING threshold above is independent — it's a
+    # cosine-similarity cutoff on the embedding, not on detection.
+    det_thresh    = float(os.environ.get("FACE_DETECTOR_THRESHOLD", "0.3"))
 
     # Reuse the FaceAnalysis instance across reloads — the model load is
     # ~5s on first call. The blocklist itself is cheap to rescan.
@@ -104,7 +112,7 @@ def _build_filter():
         try:
             _CACHED_APP = FaceAnalysis(name="buffalo_l", root=model_root,
                                providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-            _CACHED_APP.prepare(ctx_id=0, det_size=(640, 640))
+            _CACHED_APP.prepare(ctx_id=0, det_size=(640, 640), det_thresh=det_thresh)
         except Exception as e:
             _FILTER_INIT_ERROR = f"failed to initialize InsightFace: {e}"
             return
