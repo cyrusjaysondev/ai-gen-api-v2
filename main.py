@@ -205,12 +205,23 @@ def _mux_reference_audio(video_path: Path, audio_source: Path) -> tuple[bool, st
     return True, "ok"
 
 
+_MOTION_CLEAN_FRACTION = 0.40  # see comment below
+
+
 def _trim_first_half(video_path: Path) -> tuple[bool, str]:
-    """Keep only the first half of a video's frames. Used by /ltx/motion
+    """Keep only the first ~40% of a video's frames. Used by /ltx/motion
     because the IC-LoRA Union-Control guide only conditions the first
-    50% of the output latent — the second half free-generates to
-    colored noise. Trimming gives users a fully-coherent clip at half
-    the duration they requested rather than a half-broken full-length one.
+    portion of the output latent — the rest free-generates to colored
+    noise. Trimming gives users a fully-coherent clip at the cost of
+    duration.
+
+    Why 0.40 not 0.50: empirically the noise boundary in v33's output
+    fell at ~80% of the 50%-trimmed clip = ~40% of the raw decoded
+    output. Trim at 0.40 gives a small safety margin so the very last
+    frames are still clean. For length=257 the user gets ~7s clean;
+    for length=121 they get ~4s clean. To get a longer final clip,
+    request a proportionally longer `length` (multiply target seconds
+    by ~6).
 
     Returns (changed, message).
     """
@@ -231,18 +242,19 @@ def _trim_first_half(video_path: Path) -> tuple[bool, str]:
     if duration <= 0.1:
         return False, "duration too short to trim"
 
-    half = duration / 2.0
+    clean_end = duration * _MOTION_CLEAN_FRACTION
     tmp_out = video_path.with_name(f"{video_path.stem}.halftrim{video_path.suffix}")
-    # -c copy gives us a stream copy (no re-encode), `-t half` truncates.
-    # We re-encode video because stream copy at arbitrary cut points
-    # would leave us at the previous keyframe — re-encoding (NVENC if
-    # available, libx264 fallback) gives a clean cut at the half mark.
+    # Re-encode video because stream copy at arbitrary cut points
+    # would leave us at the previous keyframe — re-encoding (libx264
+    # veryfast) gives a clean cut at the target mark. Audio is stream-
+    # copied because the audio mux ran first and we want to preserve
+    # the segment that aligns with the kept video.
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(video_path),
-        "-t", f"{half:.3f}",
+        "-t", f"{clean_end:.3f}",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
-        "-c:a", "copy",  # audio mux ran before this; preserve it
+        "-c:a", "copy",
         str(tmp_out),
     ]
     try:
@@ -255,7 +267,8 @@ def _trim_first_half(video_path: Path) -> tuple[bool, str]:
         err = (res.stderr or b"").decode(errors="replace")[-300:]
         return False, f"trim failed: {err}"
     os.replace(str(tmp_out), str(video_path))
-    return True, f"trimmed to first {half:.2f}s of {duration:.2f}s"
+    return True, (f"trimmed to first {clean_end:.2f}s of {duration:.2f}s "
+                  f"({_MOTION_CLEAN_FRACTION*100:.0f}% — IC-LoRA clean region)")
 
 
 async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
