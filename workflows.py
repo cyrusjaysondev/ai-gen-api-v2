@@ -775,17 +775,12 @@ def build_ltx_motion_workflow(reference_video_filename: str,
     distilled_lora_strength = LTX_PRESETS["fast"]["lora_strength"]  # 0.5
     sigmas = _LTX_DISTILLED_LOW_SIGMAS
 
-    # ─── Snap canvas dims to a multiple of 64 ─────────────────────
-    # Union-Control IC-LoRA has latent_downscale_factor = 2.0, meaning
-    # the guide expects the latent spatial dims to be divisible by 2.
-    # LTX's latent stride is 32 (image_dim / 32 = latent_dim), so for an
-    # even latent the image dim must be divisible by 32 * 2 = 64.
-    # Without this, the guide errors out: "Latent spatial size 17x30
-    # must be divisible by latent_downscale_factor 2.0" (17 = 544/32 is
-    # odd → fail). We snap UP to the next multiple of 64 so the canvas
-    # never shrinks; for 544×960 the user gets 576×960 (still 9:16).
-    width = ((width + 63) // 64) * 64
-    height = ((height + 63) // 64) * 64
+    # ─── Snap canvas dims to a multiple of 32 ─────────────────────
+    # Standard LTX requires image dims divisible by the latent stride
+    # of 32. No IC-LoRA factor=2 constraint anymore since v29 dropped
+    # the IC-LoRA path. 544×960 is already aligned (17 × 30 latent).
+    width = ((width + 31) // 32) * 32
+    height = ((height + 31) // 32) * 32
 
     # ─── Length + fps: match the Lightricks Union-Control example ─
     # Reverted v22's "halve EmptyLTXVLatentVideo length" — that was
@@ -837,26 +832,12 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "ckpt_name":    "ltx-2.3-22b-dev-fp8.safetensors",
             "device": "default",
         }},
-        # Distilled LoRA (matches base workflow)
+        # Distilled LoRA (matches base workflow). NO IC-LoRA loader
+        # anymore — see comment on node 330 for the rationale.
         "232": {"class_type": "LoraLoaderModelOnly", "inputs": {
             "model": ["236", 0],
             "lora_name": "ltx-2.3-22b-distilled-lora-384.safetensors",
             "strength_model": distilled_lora_strength,
-        }},
-        # IC-LoRA Union-Control on top of distilled. Slot 0 = model with
-        # both LoRAs applied, slot 1 = latent_downscale_factor (FLOAT;
-        # wire into LTXAddVideoICLoRAGuide so the guide knows the LoRA's
-        # grid size).
-        #
-        # strength_model restored to 1.0 — the v24 dip to 0.7 made
-        # things much worse (TV-static across the entire clip). The
-        # IC-LoRA needs full strength to function; the mid-clip noise
-        # we saw before is fixed by the fps=30 alignment above, not
-        # by reducing this LoRA's contribution.
-        "262": {"class_type": "LTXICLoRALoaderModelOnly", "inputs": {
-            "model": ["232", 0],
-            "lora_name": "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
-            "strength_model": 1.0,
         }},
 
         # ─── Prompts ───────────────────────────────────────────────
@@ -931,82 +912,54 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "pose_estimator": "dw-ll_ucoco_384_bs5.torchscript.pt",
             "scale_stick_for_xinsr_cn": "disable",
         }},
-        # Resize the skeleton frames to a multiple of 64 so the pose
-        # video's encoded latent has even spatial dims (Union-Control
-        # IC-LoRA's latent_downscale_factor is 2 → image dim must be
-        # divisible by 32*2 = 64). The official workflow computes this
-        # dynamically via SimpleMath+ (`a*32` where `a` is the loader's
-        # latent_downscale_factor output), but SimpleMath+ isn't on
-        # this pod — 64 is the right hardcoded value for Union-Control.
+        # Resize skeleton to canvas dimensions exactly (multiple of 32
+        # is fine — we're not using the IC-LoRA's factor=2 alignment
+        # anymore). LTXVPreprocess to mirror the i2v identity chain.
         "321": {"class_type": "ResizeImageMaskNode", "inputs": {
             "input": ["320", 0],
-            "resize_type": "scale to multiple",
-            "resize_type.multiple": 64,
-            "scale_method": "lanczos",
+            "resize_type": "scale dimensions",
+            "resize_type.width": width, "resize_type.height": height,
+            "resize_type.crop": "center", "scale_method": "lanczos",
         }},
+        "322": {"class_type": "LTXVPreprocess", "inputs": {"image": ["321", 0], "img_compression": 18}},
 
-        # ─── IC-LoRA guide: STACKED to cover full output latent ───
-        # v27 confirmed the IC-LoRA at latent_downscale_factor=2.0 (its
-        # trained value) halves the temporal coverage of each guide.
-        # Overriding factor to 1.0 in v27 fixed the coverage but the
-        # output was just a clean stick figure — the IC-LoRA's
-        # character-rendering step depends on factor=2.0.
+        # ─── Standard LTXVAddGuide with DWPose skeleton ───────────
+        # Reverted away from LTXAddVideoICLoRAGuide. Across v19-v28 the
+        # IC-LoRA's latent_downscale_factor=2 halved temporal coverage,
+        # producing the 50%-onward noise. v27 confirmed factor=1.0 fixes
+        # coverage but disables the character render step. v28 stacking
+        # two guides at factor=2.0 caused double-character ghosting.
         #
-        # Fix: keep factor=2.0 (so the IC-LoRA renders the character),
-        # but STACK TWO guides at different frame_idx so their 8-slice
-        # write windows tile the full 16-slice output latent:
-        #   Guide 1 (node 330): frame_idx=0  → writes output slices 0-7
-        #   Guide 2 (node 331): frame_idx=64 → writes output slices 8-15
-        # frame_idx=64 = 8*8, so it maps to output latent slot 8.
-        # Validation check `latent_idx + guide.shape[2] <= latent_length`:
-        # 8 + 8 = 16 ≤ 16 → passes. Both guides feed the same DWPose
-        # video — they share motion, just write to different temporal
-        # positions of the output latent.
-        "330": {"class_type": "LTXAddVideoICLoRAGuideAdvanced", "inputs": {
+        # The standard LTXVAddGuide has no latent_downscale_factor → no
+        # temporal halving → full output coverage from a single guide.
+        # It treats the input image as a raw RGB conditioning signal —
+        # which previously caused appearance leak (reference person's
+        # clothes on character). But we're now feeding it the BLACK-BG
+        # DWPose skeleton, not the raw ref video. The skeleton's
+        # "appearance" is just colored bones on a dark background, so
+        # there's no character appearance to leak through. The model
+        # gets pose-driven motion structure + the character image at
+        # frame 0 via LTXVImgToVideoConditionOnly, and the result
+        # should be Marco doing the pose sequence cleanly throughout.
+        "330": {"class_type": "LTXVAddGuide", "inputs": {
             "positive": ["239", 0],
             "negative": ["239", 1],
             "vae": ["236", 2],
-            "latent": ["325", 0],              # character-conditioned latent
-            "image": ["321", 0],               # DWPose skeleton video
+            "latent": ["325", 0],   # character-conditioned latent
+            "image": ["322", 0],    # DWPose skeleton (black bg + bones)
             "frame_idx": 0,
             "strength": motion_strength,
-            "latent_downscale_factor": ["262", 1],  # 2.0 from loader
-            "crop": "disabled",
-            "use_tiled_encode": False,
-            "tile_size": 256,
-            "tile_overlap": 64,
-            "attention_strength": 1.0,
-        }},
-        # Guide 2 stacked on Guide 1's output — fills the second half
-        # of the output latent that the single-guide setup left
-        # unconditioned (hence the 50%-onward noise we saw in v19-v26).
-        "331": {"class_type": "LTXAddVideoICLoRAGuideAdvanced", "inputs": {
-            "positive": ["330", 0],
-            "negative": ["330", 1],
-            "vae": ["236", 2],
-            "latent": ["330", 2],              # build on Guide 1's latent
-            "image": ["321", 0],               # same DWPose skeleton
-            "frame_idx": 64,                   # output latent slot 8 (8×8)
-            "strength": motion_strength,
-            "latent_downscale_factor": ["262", 1],
-            "crop": "disabled",
-            "use_tiled_encode": False,
-            "tile_size": 256,
-            "tile_overlap": 64,
-            "attention_strength": 1.0,
         }},
 
         # ─── Sampler chain ─────────────────────────────────────────
-        # Read from Guide 2 (node 331) — the second stacked IC-LoRA
-        # guide whose latent has both Guide 1's first-half write AND
-        # Guide 2's second-half write composed together. Conditioning
-        # outputs also come from 331 (which inherits Guide 1's
-        # additive conditioning composition via its positive/negative
-        # inputs being wired from 330's outputs).
+        # Read from node 330 (single LTXVAddGuide — no stacking needed
+        # since the standard guide doesn't halve temporal coverage).
+        # Model now feeds directly from node 232 (distilled-LoRA loader)
+        # — no IC-LoRA in the model chain anymore.
         "231": {"class_type": "CFGGuider", "inputs": {
-            "model": ["262", 0],              # IC-LoRA-loaded model
-            "positive": ["331", 0],
-            "negative": ["331", 1],
+            "model": ["232", 0],
+            "positive": ["330", 0],
+            "negative": ["330", 1],
             "cfg": 1.0,
         }},
         "209": {"class_type": "KSamplerSelect", "inputs": {
@@ -1019,7 +972,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "guider": ["231", 0],
             "sampler": ["209", 0],
             "sigmas": ["252", 0],
-            "latent_image": ["331", 2],       # Guide 2's latent (full coverage)
+            "latent_image": ["330", 2],
         }},
 
         # ─── Decode + colour-match + output ───────────────────────
