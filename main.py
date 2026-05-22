@@ -1666,6 +1666,81 @@ async def admin_install_comfy_node(
     }
 
 
+@app.post("/admin/refresh-api-code")
+async def admin_refresh_api_code(authorization: str = Header(default=None)):
+    """Wget the latest main.py / workflows.py / safety.py / etc. from
+    the API_REPO env var into /workspace/api/, then kill uvicorn so the
+    start_api.sh supervisor re-launches it with the fresh code.
+
+    Requires the supervisor's `fetch_api_code()` shell function — i.e.
+    setup.sh must have been re-run since the wget-in-loop change landed.
+    On older containers this endpoint may return ok but the supervisor
+    won't actually re-fetch (because the in-memory start_api.sh still has
+    the wget BEFORE the while loop).
+
+    Use case: deploy a Python-file change to the pod without a container
+    restart. Couple seconds of unavailability while uvicorn cycles, no
+    GPU release, no risk of capacity loss.
+    """
+    _require_admin(authorization)
+    import os
+    import subprocess
+
+    api_repo = os.environ.get("API_REPO", "https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main")
+    api_dir = Path("/workspace/api")
+    api_dir.mkdir(parents=True, exist_ok=True)
+
+    fetched: list[dict] = []
+    for filename in ("main.py", "workflows.py", "safety.py", "logo_safety.py", "watermark.py"):
+        url = f"{api_repo}/{filename}"
+        target = api_dir / filename
+        tmp = api_dir / f"{filename}.new"
+        try:
+            res = subprocess.run(
+                ["wget", "-q", "-O", str(tmp), url],
+                capture_output=True, timeout=30,
+            )
+            if res.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0:
+                tmp.replace(target)
+                fetched.append({"file": filename, "ok": True, "size": target.stat().st_size})
+            else:
+                tmp.unlink(missing_ok=True)
+                fetched.append({"file": filename, "ok": False, "reason": "empty or wget failed"})
+        except Exception as e:
+            fetched.append({"file": filename, "ok": False, "reason": str(e)})
+
+    # Kill uvicorn — the supervisor restarts it within ~5s with the
+    # freshly fetched code. We target the port owner via netstat (mirrors
+    # start_api.sh's own stale-PID logic) — more reliable than pkill on
+    # an argv pattern.
+    restarted = False
+    try:
+        netstat = subprocess.run(["netstat", "-tlnp"], capture_output=True, timeout=10).stdout.decode()
+        for line in netstat.splitlines():
+            if ":7860" in line:
+                # last column: "PID/program"
+                pid_field = line.split()[-1]
+                pid = pid_field.split("/")[0]
+                if pid.isdigit():
+                    subprocess.run(["kill", "-9", pid], capture_output=True, timeout=5)
+                    restarted = True
+                    break
+    except Exception as e:
+        return {
+            "ok": False,
+            "files": fetched,
+            "uvicorn_kill_error": str(e),
+            "note": "Files updated but uvicorn restart failed — kill it manually with: pkill -9 -f 'uvicorn main:app'",
+        }
+
+    return {
+        "ok": True,
+        "files": fetched,
+        "uvicorn_killed": restarted,
+        "note": "uvicorn restarts in ~5s via start_api.sh supervisor. The connection that called this endpoint dies — that's expected.",
+    }
+
+
 @app.post("/admin/restart-comfyui")
 async def admin_restart_comfyui(authorization: str = Header(default=None)):
     """Kill ComfyUI so start_comfy.sh's supervisor relaunches it.

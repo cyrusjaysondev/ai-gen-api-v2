@@ -636,17 +636,26 @@ source /workspace/api/config.env
 log "Installing pip deps..."
 $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | tail -1
 
-# Always fetch latest main.py + workflows.py + safety.py + logo_safety.py + watermark.py from repo on restart
-log "Fetching latest API code..."
-for f in main.py workflows.py safety.py logo_safety.py watermark.py; do
-  wget -q -O "/workspace/api/$f.new" "${API_REPO}/$f"
-  if [ -s "/workspace/api/$f.new" ]; then
-    mv "/workspace/api/$f.new" "/workspace/api/$f"
-  else
-    log "WARN: Failed to download $f — using existing version"
-    rm -f "/workspace/api/$f.new"
-  fi
-done
+# Fetch latest main.py + workflows.py + safety.py + logo_safety.py + watermark.py from repo
+# Defined as a function so the supervisor loop below can call it BEFORE
+# every uvicorn restart. Without that, killing uvicorn (e.g. via the
+# /admin/install-comfy-node pkill) only restarts the OLD code — to deploy
+# fresh code you'd need a container reboot. Calling fetch_api_code inside
+# the loop turns a uvicorn-only restart into a real code deploy.
+fetch_api_code() {
+  log "Fetching latest API code..."
+  for f in main.py workflows.py safety.py logo_safety.py watermark.py; do
+    wget -q -O "/workspace/api/$f.new" "${API_REPO}/$f"
+    if [ -s "/workspace/api/$f.new" ]; then
+      mv "/workspace/api/$f.new" "/workspace/api/$f"
+    else
+      log "WARN: Failed to download $f — using existing version"
+      rm -f "/workspace/api/$f.new"
+    fi
+  done
+}
+
+fetch_api_code
 
 # Wait for ComfyUI to be ready
 log "Waiting for ComfyUI..."
@@ -669,10 +678,15 @@ if [ -n "$STALE_PID" ]; then
   kill -9 "$STALE_PID" 2>/dev/null || true
 fi
 
-# Start API with auto-restart on crash
+# Start API with auto-restart on crash.
+# IMPORTANT: re-fetch latest code on EVERY restart, not just when this
+# supervisor first starts. This is what lets `/admin/refresh-api-code` (and
+# any pkill -9 -f uvicorn) deliver a fresh deploy without a container
+# reboot. The wget is fast (~50ms × 5 files); the cost is negligible.
 cd /workspace/api || exit 1
 log "Starting API on port 7860..."
 while true; do
+  fetch_api_code
   $PYTHON -m uvicorn main:app --host 0.0.0.0 --port 7860 >> /workspace/api.log 2>&1
   EXIT_CODE=$?
   log "API exited with code $EXIT_CODE — restarting in 5s..."
