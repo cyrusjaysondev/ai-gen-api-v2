@@ -1371,6 +1371,30 @@ def _blocklist_count() -> int:
                if p.is_file() and p.suffix.lower() in ALLOWED_BLOCKLIST_EXTS)
 
 
+def _detect_comfy_root() -> str:
+    """Mirror setup.sh's COMFY_ROOT detection so admin endpoints look at
+    the same custom_nodes/ that setup.sh + start_comfy.sh use. Order:
+      1. COMFY_ROOT env var (set by start_api.sh via setup.sh's saved paths)
+      2. /workspace/runpod-slim/ComfyUI (slim image default)
+      3. /workspace/ComfyUI (legacy path)
+      4. Filesystem scan for any */ComfyUI/main.py under /workspace
+    """
+    import os
+    env = os.environ.get("COMFY_ROOT")
+    if env and Path(env).is_dir():
+        return env
+    for candidate in ("/workspace/runpod-slim/ComfyUI", "/workspace/ComfyUI"):
+        if Path(candidate).is_dir():
+            return candidate
+    # Last-resort scan — cheap because /workspace is small at the top level.
+    try:
+        for p in Path("/workspace").rglob("ComfyUI/main.py"):
+            return str(p.parent)
+    except Exception:
+        pass
+    return "/workspace/ComfyUI"  # fall back to legacy so callers see a path
+
+
 @app.get("/admin/comfy-status")
 async def admin_comfy_status(authorization: str = Header(default=None)):
     """Read-only introspection: which custom_nodes dirs are present, and
@@ -1386,9 +1410,8 @@ async def admin_comfy_status(authorization: str = Header(default=None)):
     specifically, which has been the recurring offender.
     """
     _require_admin(authorization)
-    import os
 
-    comfy_root = os.environ.get("COMFY_ROOT", "/workspace/ComfyUI")
+    comfy_root = _detect_comfy_root()
     nodes_dir = Path(comfy_root) / "custom_nodes"
     nodes_on_disk: list[dict] = []
     if nodes_dir.is_dir():
@@ -1461,7 +1484,6 @@ async def admin_install_comfy_node(
     so a fresh pod boot works without this manual step.
     """
     _require_admin(authorization)
-    import os
     import subprocess
     import sys
 
@@ -1473,7 +1495,7 @@ async def admin_install_comfy_node(
         repo_slug = f"https://github.com/{repo_slug}"
     repo_name = repo_slug.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
 
-    comfy_root = os.environ.get("COMFY_ROOT", "/workspace/ComfyUI")
+    comfy_root = _detect_comfy_root()
     nodes_dir = Path(comfy_root) / "custom_nodes"
     nodes_dir.mkdir(parents=True, exist_ok=True)
     target_dir = nodes_dir / repo_name
