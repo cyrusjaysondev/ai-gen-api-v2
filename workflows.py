@@ -881,13 +881,22 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "resize_type.width": width, "resize_type.height": height,
             "resize_type.crop": "center", "scale_method": "lanczos",
         }},
+        # Multi-frame character batch — repeat the character image
+        # `length` times so a downstream LTXVAddGuide can inject
+        # appearance conditioning at EVERY output frame, fighting the
+        # identity drift we saw in v34 (Marco at frame 0 → unknown man
+        # with beard + headband at frame 5).
+        "332": {"class_type": "RepeatImageBatch", "inputs": {
+            "image": ["238", 0],
+            "amount": length,
+        }},
         "228": {"class_type": "EmptyLTXVLatentVideo", "inputs": {
             "width": width, "height": height, "length": length, "batch_size": 1,
         }},
         # LTXVImgToVideoConditionOnly — applies the character image as
-        # the identity anchor. bypass=False means we USE the character
-        # (Lightricks' example has bypass=True because it's a non-
-        # character scene; we always want identity locked).
+        # the identity anchor at frame 0. bypass=False means we USE the
+        # character (Lightricks' example has bypass=True; we always
+        # want identity locked).
         "325": {"class_type": "LTXVImgToVideoConditionOnly", "inputs": {
             "vae": ["236", 2],
             "image": ["238", 0],
@@ -971,17 +980,41 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "tile_overlap": 64,
         }},
 
+        # ─── Character-batch guide stacked on IC-LoRA output ──────
+        # v34 shipped clean ~6s output but identity drifted across the
+        # clip — Marco at frame 0, a different person with beard +
+        # headband by frame 5. LTXVImgToVideoConditionOnly only
+        # anchors frame 0; the model interpolates appearance forward
+        # and drifts because the IC-LoRA pose conditioning has no
+        # identity info (skeleton bones don't carry face / clothing).
+        #
+        # Fix: inject the character image at EVERY output frame via a
+        # standard LTXVAddGuide fed by RepeatImageBatch (node 332).
+        # Strength 0.3 — low enough that the IC-LoRA's pose still
+        # dominates the motion structure, high enough to keep face
+        # and clothing locked to the character image throughout.
+        "331": {"class_type": "LTXVAddGuide", "inputs": {
+            "positive": ["330", 0],   # build on IC-LoRA guide's output
+            "negative": ["330", 1],
+            "vae": ["236", 2],
+            "latent": ["330", 2],
+            "image": ["332", 0],      # character image × length frames
+            "frame_idx": 0,
+            "strength": 0.3,
+        }},
+
         # ─── Sampler chain ─────────────────────────────────────────
         # Model: ["262", 0] = distilled + IC-LoRA weights baked in. The
         # IC-LoRA's pose-to-character training is what enables the model
         # to interpret skeleton pixels as a character pose rather than
         # literally rendering colored bones. Positive/negative come from
-        # the standard LTXVAddGuide (node 330) which spans the full
-        # output latent without the IC-LoRA guide node's 50% halving.
+        # the character-batch guide (node 331) which sits AFTER the
+        # IC-LoRA's pose conditioning and adds identity reinforcement
+        # across all output frames.
         "231": {"class_type": "CFGGuider", "inputs": {
             "model": ["262", 0],
-            "positive": ["330", 0],
-            "negative": ["330", 1],
+            "positive": ["331", 0],
+            "negative": ["331", 1],
             "cfg": 1.0,
         }},
         "209": {"class_type": "KSamplerSelect", "inputs": {
@@ -994,7 +1027,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "guider": ["231", 0],
             "sampler": ["209", 0],
             "sigmas": ["252", 0],
-            "latent_image": ["330", 2],
+            "latent_image": ["331", 2],   # identity-reinforced latent
         }},
 
         # ─── Decode + colour-match + output ───────────────────────
