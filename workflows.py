@@ -977,35 +977,29 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         }},
 
         # ─── Sparse character anchors for identity consistency ────
-        # v34 shipped clean ~6s output but identity drifted — Marco at
-        # frame 0, bearded stranger with headband at frame 5.
-        # v35 tried a full-length RepeatImageBatch but OOM'd at 257
-        # character frames VAE-encoded at once.
-        # v36 stacks SINGLE-FRAME LTXVAddGuide calls at sparse frame_idx
-        # positions across the clip. Each guide encodes just one image,
-        # so VAE memory is trivial. The model sees the character image
-        # re-asserted every ~32 latent frames, which fights the drift
-        # without requiring multi-frame VAE encoding.
+        # v36 had 4 anchors at strength 0.4 — clean dance + audio but
+        # face still drifted from Marco (slimmer/younger version of
+        # him, not an exact identity match). v37 doubles the anchor
+        # density (4 → 7) AND increases strength (0.4 → 0.5).
         #
-        # frame_idx values: 1, 33, 65, 97 (all valid: 1 mod 8). 4
-        # anchors cover up to latent slot ~12, which is the surviving
-        # region after the 40% trim for length=121 (covers all of it)
-        # and length=257 (covers 36% of raw = the trimmed region).
+        # frame_idx values are spaced every 16 latent positions
+        # (1, 17, 33, 49, 65, 81, 97) — all 1 mod 8 which is the LTX
+        # multi-frame guide constraint. 7 anchors cover latent slots
+        # 1-12 (the trim-surviving region for length=121-257).
         #
-        # strength=0.4 per anchor. Stacking is additive in conditioning
-        # but last-wins for latent writes at the anchor frame, so the
-        # character latent gets written at each anchor frame with full
-        # strength 0.4 (replaces 40% of the IC-LoRA pose conditioning
-        # at that one latent slot — enough to lock identity without
-        # disrupting motion).
+        # strength=0.5 — at each anchor frame the character latent
+        # gets a 50% write that replaces half the IC-LoRA pose
+        # conditioning at that slot. Between anchors, the model
+        # interpolates appearance forward and the next anchor
+        # re-asserts Marco before drift accumulates.
         "331a": {"class_type": "LTXVAddGuide", "inputs": {
             "positive": ["330", 0],
             "negative": ["330", 1],
             "vae": ["236", 2],
             "latent": ["330", 2],
-            "image": ["238", 0],  # single character image
+            "image": ["238", 0],
             "frame_idx": 1,
-            "strength": 0.4,
+            "strength": 0.5,
         }},
         "331b": {"class_type": "LTXVAddGuide", "inputs": {
             "positive": ["331a", 0],
@@ -1013,8 +1007,8 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "vae": ["236", 2],
             "latent": ["331a", 2],
             "image": ["238", 0],
-            "frame_idx": 33,
-            "strength": 0.4,
+            "frame_idx": 17,
+            "strength": 0.5,
         }},
         "331c": {"class_type": "LTXVAddGuide", "inputs": {
             "positive": ["331b", 0],
@@ -1022,8 +1016,8 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "vae": ["236", 2],
             "latent": ["331b", 2],
             "image": ["238", 0],
-            "frame_idx": 65,
-            "strength": 0.4,
+            "frame_idx": 33,
+            "strength": 0.5,
         }},
         "331d": {"class_type": "LTXVAddGuide", "inputs": {
             "positive": ["331c", 0],
@@ -1031,8 +1025,35 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "vae": ["236", 2],
             "latent": ["331c", 2],
             "image": ["238", 0],
+            "frame_idx": 49,
+            "strength": 0.5,
+        }},
+        "331e": {"class_type": "LTXVAddGuide", "inputs": {
+            "positive": ["331d", 0],
+            "negative": ["331d", 1],
+            "vae": ["236", 2],
+            "latent": ["331d", 2],
+            "image": ["238", 0],
+            "frame_idx": 65,
+            "strength": 0.5,
+        }},
+        "331f": {"class_type": "LTXVAddGuide", "inputs": {
+            "positive": ["331e", 0],
+            "negative": ["331e", 1],
+            "vae": ["236", 2],
+            "latent": ["331e", 2],
+            "image": ["238", 0],
+            "frame_idx": 81,
+            "strength": 0.5,
+        }},
+        "331g": {"class_type": "LTXVAddGuide", "inputs": {
+            "positive": ["331f", 0],
+            "negative": ["331f", 1],
+            "vae": ["236", 2],
+            "latent": ["331f", 2],
+            "image": ["238", 0],
             "frame_idx": 97,
-            "strength": 0.4,
+            "strength": 0.5,
         }},
 
         # ─── Sampler chain ─────────────────────────────────────────
@@ -1045,8 +1066,8 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         # across all output frames.
         "231": {"class_type": "CFGGuider", "inputs": {
             "model": ["262", 0],
-            "positive": ["331d", 0],
-            "negative": ["331d", 1],
+            "positive": ["331g", 0],
+            "negative": ["331g", 1],
             "cfg": 1.0,
         }},
         "209": {"class_type": "KSamplerSelect", "inputs": {
@@ -1059,7 +1080,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "guider": ["231", 0],
             "sampler": ["209", 0],
             "sigmas": ["252", 0],
-            "latent_image": ["331d", 2],  # last identity anchor
+            "latent_image": ["331g", 2],  # last identity anchor
         }},
 
         # ─── Decode + colour-match + output ───────────────────────
