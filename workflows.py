@@ -844,12 +844,26 @@ def build_ltx_motion_workflow(reference_video_filename: str,
 
     # Rewire the sampler chain that ltx_base_nodes built so it consumes
     # the guide outputs. CFGGuider (231) takes positive/negative from the
-    # final guide; SamplerCustomAdvanced (215) takes the guide latent as
-    # its starting point.
+    # final guide.
     if "231" in workflow:
         workflow["231"]["inputs"]["positive"] = ["331", 0]
         workflow["231"]["inputs"]["negative"] = ["331", 1]
-    if "215" in workflow:
+    # Latent routing depends on whether audio is enabled:
+    #   audio=False → 215 (sampler) reads its starting latent directly.
+    #     Override 215.latent_image so the sampler starts from the
+    #     motion-guided latent.
+    #   audio=True  → 222 (LTXVConcatAVLatent) sits between the empty
+    #     latent and the sampler, packaging the video+audio latents into
+    #     an AV-latent. The sampler then outputs an AV-latent which 217
+    #     (LTXVSeparateAVLatent) splits back into [video, audio]. If we
+    #     bypass 222 by overriding 215.latent_image directly, the sampler
+    #     produces a video-only output and 217's index-1 access ("audio")
+    #     blows up with "tuple index out of range". Instead, override 222's
+    #     video_latent input so the motion-guided latent flows through the
+    #     audio concat as the video half.
+    if "222" in workflow:  # audio path — re-route the audio concat's video half
+        workflow["222"]["inputs"]["video_latent"] = ["331", 2]
+    elif "215" in workflow:  # no-audio path — re-route the sampler directly
         workflow["215"]["inputs"]["latent_image"] = ["331", 2]
 
     if two_pass:
@@ -876,18 +890,26 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "frame_idx": 0,
             "strength": refine_strength,
         }}
-        # ltx_base_nodes' refine sampler nodes are conventionally at 218/220.
-        # Wire them to use the second-stage guide outputs.
-        if "220" in workflow:
-            workflow["220"]["inputs"]["latent_image"] = ["341", 2]
-        # The refine CFGGuider — if ltx_base_nodes named it 219 or wired
-        # 218's guider in-line, patch defensively.
-        for gid in ("219", "218"):
+        # Refine-pass conditioning: ltx_base_nodes names the refine
+        # CFGGuider "213" (two_pass branch) — patch its positive/negative
+        # to consume the second-stage guide output.
+        for gid in ("213", "219", "218"):
             if gid in workflow and isinstance(workflow[gid].get("inputs", {}), dict):
                 if "positive" in workflow[gid]["inputs"]:
                     workflow[gid]["inputs"]["positive"] = ["341", 0]
                 if "negative" in workflow[gid]["inputs"]:
                     workflow[gid]["inputs"]["negative"] = ["341", 1]
+        # Refine-pass latent routing — same audio-aware split as first
+        # pass. ltx_base_nodes names the refine sampler "219", the refine
+        # audio concat "229", and the upsampler "253":
+        #   audio=False → 219 reads latent_image directly from upsampled
+        #     latent. Override 219.latent_image to ["341", 2].
+        #   audio=True  → 229 (concat) sits between upsampler and 219.
+        #     Override 229.video_latent so audio is preserved.
+        if "229" in workflow:
+            workflow["229"]["inputs"]["video_latent"] = ["341", 2]
+        elif "219" in workflow:
+            workflow["219"]["inputs"]["latent_image"] = ["341", 2]
 
     # ColorMatch the output against the character image — same as i2v.
     # Reduces the warm/saturated drift that fp8 VAE round-trips produce.
