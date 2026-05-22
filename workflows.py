@@ -832,12 +832,26 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "ckpt_name":    "ltx-2.3-22b-dev-fp8.safetensors",
             "device": "default",
         }},
-        # Distilled LoRA (matches base workflow). NO IC-LoRA loader
-        # anymore — see comment on node 330 for the rationale.
+        # Distilled LoRA (matches base workflow).
         "232": {"class_type": "LoraLoaderModelOnly", "inputs": {
             "model": ["236", 0],
             "lora_name": "ltx-2.3-22b-distilled-lora-384.safetensors",
             "strength_model": distilled_lora_strength,
+        }},
+        # IC-LoRA loader RESTORED for the model weights (v29 confirmed:
+        # without it the model can only render whatever pixels are in
+        # the conditioning image, so DWPose skeletons rendered as
+        # skeletons). The IC-LoRA's training teaches the model to
+        # TRANSFORM skeleton conditioning into a character render — we
+        # need that knowledge baked into the unet weights. But we'll
+        # NOT use the matching LTXAddVideoICLoRAGuide node downstream;
+        # it's the one that halves temporal coverage. Standard
+        # LTXVAddGuide (no halving) feeds the same DWPose skeleton,
+        # and the IC-LoRA-trained model interprets it correctly.
+        "262": {"class_type": "LTXICLoRALoaderModelOnly", "inputs": {
+            "model": ["232", 0],
+            "lora_name": "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
+            "strength_model": 1.0,
         }},
 
         # ─── Prompts ───────────────────────────────────────────────
@@ -952,12 +966,14 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         }},
 
         # ─── Sampler chain ─────────────────────────────────────────
-        # Read from node 330 (single LTXVAddGuide — no stacking needed
-        # since the standard guide doesn't halve temporal coverage).
-        # Model now feeds directly from node 232 (distilled-LoRA loader)
-        # — no IC-LoRA in the model chain anymore.
+        # Model: ["262", 0] = distilled + IC-LoRA weights baked in. The
+        # IC-LoRA's pose-to-character training is what enables the model
+        # to interpret skeleton pixels as a character pose rather than
+        # literally rendering colored bones. Positive/negative come from
+        # the standard LTXVAddGuide (node 330) which spans the full
+        # output latent without the IC-LoRA guide node's 50% halving.
         "231": {"class_type": "CFGGuider", "inputs": {
-            "model": ["232", 0],
+            "model": ["262", 0],
             "positive": ["330", 0],
             "negative": ["330", 1],
             "cfg": 1.0,
