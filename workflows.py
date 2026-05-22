@@ -720,28 +720,42 @@ def build_ltx_motion_workflow(reference_video_filename: str,
     output looked like i2v of the character image rather than motion
     transfer.
 
-    LTXVAddGuide actually injects the reference video into the conditioning
-    AND the latent at a specific frame_idx with controllable strength. Two
-    guides are stacked:
+    LTXVAddGuide injects video/image frames into the conditioning AND the
+    latent at a given frame_idx with controllable strength. We stack two
+    guides, BOTH spanning the full output length:
 
-      1. Character image at frame_idx=0, strength=inplace_strength  →
-         anchors WHO the output looks like (identity at the start).
-      2. Reference video starting at frame_idx=0, strength=motion_strength →
-         drives WHAT the output does (the actual motion to copy).
+      1. Reference video (multi-frame from VHS_LoadVideo) at frame_idx=0,
+         strength=motion_strength  →  drives the motion.
+      2. Character image RepeatImageBatch'd to `length` frames at
+         frame_idx=0, strength=inplace_strength  →  drives appearance at
+         every frame, not just frame 0.
+
+    Why batch the character image across all frames? When the character
+    guide only covered frame 0, the reference video's appearance bled
+    into frames 1..N — the rendered character did the right motion but
+    wore the reference person's clothes/face after frame 0. Repeating
+    the character into a static N-frame batch lets us write character
+    appearance into EVERY frame's conditioning, fighting the reference's
+    appearance throughout while the motion conditioning still drives the
+    pose/dynamics. Closest you can get to true motion transfer without a
+    pose-extraction ControlNet (which the LTX stack on these pods doesn't
+    have).
 
     The reference video must satisfy LTX's `8*n + 1` frame constraint —
     97, 121, 161, 257 all qualify so the default `length` values are
     safe. main.py's ffmpeg pre-step already enforces this via -frames:v.
+    The character batch is `length` frames so it satisfies the same
+    constraint automatically.
 
-    Knob meanings (renamed roles vs the old version):
-      inplace_strength  — identity guide strength. 0.4 = weak identity
-                          (motion dominates, face may drift), 0.5–0.7 =
-                          balanced, 0.9 = strong identity (face stays put
-                          but motion looks subdued).
-      motion_strength   — reference-video guide strength. 0.0–1.0 (LTX
-                          caps it at 1). 0.95 = strong copy of reference
-                          motion (default). Lower it to blend the
-                          character's natural motion with the reference's.
+    Knob meanings:
+      inplace_strength  — appearance-anchor strength (applied to ALL
+                          frames). 0.8–1.0 = character appearance
+                          dominates (recommended). Lower if you want
+                          stylization toward the reference look.
+      motion_strength   — reference-video guide strength (applied to ALL
+                          frames). 0.5–0.7 = motion structure without
+                          overwhelming appearance. 1.0 = strong copy of
+                          reference motion but risks bleeding appearance.
     """
     two_pass = LTX_PRESETS[preset]["two_pass"]
     refine_strength = min(1.0, inplace_strength + 0.3)
@@ -761,6 +775,20 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         }},
         "235": {"class_type": "ResizeImagesByLongerEdge", "inputs": {"images": ["238", 0], "longer_edge": 1536}},
         "248": {"class_type": "LTXVPreprocess", "inputs": {"image": ["235", 0], "img_compression": 18}},
+
+        # Multi-frame character batch — replicate the character image
+        # `length` times so the identity guide can inject character
+        # appearance into EVERY frame's conditioning slot, not just frame
+        # 0. Without this, the reference video guide (motion_strength)
+        # carries both motion AND the reference's appearance into frames
+        # 1..N, and only frame 0 gets the character — so the rendered
+        # character bows around with the WRONG clothes/face from frame 1
+        # onward. A static N-frame character batch lets us write the
+        # character latent at every frame and fight that appearance bleed.
+        "332": {"class_type": "RepeatImageBatch", "inputs": {
+            "image": ["248", 0],
+            "amount": length,
+        }},
 
         # Reference video chain — load with VHS, resize to canvas. The
         # IMAGE tensor goes directly into LTXVAddGuide as a multi-frame
@@ -815,14 +843,15 @@ def build_ltx_motion_workflow(reference_video_filename: str,
     )
     workflow.update(img_nodes)
 
-    # Stack the two LTXVAddGuide calls — ORDER MATTERS at overlapping
-    # frame_idx values: LTXVAddGuide writes guide-encoded latent slices
-    # INTO the input latent at frame_idx with the given strength. When two
-    # guides share frame_idx=0, the second one stacked wins for that frame.
-    # Run reference video FIRST (drives motion across frames 0..N), then
-    # the character image SECOND (overwrites frame 0 with identity).
-    # That gives the sampler: identity anchor at frame 0 + reference motion
-    # propagating through frames 1..N as the diffusion process unfolds.
+    # Stack the two LTXVAddGuide calls. BOTH guides span the full N-frame
+    # window now — the reference (multi-frame from VHS) carries motion,
+    # the character (multi-frame from RepeatImageBatch at node 332)
+    # carries appearance everywhere. Order still matters: LTXVAddGuide
+    # composes additively in conditioning but its latent-write is
+    # last-wins at overlapping frames. We run the reference FIRST so the
+    # character batch (second) layers identity over reference appearance
+    # at every frame, not just frame 0 — that's the fix for the
+    # "character bows around but wears the reference's clothes" bug.
     workflow["330"] = {"class_type": "LTXVAddGuide", "inputs": {
         "positive": ["239", 0],
         "negative": ["239", 1],
@@ -837,7 +866,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         "negative": ["330", 1],
         "vae": ["236", 2],
         "latent": ["330", 2],
-        "image": ["248", 0],
+        "image": ["332", 0],  # RepeatImageBatch — character at every frame
         "frame_idx": 0,
         "strength": inplace_strength,
     }}
@@ -886,7 +915,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "negative": ["340", 1],
             "vae": ["236", 2],
             "latent": ["340", 2],
-            "image": ["248", 0],
+            "image": ["332", 0],  # batched character — same as first pass
             "frame_idx": 0,
             "strength": refine_strength,
         }}

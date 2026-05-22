@@ -177,8 +177,12 @@ def _mux_reference_audio(video_path: Path, audio_source: Path) -> tuple[bool, st
         return False, "reference has no audio track"
 
     # Write to a sibling temp then atomic replace — never half-mutate the
-    # output file while the URL is already advertised.
-    tmp_out = video_path.with_suffix(video_path.suffix + ".muxing")
+    # output file while the URL is already advertised. The temp file MUST
+    # preserve the original extension: ffmpeg infers the container from
+    # the path extension and "<name>.mp4.muxing" gave it nothing to read,
+    # failing with "Error initializing the muxer ... Invalid argument".
+    # "<stem>.tmp<suffix>" keeps the .mp4/.webm visible to autodetect.
+    tmp_out = video_path.with_name(f"{video_path.stem}.tmp{video_path.suffix}")
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(video_path),
