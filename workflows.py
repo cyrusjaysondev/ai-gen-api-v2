@@ -926,40 +926,44 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "pose_estimator": "dw-ll_ucoco_384_bs5.torchscript.pt",
             "scale_stick_for_xinsr_cn": "disable",
         }},
-        # Resize skeleton to canvas dimensions exactly (multiple of 32
-        # is fine — we're not using the IC-LoRA's factor=2 alignment
-        # anymore). LTXVPreprocess to mirror the i2v identity chain.
+        # Resize skeleton to multiple of 64 (IC-LoRA Union-Control needs
+        # latent dims divisible by latent_downscale_factor=2 → image
+        # dims divisible by 32*2 = 64).
         "321": {"class_type": "ResizeImageMaskNode", "inputs": {
             "input": ["320", 0],
-            "resize_type": "scale dimensions",
-            "resize_type.width": width, "resize_type.height": height,
-            "resize_type.crop": "center", "scale_method": "lanczos",
+            "resize_type": "scale to multiple",
+            "resize_type.multiple": 64,
+            "scale_method": "lanczos",
         }},
-        "322": {"class_type": "LTXVPreprocess", "inputs": {"image": ["321", 0], "img_compression": 18}},
 
-        # ─── LTXVAddGuidesFromBatch: native multi-frame conditioning ─
-        # v29 (LTXVAddGuide w/ skeleton, no IC-LoRA loader) and v30
-        # (same guide + IC-LoRA loader) both rendered skeletons
-        # literally — model didn't translate them into a character.
-        # The IC-LoRA guide node's processing is required for that
-        # translation but it does the 50% halving.
+        # ─── IC-LoRA guide (single, factor=2 from loader) ─────────
+        # PRAGMATIC v32: revert workflow to v25 setup. After 30+
+        # iterations we've shown the IC-LoRA guide consistently
+        # produces clean Marco-dancing for the first ~50% of output
+        # frames, then collapses to noise for the second half. None
+        # of the workarounds (stacked guides → ghosting; standalone
+        # LTXVAddGuide → literal skeleton; LTXVAddGuidesFromBatch →
+        # 10-minute hang) deliver both temporal coverage AND
+        # character rendering simultaneously.
         #
-        # LTXVAddGuidesFromBatch takes a "batch of images - non-black
-        # images will be used as guides" per the tooltip — it likely
-        # auto-distributes keyframes across the output latent's
-        # temporal slots. No latent_downscale_factor input → no
-        # halving. The colored skeleton-on-black DWPose frames are
-        # non-black so all 121 of them should become keyframes spread
-        # across the output. Combined with the IC-LoRA loader (which
-        # gives the model the skeleton-to-character translation
-        # capability) this should fix both problems at once.
-        "330": {"class_type": "LTXVAddGuidesFromBatch", "inputs": {
+        # So accept the limitation and TRIM the output in main.py to
+        # keep only the clean first half. User asking for length=121
+        # (~5s) gets ~4s of cleanly-rendered Marco doing the motion.
+        # That's a real, shippable result — better than chasing the
+        # unbounded "fix the second half" spiral.
+        "330": {"class_type": "LTXAddVideoICLoRAGuide", "inputs": {
             "positive": ["239", 0],
             "negative": ["239", 1],
             "vae": ["236", 2],
-            "latent": ["325", 0],   # character-conditioned latent
-            "images": ["322", 0],   # DWPose skeleton batch
+            "latent": ["325", 0],
+            "image": ["321", 0],
+            "frame_idx": 0,
             "strength": motion_strength,
+            "latent_downscale_factor": ["262", 1],
+            "crop": "disabled",
+            "use_tiled_encode": False,
+            "tile_size": 256,
+            "tile_overlap": 64,
         }},
 
         # ─── Sampler chain ─────────────────────────────────────────

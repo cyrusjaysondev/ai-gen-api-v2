@@ -205,10 +205,64 @@ def _mux_reference_audio(video_path: Path, audio_source: Path) -> tuple[bool, st
     return True, "ok"
 
 
+def _trim_first_half(video_path: Path) -> tuple[bool, str]:
+    """Keep only the first half of a video's frames. Used by /ltx/motion
+    because the IC-LoRA Union-Control guide only conditions the first
+    50% of the output latent — the second half free-generates to
+    colored noise. Trimming gives users a fully-coherent clip at half
+    the duration they requested rather than a half-broken full-length one.
+
+    Returns (changed, message).
+    """
+    import subprocess
+    if not video_path.exists():
+        return False, "input missing"
+
+    # Probe duration
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nokey=1:noprint_wrappers=1", str(video_path)],
+            capture_output=True, timeout=15,
+        )
+        duration = float((probe.stdout or b"").decode().strip())
+    except Exception as e:
+        return False, f"ffprobe error: {e}"
+    if duration <= 0.1:
+        return False, "duration too short to trim"
+
+    half = duration / 2.0
+    tmp_out = video_path.with_name(f"{video_path.stem}.halftrim{video_path.suffix}")
+    # -c copy gives us a stream copy (no re-encode), `-t half` truncates.
+    # We re-encode video because stream copy at arbitrary cut points
+    # would leave us at the previous keyframe — re-encoding (NVENC if
+    # available, libx264 fallback) gives a clean cut at the half mark.
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", str(video_path),
+        "-t", f"{half:.3f}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+        "-c:a", "copy",  # audio mux ran before this; preserve it
+        str(tmp_out),
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, timeout=120)
+    except Exception as e:
+        tmp_out.unlink(missing_ok=True)
+        return False, f"trim ffmpeg error: {e}"
+    if res.returncode != 0 or not tmp_out.exists() or tmp_out.stat().st_size == 0:
+        tmp_out.unlink(missing_ok=True)
+        err = (res.stderr or b"").decode(errors="replace")[-300:]
+        return False, f"trim failed: {err}"
+    os.replace(str(tmp_out), str(video_path))
+    return True, f"trimmed to first {half:.2f}s of {duration:.2f}s"
+
+
 async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                   watermark_text: str | None = None,
                   watermark_image: bool = False,
-                  audio_source_path: str | None = None):
+                  audio_source_path: str | None = None,
+                  trim_first_half: bool = False):
     jobs[job_id] = {**jobs.get(job_id, {}), "status": "processing", "started_at": datetime.now(timezone.utc).isoformat()}
     try:
         client_id = str(uuid.uuid4())
@@ -281,6 +335,25 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                                 audio_mux_warning = str(mux_err)
                                 print(f"[{job_id}] audio mux raised: {mux_err}")
 
+                        # Optional first-half trim — used by /ltx/motion
+                        # because the IC-LoRA guide only conditions ~50% of
+                        # the output latent (the remaining frames collapse
+                        # to colored noise). Trim AFTER audio mux so the
+                        # surviving audio is the segment that lines up with
+                        # the kept video.
+                        trim_warning: str | None = None
+                        if trim_first_half and ext in _VIDEO_EXTS:
+                            try:
+                                ok, msg = await asyncio.to_thread(
+                                    _trim_first_half, path,
+                                )
+                                print(f"[{job_id}] trim: {msg}")
+                                if not ok:
+                                    trim_warning = msg
+                            except Exception as trim_err:
+                                trim_warning = str(trim_err)
+                                print(f"[{job_id}] trim raised: {trim_err}")
+
                         # Optional watermark — text and/or logo. Both run in
                         # place. Failures don't nuke the job; the
                         # unwatermarked file is still valid output.
@@ -327,6 +400,10 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                             completed["watermark_warning"] = " | ".join(wm_warnings)
                         if audio_mux_warning:
                             completed["audio_warning"] = audio_mux_warning
+                        if trim_warning:
+                            completed["trim_warning"] = trim_warning
+                        elif trim_first_half:
+                            completed["trimmed"] = "first_half_only"
                         jobs[job_id] = completed
                         return
 
@@ -965,9 +1042,15 @@ async def ltx_motion_control(
     # _mux_reference_audio inside run_job to carry the reference's
     # original audio onto the silent video LTX produced.
     audio_source_path = raw_video_path if audio else None
+    # trim_first_half is ALWAYS true for /ltx/motion — see the
+    # comment on node 330 in workflows.py:
+    # the IC-LoRA Union-Control guide conditions only the first ~50%
+    # of output latent slices, the second half free-generates to
+    # colored noise. Trimming gives the user a coherent ~half-length
+    # clip rather than a half-broken full-length one.
     background_tasks.add_task(
         run_job, job_id, workflow, cleanup_paths, watermark, watermark_image,
-        audio_source_path,
+        audio_source_path, True,  # trim_first_half=True
     )
     return {
         "job_id": job_id, "status": "queued", "model": "ltx-2.3-22b",
@@ -975,6 +1058,7 @@ async def ltx_motion_control(
         "workflow_path": "vhs" if use_vhs else "frame-extract",
         "ref_video_normalized_to": {"width": width, "height": height, "fps": fps, "max_frames": length},
         "audio_source": "reference" if audio else "none",
+        "note": "Output trimmed to first ~50% (IC-LoRA conditioning limit). Request 2× the desired duration in `length`.",
     }
 
 
