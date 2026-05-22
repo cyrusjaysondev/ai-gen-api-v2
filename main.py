@@ -658,8 +658,8 @@ async def ltx_motion_control(
     seed: int = Form(-1),
     audio: bool = Form(False),
     enhance_prompt: bool = Form(True, description="Rewrite the prompt via Gemma using the character image as visual context. Recommended ON unless you've written a long detailed motion description yourself."),
-    inplace_strength: float = Form(0.5, ge=0.3, le=1.0, description="Identity-vs-motion balance. 0.7 = identity dominates (cleaner face, weaker motion fidelity). 0.5 = balanced (default for motion control). 0.3 = motion dominates (best dance match, identity drift possible)."),
-    motion_strength: float = Form(1.0, ge=0.0, le=1.5, description="Multiplier on the encoded reference latent. 1.0 = use motion as-encoded. <1.0 attenuates (subtler motion). >1.0 amplifies (risk of artifacts > 1.2)."),
+    inplace_strength: float = Form(0.5, ge=0.0, le=1.0, description="Identity-anchor strength for LTXVAddGuide on the character image. 1.0 = locks first frame to character image (identity dominates, motion fights it). 0.5 = balanced. 0.1-0.2 = motion dominates (best dance match, identity drift possible). 0.0 = no identity anchor."),
+    motion_strength: float = Form(1.0, ge=0.0, le=1.0, description="LTXVAddGuide strength for the reference video. 1.0 = full motion conditioning (recommended). <1.0 attenuates."),
     watermark: str | None = Form(None, description="Optional text overlay at bottom-right. Stripped by Supabase proxies in prod."),
     watermark_image: bool = Form(False, description="Composite the GenReel logo at the bottom-right."),
 ):

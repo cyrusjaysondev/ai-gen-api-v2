@@ -815,27 +815,31 @@ def build_ltx_motion_workflow(reference_video_filename: str,
     )
     workflow.update(img_nodes)
 
-    # Stack the two LTXVAddGuide calls:
-    #   first: character image — identity anchor at frame 0
-    #   then:  reference video — motion driver across the whole clip
-    # Output of stage 2 becomes the conditioning + latent the sampler uses.
+    # Stack the two LTXVAddGuide calls — ORDER MATTERS at overlapping
+    # frame_idx values: LTXVAddGuide writes guide-encoded latent slices
+    # INTO the input latent at frame_idx with the given strength. When two
+    # guides share frame_idx=0, the second one stacked wins for that frame.
+    # Run reference video FIRST (drives motion across frames 0..N), then
+    # the character image SECOND (overwrites frame 0 with identity).
+    # That gives the sampler: identity anchor at frame 0 + reference motion
+    # propagating through frames 1..N as the diffusion process unfolds.
     workflow["330"] = {"class_type": "LTXVAddGuide", "inputs": {
         "positive": ["239", 0],
         "negative": ["239", 1],
         "vae": ["236", 2],
         "latent": ["228", 0],
-        "image": ["248", 0],
+        "image": ["315", 0],
         "frame_idx": 0,
-        "strength": inplace_strength,
+        "strength": motion_strength,
     }}
     workflow["331"] = {"class_type": "LTXVAddGuide", "inputs": {
         "positive": ["330", 0],
         "negative": ["330", 1],
         "vae": ["236", 2],
         "latent": ["330", 2],
-        "image": ["315", 0],
+        "image": ["248", 0],
         "frame_idx": 0,
-        "strength": motion_strength,
+        "strength": inplace_strength,
     }}
 
     # Rewire the sampler chain that ltx_base_nodes built so it consumes
