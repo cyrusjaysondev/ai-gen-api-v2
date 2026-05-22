@@ -403,19 +403,47 @@ fi
 # output back out as mp4. Without this the motion-control workflow can't
 # load the reference. Pinned to upstream main; the pod auto-pulls on each
 # boot via this block.
-if [ ! -d "$NODES/ComfyUI-VideoHelperSuite" ]; then
-  log "  Installing ComfyUI-VideoHelperSuite (provides VHS_LoadVideo for /ltx/motion)..."
-  (
-    cd "$NODES"
-    git clone -q https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
-    if [ -f "ComfyUI-VideoHelperSuite/requirements.txt" ]; then
-      $PIP install -q -r ComfyUI-VideoHelperSuite/requirements.txt 2>&1 | tail -1
-    fi
-  )
-  log "  ComfyUI-VideoHelperSuite installed"
-else
-  log "  ComfyUI-VideoHelperSuite already installed"
-fi
+#
+# Unlike KJNodes/LanPaint above we ALWAYS run the install step, even when
+# the directory exists, because a previous boot may have partially cloned
+# the repo or failed pip install — leaving an empty / broken dir that the
+# `[ ! -d ]` guard would skip on the next boot, permanently blocking the
+# motion endpoint. The git clone command short-circuits if the repo is
+# already healthy; pip install is idempotent. Output is captured to a
+# named log file so post-mortem inspection doesn't need ssh into the pod.
+VHS_DIR="$NODES/ComfyUI-VideoHelperSuite"
+VHS_LOG="/workspace/setup-vhs.log"
+{
+  echo "=== VHS install run: $(date -u +%FT%TZ) ==="
+  if [ ! -d "$VHS_DIR/.git" ]; then
+    # Either missing OR a partial clone (no .git). Wipe and re-clone.
+    log "  Installing ComfyUI-VideoHelperSuite (clean clone)..."
+    rm -rf "$VHS_DIR"
+    (cd "$NODES" && git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite) || \
+      log "  ⚠️  ComfyUI-VideoHelperSuite git clone FAILED — /ltx/motion will not work"
+  else
+    log "  ComfyUI-VideoHelperSuite: git pull (refresh)"
+    (cd "$VHS_DIR" && git pull --ff-only) || log "  ⚠️  VHS git pull failed (continuing with existing checkout)"
+  fi
+
+  if [ -f "$VHS_DIR/requirements.txt" ]; then
+    log "  Installing VHS requirements..."
+    $PIP install -r "$VHS_DIR/requirements.txt" || \
+      log "  ⚠️  VHS pip install FAILED — node will be present but may fail to load at ComfyUI startup"
+  else
+    log "  ⚠️  VHS requirements.txt missing — clone is corrupt"
+  fi
+
+  # Quick sanity check — does the __init__ exist? If not, the node will
+  # silently fail to register and the pod-side error will look like
+  # "Node 'VHS_LoadVideo' not found".
+  if [ -f "$VHS_DIR/__init__.py" ]; then
+    log "  ComfyUI-VideoHelperSuite ready ($(wc -l < "$VHS_DIR/__init__.py") lines in __init__.py)"
+  else
+    log "  ⚠️  VHS __init__.py missing — ComfyUI will not load VHS_LoadVideo"
+  fi
+} >>"$VHS_LOG" 2>&1
+log "  (VHS install details: tail -200 $VHS_LOG)"
 
 # (The conditional LanPaint-only ComfyUI relaunch that used to live here
 # is now subsumed by the start_comfy.sh supervisor below: it unconditionally

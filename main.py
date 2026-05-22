@@ -1371,6 +1371,168 @@ def _blocklist_count() -> int:
                if p.is_file() and p.suffix.lower() in ALLOWED_BLOCKLIST_EXTS)
 
 
+@app.get("/admin/comfy-status")
+async def admin_comfy_status(authorization: str = Header(default=None)):
+    """Read-only introspection: which custom_nodes dirs are present, and
+    which node class types is the running ComfyUI actually exposing?
+
+    Use this when a workflow fails with "Node 'X' not found" — compare
+    the file-system snapshot (what setup.sh produced) to the loaded-node
+    snapshot (what ComfyUI sees). A node directory that exists on disk
+    but is missing from object_info means the load failed silently —
+    usually a Python import error in the custom node's __init__.py
+    (missing pip dep is the common culprit). The trailing tail of
+    /workspace/setup-vhs.log surfaces the install-step trace for VHS
+    specifically, which has been the recurring offender.
+    """
+    _require_admin(authorization)
+    import os
+
+    comfy_root = os.environ.get("COMFY_ROOT", "/workspace/ComfyUI")
+    nodes_dir = Path(comfy_root) / "custom_nodes"
+    nodes_on_disk: list[dict] = []
+    if nodes_dir.is_dir():
+        for entry in sorted(nodes_dir.iterdir()):
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            nodes_on_disk.append({
+                "name": entry.name,
+                "has_init": (entry / "__init__.py").is_file(),
+                "has_requirements": (entry / "requirements.txt").is_file(),
+                "has_git": (entry / ".git").is_dir(),
+            })
+
+    loaded_nodes: list[str] = []
+    object_info_error: str | None = None
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{COMFYUI_URL}/object_info")
+            if resp.status_code == 200:
+                loaded_nodes = sorted(resp.json().keys())
+            else:
+                object_info_error = f"ComfyUI /object_info → HTTP {resp.status_code}"
+    except Exception as e:
+        object_info_error = f"could not reach ComfyUI: {e}"
+
+    # Surface just the names we care about so the admin doesn't have to grep
+    # through 800 stock node types. Add to this list as we depend on more
+    # custom nodes.
+    interesting = ["VHS_LoadVideo", "VHS_VideoCombine", "LTXVImgToVideoInplace",
+                   "LTXVPreprocess", "ColorMatch", "LatentMultiply",
+                   "VAEEncode", "VAEDecode", "LoadImage"]
+    interesting_status = {name: name in set(loaded_nodes) for name in interesting}
+
+    vhs_log_tail: list[str] = []
+    vhs_log = Path("/workspace/setup-vhs.log")
+    if vhs_log.is_file():
+        try:
+            with vhs_log.open() as f:
+                lines = f.readlines()
+            vhs_log_tail = [ln.rstrip("\n") for ln in lines[-30:]]
+        except Exception:
+            pass
+
+    return {
+        "comfy_root": comfy_root,
+        "comfy_object_info_error": object_info_error,
+        "custom_nodes_on_disk": nodes_on_disk,
+        "loaded_node_count": len(loaded_nodes),
+        "key_nodes_loaded": interesting_status,
+        "vhs_install_log_tail": vhs_log_tail,
+    }
+
+
+@app.post("/admin/install-comfy-node")
+async def admin_install_comfy_node(
+    repo: str = Form(..., description="GitHub slug like 'Kosinkadink/ComfyUI-VideoHelperSuite' OR full https:// URL."),
+    restart_comfyui: bool = Form(True, description="After install, kill ComfyUI's python so the supervisor relaunches it and picks up the new node. Set false to skip the restart (you'll need to reload manually before the node is usable)."),
+    authorization: str = Header(default=None),
+):
+    """Install a ComfyUI custom node at runtime without a pod restart.
+
+    Pattern: git clone (or pull) into /workspace/ComfyUI/custom_nodes,
+    pip install the node's requirements.txt if present, optionally SIGKILL
+    ComfyUI's process (start_comfy.sh's supervisor relaunches within 5s
+    with the new node loaded). Returns the install trace.
+
+    Use for one-off custom-node additions when setup.sh's idempotent
+    install block didn't fire (network blip on boot, partial clone, etc.).
+    Long-term: every node we depend on should be listed in setup.sh too,
+    so a fresh pod boot works without this manual step.
+    """
+    _require_admin(authorization)
+    import os
+    import subprocess
+    import sys
+
+    repo_slug = repo.strip()
+    if not repo_slug:
+        raise HTTPException(400, "repo is required")
+    if "://" not in repo_slug:
+        # Allow "owner/name" shorthand.
+        repo_slug = f"https://github.com/{repo_slug}"
+    repo_name = repo_slug.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+
+    comfy_root = os.environ.get("COMFY_ROOT", "/workspace/ComfyUI")
+    nodes_dir = Path(comfy_root) / "custom_nodes"
+    nodes_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = nodes_dir / repo_name
+    trace: list[str] = []
+
+    def _run(cmd: list[str], cwd: str | None = None) -> tuple[int, str]:
+        try:
+            res = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=180)
+            output = (res.stdout + res.stderr).decode(errors="replace")
+            trace.append(f"$ {' '.join(cmd)}\n{output[-1000:]}\n--- exit {res.returncode} ---")
+            return res.returncode, output
+        except subprocess.TimeoutExpired:
+            trace.append(f"$ {' '.join(cmd)}\n  TIMEOUT (>180s)")
+            return 124, ""
+
+    # Clone or pull. If the dir exists but has no .git, treat as corrupt
+    # and re-clone so the failure mode is recoverable from here without
+    # another endpoint.
+    if not (target_dir / ".git").is_dir():
+        if target_dir.exists():
+            trace.append(f"removing corrupt {target_dir}")
+            subprocess.run(["rm", "-rf", str(target_dir)], check=False)
+        rc, _ = _run(["git", "clone", repo_slug, str(target_dir)])
+        if rc != 0:
+            raise HTTPException(500, f"git clone failed (see trace): {trace[-1] if trace else ''}")
+    else:
+        _run(["git", "pull", "--ff-only"], cwd=str(target_dir))
+
+    # Pip install requirements if any.
+    req = target_dir / "requirements.txt"
+    if req.is_file():
+        _run([sys.executable, "-m", "pip", "install", "-r", str(req)])
+    else:
+        trace.append("(no requirements.txt)")
+
+    restarted = False
+    if restart_comfyui:
+        # ComfyUI runs as `python main.py` under start_comfy.sh's flock
+        # supervisor — killing the python process makes the supervisor
+        # relaunch within ~5s, reloading custom_nodes on the way up.
+        rc, _ = _run(["pkill", "-9", "-f", "ComfyUI/main.py"])
+        restarted = rc == 0
+        if not restarted:
+            trace.append("pkill found no ComfyUI process to kill (may already be down)")
+
+    return {
+        "ok": True,
+        "repo": repo_slug,
+        "target_dir": str(target_dir),
+        "has_init_py": (target_dir / "__init__.py").is_file(),
+        "comfyui_restart_signaled": restarted,
+        "note": (
+            "ComfyUI restart takes ~30s. Poll GET /admin/comfy-status until "
+            "key_nodes_loaded reflects the new node before submitting jobs."
+        ),
+        "trace": trace,
+    }
+
+
 @app.post("/admin/reload-filter")
 async def admin_reload_filter(authorization: str = Header(default=None)):
     """Force `safety._build_filter()` to re-run without a uvicorn restart.
