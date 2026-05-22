@@ -18,6 +18,7 @@ from workflows import (
     build_t2i_workflow,
     build_ltx_i2v_workflow,
     build_ltx_motion_workflow,
+    build_ltx_motion_workflow_no_vhs,
     build_ltx_t2v_workflow,
     compute_dimensions,
     compute_ltx_dimensions,
@@ -766,23 +767,94 @@ async def ltx_motion_control(
     # Raw upload no longer needed once we have the normalized clip.
     Path(raw_video_path).unlink(missing_ok=True)
 
-    workflow = build_ltx_motion_workflow(
-        reference_video_filename=ref_video_filename,
-        character_image_filename=img_filename,
-        prompt=prompt, negative_prompt=negative_prompt,
-        width=width, height=height, length=length, fps=fps, seed=seed,
-        preset=preset, audio=audio, enhance_prompt=enhance_prompt,
-        inplace_strength=inplace_strength, motion_strength=motion_strength,
-    )
+    # Workflow selection — VHS path is faster (1 node loads N frames in
+    # one shot) but requires ComfyUI-VideoHelperSuite. Fallback path
+    # extracts frames with ffmpeg and uses N LoadImage + chained
+    # ImageBatch nodes — stock ComfyUI only.
+    #
+    # We probe ComfyUI's /object_info to see which path is available.
+    # Probe is cheap (~50ms) and cached upstream by ComfyUI so it
+    # doesn't add real latency. If anything goes wrong probing, we
+    # default to the no-VHS fallback — it always works.
+    use_vhs = False
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            obj_info_resp = await client.get(f"{COMFYUI_URL}/object_info")
+            if obj_info_resp.status_code == 200:
+                use_vhs = "VHS_LoadVideo" in obj_info_resp.json()
+    except Exception as e:
+        print(f"[ltx/motion] object_info probe failed: {e} — using no-VHS path")
+
+    cleanup_paths: list[str] = [img_path]
+    if use_vhs:
+        print(f"[ltx/motion] using VHS path (VHS_LoadVideo available)")
+        cleanup_paths.append(ref_video_path)
+        workflow = build_ltx_motion_workflow(
+            reference_video_filename=ref_video_filename,
+            character_image_filename=img_filename,
+            prompt=prompt, negative_prompt=negative_prompt,
+            width=width, height=height, length=length, fps=fps, seed=seed,
+            preset=preset, audio=audio, enhance_prompt=enhance_prompt,
+            inplace_strength=inplace_strength, motion_strength=motion_strength,
+        )
+    else:
+        # Extract every frame of the normalized clip into ComfyUI's input
+        # dir as individual PNGs. Chain runs to completion or raises 500
+        # if the frame count doesn't match what we asked ffmpeg for above.
+        print(f"[ltx/motion] using no-VHS fallback (extracting {length} frames)")
+        frame_dir_id = uuid.uuid4().hex[:8]
+        frame_pattern = f"ltx_motion_frame_{frame_dir_id}_%04d.png"
+        frame_extract_cmd = [
+            "ffmpeg", "-y", "-loglevel", "error", "-i", ref_video_path,
+            "-vsync", "0",
+            str(INPUT_DIR / frame_pattern),
+        ]
+
+        def _run_extract() -> subprocess.CompletedProcess:
+            return subprocess.run(frame_extract_cmd, check=True, capture_output=True, timeout=120)
+
+        try:
+            await asyncio.to_thread(_run_extract)
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or b"").decode(errors="replace")[:500]
+            Path(ref_video_path).unlink(missing_ok=True)
+            Path(img_path).unlink(missing_ok=True)
+            raise HTTPException(500, f"frame extraction failed: {stderr or 'ffmpeg failed'}")
+        except subprocess.TimeoutExpired:
+            Path(ref_video_path).unlink(missing_ok=True)
+            Path(img_path).unlink(missing_ok=True)
+            raise HTTPException(408, "frame extraction timed out")
+
+        # Collect the actual extracted frames (sorted) — ffmpeg starts at
+        # %04d=0001. If we got fewer than expected, log it but use what
+        # we have; the workflow only needs ≥2 frames to chain.
+        frame_files = sorted(INPUT_DIR.glob(f"ltx_motion_frame_{frame_dir_id}_*.png"))
+        if len(frame_files) < 2:
+            Path(ref_video_path).unlink(missing_ok=True)
+            Path(img_path).unlink(missing_ok=True)
+            raise HTTPException(500, f"frame extraction produced only {len(frame_files)} frames")
+        frame_filenames = [f.name for f in frame_files]
+        # Add every extracted frame to cleanup so we don't pile up files.
+        cleanup_paths.extend(str(f) for f in frame_files)
+        # Original ref video is now redundant — we've got the frames.
+        Path(ref_video_path).unlink(missing_ok=True)
+
+        workflow = build_ltx_motion_workflow_no_vhs(
+            reference_frame_filenames=frame_filenames,
+            character_image_filename=img_filename,
+            prompt=prompt, negative_prompt=negative_prompt,
+            width=width, height=height, length=length, fps=fps, seed=seed,
+            preset=preset, audio=audio, enhance_prompt=enhance_prompt,
+            inplace_strength=inplace_strength, motion_strength=motion_strength,
+        )
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    # Both input files get cleaned up after the job completes (or fails) —
-    # same cleanup contract as the existing /ltx/i2v + /flux/face-swap.
-    background_tasks.add_task(run_job, job_id, workflow, [img_path, ref_video_path], watermark, watermark_image)
+    background_tasks.add_task(run_job, job_id, workflow, cleanup_paths, watermark, watermark_image)
     return {
         "job_id": job_id, "status": "queued", "model": "ltx-2.3-22b",
         "poll_url": f"{BASE_URL}/status/{job_id}",
+        "workflow_path": "vhs" if use_vhs else "frame-extract",
         "ref_video_normalized_to": {"width": width, "height": height, "fps": fps, "max_frames": length},
     }
 

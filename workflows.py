@@ -554,6 +554,154 @@ def build_ltx_t2v_workflow(prompt: str, negative_prompt: str,
 # (typically 97 frames) and downscale to the target resolution.
 # ─────────────────────────────────────────────
 
+def build_ltx_motion_workflow_no_vhs(reference_frame_filenames: list[str],
+                                     character_image_filename: str,
+                                     prompt: str, negative_prompt: str,
+                                     width: int, height: int, length: int, fps: int, seed: int,
+                                     preset: str = "fast", audio: bool = False,
+                                     enhance_prompt: bool = True,
+                                     inplace_strength: float = 0.5,
+                                     motion_strength: float = 1.0) -> dict:
+    """Fallback motion-control workflow that doesn't need ComfyUI-VideoHelperSuite.
+
+    Where the VHS variant uses one `VHS_LoadVideo` node to read the whole
+    reference clip in one shot, this version takes a list of per-frame
+    PNG filenames (already extracted by main.py via ffmpeg into ComfyUI's
+    input dir) and stitches them into a single image tensor using a
+    LoadImage + ImageBatch chain — both of which are stock ComfyUI core
+    nodes, so no custom-node install is required.
+
+    Graph shape for the frame loader:
+        LoadImage[f01] ┐
+                      ImageBatch ┐
+        LoadImage[f02] ┘         │
+                                 ImageBatch ┐
+        LoadImage[f03] ───────────┘         │
+                                            ImageBatch ─► VAEEncode ─►
+        LoadImage[f04] ─────────────────────┘            (motion latent)
+
+    Linear chain rather than balanced tree — ComfyUI executes nodes
+    bottom-up so depth doesn't really matter, and a chain keeps node
+    IDs easy to reason about. Each ImageBatch combines a running
+    accumulator with the next single-frame load.
+
+    Performance vs VHS:
+      - Workflow JSON is bigger (≈2N nodes vs 1)
+      - Each LoadImage is a separate file open — a bit slower than
+        VHS's bulk read, but still <2s total for 121 frames on local SSD
+      - VAE encode + sampler stages are identical to the VHS path
+    """
+    if len(reference_frame_filenames) < 2:
+        raise ValueError(
+            f"motion workflow needs at least 2 reference frames; got {len(reference_frame_filenames)}"
+        )
+
+    two_pass = LTX_PRESETS[preset]["two_pass"]
+    refine_strength = min(1.0, inplace_strength + 0.3)
+
+    # Node-ID allocation. We reserve the same IDs as the VHS variant for
+    # the shared bits (character image chain at 269/238/235/248, the
+    # motion-strength multiplier at 313, the image-into-video mixer at
+    # 249) so the rest of ltx_base_nodes wiring lines up identically.
+    # Per-frame loaders use IDs 1000..1000+N and batchers 2000..2000+N
+    # to stay out of the way of ltx_base_nodes' allocations.
+    LOAD_BASE = 1000
+    BATCH_BASE = 2000
+
+    img_nodes: dict = {
+        # Character image — identical chain to i2v / VHS variant.
+        "269": {"class_type": "LoadImage", "inputs": {"image": character_image_filename}},
+        "238": {"class_type": "ResizeImageMaskNode", "inputs": {
+            "input": ["269", 0], "resize_type": "scale dimensions",
+            "resize_type.width": width, "resize_type.height": height,
+            "resize_type.crop": "center", "scale_method": "lanczos"
+        }},
+        "235": {"class_type": "ResizeImagesByLongerEdge", "inputs": {"images": ["238", 0], "longer_edge": 1536}},
+        "248": {"class_type": "LTXVPreprocess", "inputs": {"image": ["235", 0], "img_compression": 18}},
+    }
+
+    # Per-frame LoadImage nodes. ComfyUI's LoadImage takes a filename
+    # that's already been written into its input dir.
+    for i, fn in enumerate(reference_frame_filenames):
+        img_nodes[str(LOAD_BASE + i)] = {"class_type": "LoadImage", "inputs": {"image": fn}}
+
+    # Each frame needs to be resized to the LTX canvas before batching —
+    # the VAE expects all batched frames at the same dimensions. We
+    # reuse the same ResizeImageMaskNode helper the character image
+    # uses, just per-frame.
+    RESIZE_BASE = LOAD_BASE + len(reference_frame_filenames)  # avoid collisions
+    for i in range(len(reference_frame_filenames)):
+        img_nodes[str(RESIZE_BASE + i)] = {"class_type": "ResizeImageMaskNode", "inputs": {
+            "input": [str(LOAD_BASE + i), 0],
+            "resize_type": "scale dimensions",
+            "resize_type.width": width, "resize_type.height": height,
+            "resize_type.crop": "center", "scale_method": "lanczos"
+        }}
+
+    # Linear ImageBatch chain — combine resized[0] + resized[1], then
+    # accumulate one frame at a time.
+    img_nodes[str(BATCH_BASE)] = {"class_type": "ImageBatch", "inputs": {
+        "image1": [str(RESIZE_BASE + 0), 0],
+        "image2": [str(RESIZE_BASE + 1), 0],
+    }}
+    for i in range(2, len(reference_frame_filenames)):
+        img_nodes[str(BATCH_BASE + i - 1)] = {"class_type": "ImageBatch", "inputs": {
+            "image1": [str(BATCH_BASE + i - 2), 0],
+            "image2": [str(RESIZE_BASE + i), 0],
+        }}
+    final_batch_id = str(BATCH_BASE + len(reference_frame_filenames) - 2)
+
+    # VAE-encode the batched frames into a motion latent. Same shape as
+    # what VHS would produce if it had loaded the video.
+    img_nodes["312"] = {"class_type": "VAEEncode", "inputs": {
+        "pixels": [final_batch_id, 0], "vae": ["236", 2],
+    }}
+    # Motion-strength multiplier (same as VHS path).
+    img_nodes["313"] = {"class_type": "LatentMultiply", "inputs": {
+        "samples": ["312", 0], "multiplier": motion_strength,
+    }}
+    # Mix character identity into the motion latent.
+    img_nodes["249"] = {"class_type": "LTXVImgToVideoInplace", "inputs": {
+        "vae": ["236", 2], "image": ["248", 0], "latent": ["313", 0],
+        "strength": inplace_strength, "bypass": False,
+    }}
+
+    if enhance_prompt:
+        img_nodes["274"] = {"class_type": "TextGenerateLTX2Prompt", "inputs": {
+            "clip": ["272", 1], "image": ["269", 0], "prompt": prompt,
+            "max_length": 256, "sampling_mode": "on",
+            "sampling_mode.temperature": 0.7, "sampling_mode.top_k": 64,
+            "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
+            "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": seed,
+        }}
+        img_nodes["240"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["243", 0], "text": ["274", 0]}}
+
+    if two_pass:
+        img_nodes["230"] = {"class_type": "LTXVImgToVideoInplace", "inputs": {
+            "vae": ["236", 2], "image": ["248", 0], "latent": ["253", 0],
+            "strength": refine_strength, "bypass": False,
+        }}
+        high_res_src = ["230", 0]
+    else:
+        high_res_src = None
+
+    workflow = ltx_base_nodes(
+        prompt, negative_prompt, width, height, length, fps, seed,
+        low_res_video_src=["249", 0], high_res_video_src=high_res_src,
+        prefix="ltx_motion", preset=preset, audio=audio,
+    )
+    workflow.update(img_nodes)
+
+    workflow["280"] = {"class_type": "ColorMatch", "inputs": {
+        "image_ref": ["269", 0],
+        "image_target": ["251", 0],
+        "method": "mkl",
+        "strength": 1.0,
+    }}
+    workflow["242"]["inputs"]["images"] = ["280", 0]
+    return workflow
+
+
 def build_ltx_motion_workflow(reference_video_filename: str,
                               character_image_filename: str,
                               prompt: str, negative_prompt: str,
