@@ -1557,13 +1557,28 @@ async def admin_install_comfy_node(
 
     restarted = False
     if restart_comfyui:
-        # ComfyUI runs as `python main.py` under start_comfy.sh's flock
-        # supervisor — killing the python process makes the supervisor
-        # relaunch within ~5s, reloading custom_nodes on the way up.
-        rc, _ = _run(["pkill", "-9", "-f", "ComfyUI/main.py"])
-        restarted = rc == 0
+        # ComfyUI runs under start_comfy.sh's flock supervisor as e.g.
+        #   /workspace/runpod-slim/ComfyUI/.venv-cu128/bin/python main.py --listen ...
+        # The cmdline contains "main.py" but NOT "ComfyUI/main.py" (cwd'd
+        # into ComfyUI before exec), so the original pattern matched
+        # nothing. Walk a list of broad-to-specific patterns; first match
+        # wins. The supervisor relaunches within ~5s with the new node
+        # registered.
+        kill_patterns = [
+            "runpod-slim/ComfyUI/.venv",   # most specific — full path inside venv
+            "ComfyUI.*main.py",             # ComfyUI followed by main.py anywhere
+            "/ComfyUI/main.py",             # works on legacy layouts
+            "python.*main.py.*--listen",   # any python main.py with the --listen flag ComfyUI uses
+        ]
+        for pat in kill_patterns:
+            rc, _ = _run(["pkill", "-9", "-f", pat])
+            if rc == 0:
+                trace.append(f"pkill matched pattern: {pat!r}")
+                restarted = True
+                break
         if not restarted:
-            trace.append("pkill found no ComfyUI process to kill (may already be down)")
+            trace.append("pkill found no ComfyUI process across any pattern — "
+                         "supervisor may already be down OR cmdline shape changed")
 
     return {
         "ok": True,
@@ -1575,6 +1590,44 @@ async def admin_install_comfy_node(
             "ComfyUI restart takes ~30s. Poll GET /admin/comfy-status until "
             "key_nodes_loaded reflects the new node before submitting jobs."
         ),
+        "trace": trace,
+    }
+
+
+@app.post("/admin/restart-comfyui")
+async def admin_restart_comfyui(authorization: str = Header(default=None)):
+    """Kill ComfyUI so start_comfy.sh's supervisor relaunches it.
+
+    Use after dropping a custom node into custom_nodes/ out-of-band (or
+    when /admin/install-comfy-node's restart step couldn't find the
+    process). Same pkill-by-pattern logic as install-comfy-node, just
+    standalone so we don't have to re-install to trigger a reload.
+    """
+    _require_admin(authorization)
+    import subprocess
+
+    kill_patterns = [
+        "runpod-slim/ComfyUI/.venv",
+        "ComfyUI.*main.py",
+        "/ComfyUI/main.py",
+        "python.*main.py.*--listen",
+    ]
+    trace: list[str] = []
+    matched: str | None = None
+    for pat in kill_patterns:
+        try:
+            res = subprocess.run(["pkill", "-9", "-f", pat], capture_output=True, timeout=10)
+            trace.append(f"pkill -9 -f {pat!r} → exit {res.returncode}")
+            if res.returncode == 0:
+                matched = pat
+                break
+        except Exception as e:
+            trace.append(f"pkill -9 -f {pat!r} → error {e}")
+
+    return {
+        "ok": matched is not None,
+        "matched_pattern": matched,
+        "note": "Wait ~30s and poll /admin/comfy-status to verify the new node count.",
         "trace": trace,
     }
 
