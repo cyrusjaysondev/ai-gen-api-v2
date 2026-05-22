@@ -787,24 +787,17 @@ def build_ltx_motion_workflow(reference_video_filename: str,
     width = ((width + 63) // 64) * 64
     height = ((height + 63) // 64) * 64
 
-    # ─── Pose-video length: 2× the latent length ─────────────────
-    # Empirical observation: LTX 2.3 distilled produces ~2× output
-    # image frames from EmptyLTXVLatentVideo(length=N). For N=121 the
-    # decoded output is 249 frames. The IC-LoRA pose conditioning is
-    # bounded by the input pose video's frame count — when the pose
-    # runs out mid-output the model has nothing to condition on and
-    # collapses to noise from that point forward (we saw a clean
-    # Marco-dancing frame at 25% and pure-static at 50%).
-    #
-    # Fix: load enough pose frames to cover the full output. The
-    # rounding ensures we satisfy LTX's 8n+1 frame-count constraint;
-    # main.py's ffmpeg pre-step uses -stream_loop -1, so short refs
-    # are looped to fill the requested frame count.
-    pose_length_target = 2 * length + 7  # empirical: 121 → 249
-    # Snap up to the next 8n+1 boundary
-    pose_length = ((pose_length_target - 1 + 7) // 8) * 8 + 1
-    if pose_length < pose_length_target:
-        pose_length += 8
+    # ─── Pose-video length: same as latent length ────────────────
+    # The IC-LoRA guide validates pose_latent_slices <= output_latent_
+    # slices. Output latent has (length-1)/8+1 slices; pose video at
+    # `length` image frames also has (length-1)/8+1 slices. Equal.
+    # The 2× theory from v20 was wrong (pose=249 with output=121
+    # triggered "Conditioning frames exceed the length of the latent
+    # sequence"). The 2× output frame count we observe in the encoded
+    # mp4 is something else — likely an LTX VAE temporal upscale at
+    # decode time. It doesn't affect the LATENT level so pose=length
+    # is the right matching.
+    pose_length = length
 
     # ─── Resolve DWPose preprocessor input (resize) target ────────
     # DWPose works best around 512px. We resize the reference video so

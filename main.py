@@ -819,16 +819,10 @@ async def ltx_motion_control(
     # is encoding (can take 10-60s on a long source).
     import asyncio
     import subprocess
-    # Pose-video frame target: 2× length + 7, snapped UP to the next
-    # 8n+1 LTX-friendly boundary. This matches the pose_length the
-    # workflow's VHS_LoadVideo will request — LTX 2.3 distilled outputs
-    # ~2× the EmptyLTXVLatentVideo length in image frames, so we need
-    # this many pose frames for the IC-LoRA guide to cover the full
-    # generated clip. If the source ref is shorter, -stream_loop -1
-    # loops it transparently to fill.
-    _pose_target = 2 * length + 7
-    _r = (_pose_target - 1) % 8
-    ref_frame_count = _pose_target if _r == 0 else _pose_target + (8 - _r)
+    # Pose-video frame target: same as `length`. The IC-LoRA guide
+    # validates pose_latent_slices <= output_latent_slices, so we
+    # match exactly (v20's 2*length+7 hit the validation error).
+    ref_frame_count = length
     ffmpeg_cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-stream_loop", "-1", "-i", raw_video_path,
