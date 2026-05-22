@@ -708,245 +708,252 @@ def build_ltx_motion_workflow(reference_video_filename: str,
                               width: int, height: int, length: int, fps: int, seed: int,
                               preset: str = "fast", audio: bool = False,
                               enhance_prompt: bool = True,
-                              inplace_strength: float = 0.5,
-                              motion_strength: float = 0.95) -> dict:
-    """Build the LTX 2.3 motion-control workflow.
+                              inplace_strength: float = 1.0,
+                              motion_strength: float = 1.0) -> dict:
+    """Build the LTX 2.3 motion-control workflow — IC-LoRA Union-Control path.
 
-    Uses the LTXVAddGuide node — the proper motion-conditioning primitive
-    from ComfyUI-LTXVideo's `comfy_extras.nodes_lt`. The previous version
-    passed a VAE-encoded reference into LTXVImgToVideoInplace's `latent`
-    input, but that node is i2v-only (it overwrites the latent with the
-    image encoding), so the reference motion was being discarded — the
-    output looked like i2v of the character image rather than motion
-    transfer.
+    THIS IS THE THIRD REWRITE. The earlier two strategies both produced
+    appearance-leaked output (character "wore" the reference person's
+    clothes/face from frame 1 onward) because they both fed raw RGB
+    pixels from the reference video into the conditioning latent:
 
-    LTXVAddGuide injects video/image frames into the conditioning AND the
-    latent at a given frame_idx with controllable strength. We stack two
-    guides, BOTH spanning the full output length:
+      v1 — LTXVImgToVideoInplace with VAE-encoded ref latent.
+           Identity-only node; motion silently discarded.
+      v2 — LTXVAddGuide with raw ref RGB + character batch.
+           Motion landed but appearance bled through. There's no
+           strength balance that separates motion from appearance when
+           the guide pixels ARE the reference person.
 
-      1. Reference video (multi-frame from VHS_LoadVideo) at frame_idx=0,
-         strength=motion_strength  →  drives the motion.
-      2. Character image RepeatImageBatch'd to `length` frames at
-         frame_idx=0, strength=inplace_strength  →  drives appearance at
-         every frame, not just frame 0.
+    The fix is structural, not a knob tweak: feed the model a CONTROL
+    SIGNAL (pose skeleton on black background) instead of the raw RGB
+    reference, and use Lightricks' Union-Control IC-LoRA — a LoRA
+    adapter trained to interpret pose/depth/canny inputs and re-render
+    them with the appearance from a separate character image. Result:
+    motion comes from the skeleton, appearance comes from the character
+    image, and the two never mix in the latent.
 
-    Why batch the character image across all frames? When the character
-    guide only covered frame 0, the reference video's appearance bled
-    into frames 1..N — the rendered character did the right motion but
-    wore the reference person's clothes/face after frame 0. Repeating
-    the character into a static N-frame batch lets us write character
-    appearance into EVERY frame's conditioning, fighting the reference's
-    appearance throughout while the motion conditioning still drives the
-    pose/dynamics. Closest you can get to true motion transfer without a
-    pose-extraction ControlNet (which the LTX stack on these pods doesn't
-    have).
+    Pipeline overview (mirrors Lightricks' official
+    LTX-2.3_ICLoRA_Union_Control_Distilled.json with DWPose as the
+    control signal — pose is the right choice for human dance/gesture
+    transfer; depth/canny are better for whole-scene composition):
 
-    The reference video must satisfy LTX's `8*n + 1` frame constraint —
-    97, 121, 161, 257 all qualify so the default `length` values are
-    safe. main.py's ffmpeg pre-step already enforces this via -frames:v.
-    The character batch is `length` frames so it satisfies the same
-    constraint automatically.
+      reference_video → VHS_LoadVideo → resize (shorter=544)
+                     → DWPreprocessor (yolox_l + dw-ll_ucoco_384)
+                     → resize-to-multiple-of-32
+                     → LTXAddVideoICLoRAGuide.image  (motion signal)
 
-    Knob meanings:
-      inplace_strength  — appearance-anchor strength (applied to ALL
-                          frames). 0.8–1.0 = character appearance
-                          dominates (recommended). Lower if you want
-                          stylization toward the reference look.
-      motion_strength   — reference-video guide strength (applied to ALL
-                          frames). 0.5–0.7 = motion structure without
-                          overwhelming appearance. 1.0 = strong copy of
-                          reference motion but risks bleeding appearance.
+      character_image → LoadImage → resize
+                     → LTXVImgToVideoConditionOnly (bypass=False)
+                     → LTXAddVideoICLoRAGuide.latent  (identity)
+
+      checkpoint → distilled-LoRA → Union-Control IC-LoRA
+                → CFGGuider → SamplerCustomAdvanced
+
+    Knob meanings under IC-LoRA — DIFFERENT from the LTXVAddGuide path:
+      inplace_strength  — `strength` on LTXVImgToVideoConditionOnly.
+                          1.0 = full character identity (recommended).
+                          Lower → character less locked, more prompt-
+                          driven appearance.
+      motion_strength   — `strength` on LTXAddVideoICLoRAGuide. 1.0 =
+                          full pose-driven motion (recommended). Lower
+                          → looser interpretation of the skeleton.
+
+    Notes vs. earlier callers:
+      • `audio` is ignored (caller in main.py forces it False and muxes
+        reference audio post-generation).
+      • `preset` is ignored for now — IC-LoRA path is single-pass with
+        the 8-step distilled sigmas. Two-pass refinement on top of
+        IC-LoRA is non-trivial and not part of Lightricks' example.
+      • `enhance_prompt` is ignored — Gemma rewriting the prompt based
+        on character image alone tends to fight pose conditioning.
     """
-    two_pass = LTX_PRESETS[preset]["two_pass"]
-    refine_strength = min(1.0, inplace_strength + 0.3)
-    # LTXVAddGuide enforces strength in [0, 1] — clamp early so a
-    # passed-in motion_strength > 1 (legacy callers tuned for the broken
-    # LatentMultiply path) doesn't 400 the request.
+    _ = preset, audio, enhance_prompt, motion_strength, inplace_strength  # acknowledged-but-restricted
+    # Clamp strengths into [0,1] — the IC-LoRA guide enforces this and
+    # so does LTXVImgToVideoConditionOnly.
     motion_strength = max(0.0, min(1.0, motion_strength))
+    inplace_strength = max(0.0, min(1.0, inplace_strength))
+    distilled_lora_strength = LTX_PRESETS["fast"]["lora_strength"]  # 0.5
+    sigmas = _LTX_DISTILLED_LOW_SIGMAS
 
-    img_nodes = {
-        # Character image chain — identical to i2v's first-frame setup.
-        # Acts as the identity guide via the first LTXVAddGuide call below.
+    # ─── Resolve DWPose preprocessor input (resize) target ────────
+    # DWPose works best around 512px. We resize the reference video so
+    # the shorter dimension is the SHORTER of (canvas-width, canvas-
+    # height) — that way pose tracking has resolution while staying
+    # cheap. The output then gets resized to the canvas dims directly.
+    dw_shorter = min(width, height)
+    if dw_shorter < 384:
+        dw_shorter = 384  # floor — below this DWPose loses confidence
+
+    workflow: dict = {
+        # ─── Checkpoint + LoRAs ────────────────────────────────────
+        "236": {"class_type": "CheckpointLoaderSimple", "inputs": {
+            "ckpt_name": "ltx-2.3-22b-dev-fp8.safetensors",
+        }},
+        # Text-encoder loader (used for CLIPTextEncode below)
+        "243": {"class_type": "LTXAVTextEncoderLoader", "inputs": {
+            "text_encoder": "gemma_3_12B_it_fp4_mixed.safetensors",
+            "ckpt_name":    "ltx-2.3-22b-dev-fp8.safetensors",
+            "device": "default",
+        }},
+        # Distilled LoRA (matches base workflow)
+        "232": {"class_type": "LoraLoaderModelOnly", "inputs": {
+            "model": ["236", 0],
+            "lora_name": "ltx-2.3-22b-distilled-lora-384.safetensors",
+            "strength_model": distilled_lora_strength,
+        }},
+        # IC-LoRA Union-Control on top of distilled. Slot 0 = model with
+        # both LoRAs applied, slot 1 = latent_downscale_factor (FLOAT;
+        # wire into LTXAddVideoICLoRAGuide so the guide knows the LoRA's
+        # grid size).
+        "262": {"class_type": "LTXICLoRALoaderModelOnly", "inputs": {
+            "model": ["232", 0],
+            "lora_name": "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
+            "strength_model": 1.0,
+        }},
+
+        # ─── Prompts ───────────────────────────────────────────────
+        # Skipping Gemma TextGenerateLTX2Prompt — IC-LoRA pose driving
+        # works best when the prompt is a literal description and the
+        # control signal does the heavy lifting on motion.
+        "240": {"class_type": "CLIPTextEncode", "inputs": {
+            "clip": ["243", 0], "text": prompt or "the subject performs the motion",
+        }},
+        "247": {"class_type": "CLIPTextEncode", "inputs": {
+            "clip": ["243", 0], "text": negative_prompt,
+        }},
+        "239": {"class_type": "LTXVConditioning", "inputs": {
+            "positive": ["240", 0], "negative": ["247", 0], "frame_rate": float(fps),
+        }},
+
+        # ─── Character image (identity source) ────────────────────
         "269": {"class_type": "LoadImage", "inputs": {"image": character_image_filename}},
         "238": {"class_type": "ResizeImageMaskNode", "inputs": {
-            "input": ["269", 0], "resize_type": "scale dimensions",
+            "input": ["269", 0],
+            "resize_type": "scale dimensions",
             "resize_type.width": width, "resize_type.height": height,
             "resize_type.crop": "center", "scale_method": "lanczos",
         }},
-        "235": {"class_type": "ResizeImagesByLongerEdge", "inputs": {"images": ["238", 0], "longer_edge": 1536}},
-        "248": {"class_type": "LTXVPreprocess", "inputs": {"image": ["235", 0], "img_compression": 18}},
-
-        # Multi-frame character batch — replicate the character image
-        # `length` times so the identity guide can inject character
-        # appearance into EVERY frame's conditioning slot, not just frame
-        # 0. Without this, the reference video guide (motion_strength)
-        # carries both motion AND the reference's appearance into frames
-        # 1..N, and only frame 0 gets the character — so the rendered
-        # character bows around with the WRONG clothes/face from frame 1
-        # onward. A static N-frame character batch lets us write the
-        # character latent at every frame and fight that appearance bleed.
-        "332": {"class_type": "RepeatImageBatch", "inputs": {
-            "image": ["248", 0],
-            "amount": length,
+        "228": {"class_type": "EmptyLTXVLatentVideo", "inputs": {
+            "width": width, "height": height, "length": length, "batch_size": 1,
+        }},
+        # LTXVImgToVideoConditionOnly — applies the character image as
+        # the identity anchor. bypass=False means we USE the character
+        # (Lightricks' example has bypass=True because it's a non-
+        # character scene; we always want identity locked).
+        "325": {"class_type": "LTXVImgToVideoConditionOnly", "inputs": {
+            "vae": ["236", 2],
+            "image": ["238", 0],
+            "latent": ["228", 0],
+            "strength": inplace_strength,
+            "bypass": False,
         }},
 
-        # Reference video chain — load with VHS, resize to canvas. The
-        # IMAGE tensor goes directly into LTXVAddGuide as a multi-frame
-        # guide; we don't VAE-encode it ourselves (LTXVAddGuide does that
-        # internally as part of its guide-injection logic, which gets the
-        # encoding right for the conditioning slot).
+        # ─── Reference video → DWPose skeleton (motion control) ───
         "310": {"class_type": "VHS_LoadVideo", "inputs": {
             "video": reference_video_filename,
             "force_rate": float(fps),
             "force_size": "Disabled",
-            "custom_width": 0,
-            "custom_height": 0,
+            "custom_width": 0, "custom_height": 0,
             "frame_load_cap": length,
             "skip_first_frames": 0,
             "select_every_nth": 1,
         }},
         "311": {"class_type": "ResizeImageMaskNode", "inputs": {
-            "input": ["310", 0], "resize_type": "scale dimensions",
-            "resize_type.width": width, "resize_type.height": height,
-            "resize_type.crop": "center", "scale_method": "lanczos",
+            "input": ["310", 0],
+            "resize_type": "scale shorter dimension",
+            "resize_type.shorter_size": dw_shorter,
+            "scale_method": "lanczos",
         }},
-        "315": {"class_type": "LTXVPreprocess", "inputs": {"image": ["311", 0], "img_compression": 18}},
-    }
+        # DWPose preprocessor — produces a skeleton-on-black-background
+        # video of the same length as the input. THIS is what kills the
+        # appearance leak: the pixels going into the IC-LoRA guide have
+        # zero reference-person appearance, only joint geometry.
+        "320": {"class_type": "DWPreprocessor", "inputs": {
+            "image": ["311", 0],
+            "detect_hand": "enable",
+            "detect_body": "enable",
+            "detect_face": "enable",
+            "resolution": 512,
+            "bbox_detector": "yolox_l.onnx",
+            "pose_estimator": "dw-ll_ucoco_384_bs5.torchscript.pt",
+            "scale_stick_for_xinsr_cn": "disable",
+        }},
+        # Resize the skeleton frames to a multiple of 32 so they align
+        # with the latent grid. Union-Control's latent_downscale_factor
+        # is 1.0 → multiple = 32. (The official workflow computes this
+        # dynamically with SimpleMath+ but that node isn't installed
+        # here; for Union-Control specifically, 32 is correct.)
+        "321": {"class_type": "ResizeImageMaskNode", "inputs": {
+            "input": ["320", 0],
+            "resize_type": "scale to multiple",
+            "resize_type.multiple": 32,
+            "scale_method": "lanczos",
+        }},
 
-    if enhance_prompt:
-        # Gemma-driven prompt enhancement — uses the character image as
-        # visual context. With proper motion guidance now in place, the
-        # prompt can stay simple ("the woman dances") and the reference
-        # video tells the model HOW to dance.
-        img_nodes["274"] = {"class_type": "TextGenerateLTX2Prompt", "inputs": {
-            "clip": ["272", 1], "image": ["269", 0], "prompt": prompt,
-            "max_length": 256, "sampling_mode": "on",
-            "sampling_mode.temperature": 0.7, "sampling_mode.top_k": 64,
-            "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
-            "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": seed,
-        }}
-        img_nodes["240"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["243", 0], "text": ["274", 0]}}
-
-    workflow = ltx_base_nodes(
-        prompt, negative_prompt, width, height, length, fps, seed,
-        # Sentinel that gets rewritten below — see "high_res_src" + the
-        # guide chain. We need ltx_base_nodes to wire its sampler chain
-        # through OUR guide-conditioned positive/negative/latent rather
-        # than through 239 (the un-guided LTXVConditioning output it
-        # would normally pick). The simplest way is to let ltx_base_nodes
-        # set up the empty latent at "228", then OVERWRITE the sampler's
-        # inputs (CFGGuider 231, latent_image on 215) downstream of the
-        # guide chain. We do that after `workflow.update`.
-        low_res_video_src=["228", 0],
-        high_res_video_src=None,
-        prefix="ltx_motion", preset=preset, audio=audio,
-    )
-    workflow.update(img_nodes)
-
-    # Stack the two LTXVAddGuide calls. BOTH guides span the full N-frame
-    # window now — the reference (multi-frame from VHS) carries motion,
-    # the character (multi-frame from RepeatImageBatch at node 332)
-    # carries appearance everywhere. Order still matters: LTXVAddGuide
-    # composes additively in conditioning but its latent-write is
-    # last-wins at overlapping frames. We run the reference FIRST so the
-    # character batch (second) layers identity over reference appearance
-    # at every frame, not just frame 0 — that's the fix for the
-    # "character bows around but wears the reference's clothes" bug.
-    workflow["330"] = {"class_type": "LTXVAddGuide", "inputs": {
-        "positive": ["239", 0],
-        "negative": ["239", 1],
-        "vae": ["236", 2],
-        "latent": ["228", 0],
-        "image": ["315", 0],
-        "frame_idx": 0,
-        "strength": motion_strength,
-    }}
-    workflow["331"] = {"class_type": "LTXVAddGuide", "inputs": {
-        "positive": ["330", 0],
-        "negative": ["330", 1],
-        "vae": ["236", 2],
-        "latent": ["330", 2],
-        "image": ["332", 0],  # RepeatImageBatch — character at every frame
-        "frame_idx": 0,
-        "strength": inplace_strength,
-    }}
-
-    # Rewire the sampler chain that ltx_base_nodes built so it consumes
-    # the guide outputs. CFGGuider (231) takes positive/negative from the
-    # final guide.
-    if "231" in workflow:
-        workflow["231"]["inputs"]["positive"] = ["331", 0]
-        workflow["231"]["inputs"]["negative"] = ["331", 1]
-    # Latent routing depends on whether audio is enabled:
-    #   audio=False → 215 (sampler) reads its starting latent directly.
-    #     Override 215.latent_image so the sampler starts from the
-    #     motion-guided latent.
-    #   audio=True  → 222 (LTXVConcatAVLatent) sits between the empty
-    #     latent and the sampler, packaging the video+audio latents into
-    #     an AV-latent. The sampler then outputs an AV-latent which 217
-    #     (LTXVSeparateAVLatent) splits back into [video, audio]. If we
-    #     bypass 222 by overriding 215.latent_image directly, the sampler
-    #     produces a video-only output and 217's index-1 access ("audio")
-    #     blows up with "tuple index out of range". Instead, override 222's
-    #     video_latent input so the motion-guided latent flows through the
-    #     audio concat as the video half.
-    if "222" in workflow:  # audio path — re-route the audio concat's video half
-        workflow["222"]["inputs"]["video_latent"] = ["331", 2]
-    elif "215" in workflow:  # no-audio path — re-route the sampler directly
-        workflow["215"]["inputs"]["latent_image"] = ["331", 2]
-
-    if two_pass:
-        # Two-pass refine — re-apply guides into the upsampled latent.
-        # Same swap-order discipline as the first pass (reference first,
-        # then character) so identity wins at frame 0 here too. Refine
-        # uses slightly higher identity strength (refine_strength = min(1,
-        # inplace_strength + 0.3)), motion strength is unchanged.
-        workflow["340"] = {"class_type": "LTXVAddGuide", "inputs": {
+        # ─── IC-LoRA guide ────────────────────────────────────────
+        "330": {"class_type": "LTXAddVideoICLoRAGuide", "inputs": {
             "positive": ["239", 0],
             "negative": ["239", 1],
             "vae": ["236", 2],
-            "latent": ["253", 0],
-            "image": ["315", 0],
+            "latent": ["325", 0],              # character-conditioned latent
+            "image": ["321", 0],               # DWPose skeleton video
             "frame_idx": 0,
             "strength": motion_strength,
-        }}
-        workflow["341"] = {"class_type": "LTXVAddGuide", "inputs": {
-            "positive": ["340", 0],
-            "negative": ["340", 1],
-            "vae": ["236", 2],
-            "latent": ["340", 2],
-            "image": ["332", 0],  # batched character — same as first pass
-            "frame_idx": 0,
-            "strength": refine_strength,
-        }}
-        # Refine-pass conditioning: ltx_base_nodes names the refine
-        # CFGGuider "213" (two_pass branch) — patch its positive/negative
-        # to consume the second-stage guide output.
-        for gid in ("213", "219", "218"):
-            if gid in workflow and isinstance(workflow[gid].get("inputs", {}), dict):
-                if "positive" in workflow[gid]["inputs"]:
-                    workflow[gid]["inputs"]["positive"] = ["341", 0]
-                if "negative" in workflow[gid]["inputs"]:
-                    workflow[gid]["inputs"]["negative"] = ["341", 1]
-        # Refine-pass latent routing — same audio-aware split as first
-        # pass. ltx_base_nodes names the refine sampler "219", the refine
-        # audio concat "229", and the upsampler "253":
-        #   audio=False → 219 reads latent_image directly from upsampled
-        #     latent. Override 219.latent_image to ["341", 2].
-        #   audio=True  → 229 (concat) sits between upsampler and 219.
-        #     Override 229.video_latent so audio is preserved.
-        if "229" in workflow:
-            workflow["229"]["inputs"]["video_latent"] = ["341", 2]
-        elif "219" in workflow:
-            workflow["219"]["inputs"]["latent_image"] = ["341", 2]
+            "latent_downscale_factor": ["262", 1],  # from IC-LoRA loader
+            "crop": "disabled",
+            "use_tiled_encode": False,
+            "tile_size": 256,
+            "tile_overlap": 64,
+        }},
 
-    # ColorMatch the output against the character image — same as i2v.
-    # Reduces the warm/saturated drift that fp8 VAE round-trips produce.
-    workflow["280"] = {"class_type": "ColorMatch", "inputs": {
-        "image_ref": ["269", 0],
-        "image_target": ["251", 0],
-        "method": "mkl",
-        "strength": 1.0,
-    }}
-    workflow["242"]["inputs"]["images"] = ["280", 0]
+        # ─── Sampler chain ─────────────────────────────────────────
+        "231": {"class_type": "CFGGuider", "inputs": {
+            "model": ["262", 0],              # IC-LoRA-loaded model
+            "positive": ["330", 0],
+            "negative": ["330", 1],
+            "cfg": 1.0,
+        }},
+        "209": {"class_type": "KSamplerSelect", "inputs": {
+            "sampler_name": "euler_ancestral_cfg_pp",
+        }},
+        "237": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+        "252": {"class_type": "ManualSigmas", "inputs": {"sigmas": sigmas}},
+        "215": {"class_type": "SamplerCustomAdvanced", "inputs": {
+            "noise": ["237", 0],
+            "guider": ["231", 0],
+            "sampler": ["209", 0],
+            "sigmas": ["252", 0],
+            "latent_image": ["330", 2],       # IC-LoRA guide's latent output
+        }},
+
+        # ─── Decode + colour-match + output ───────────────────────
+        "251": {"class_type": "VAEDecodeTiled", "inputs": {
+            "samples": ["215", 0],
+            "vae": ["236", 2],
+            "tile_size": 768, "overlap": 64,
+            "temporal_size": 4096, "temporal_overlap": 4,
+        }},
+        # ColorMatch the output against the character image, mirroring
+        # the i2v workflow — reduces the warm/saturated drift the fp8
+        # VAE roundtrip produces.
+        "280": {"class_type": "ColorMatch", "inputs": {
+            "image_ref": ["269", 0],
+            "image_target": ["251", 0],
+            "method": "mkl",
+            "strength": 1.0,
+        }},
+        "242": {"class_type": "VHS_VideoCombine", "inputs": {
+            "images": ["280", 0],
+            "frame_rate": fps,
+            "loop_count": 0,
+            "filename_prefix": "ltx_motion",
+            "format": "video/h264-mp4",
+            "pix_fmt": "yuv420p",
+            "crf": 19,
+            "save_metadata": True,
+            "trim_to_audio": False,
+            "pingpong": False,
+            "save_output": True,
+        }},
+    }
     return workflow
