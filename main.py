@@ -1942,6 +1942,108 @@ async def admin_reload_filter(authorization: str = Header(default=None)):
     return face_safety.force_reload_filter()
 
 
+@app.post("/admin/test-face-filter")
+async def admin_test_face_filter(
+    image: UploadFile = File(..., description="Image to test against the loaded blocklist."),
+    top_n: int = Form(5, ge=1, le=50, description="How many top-scoring identities to return."),
+    authorization: str = Header(default=None),
+):
+    """Diagnose why a specific image is or isn't being blocked.
+
+    Runs the same detect-then-match pipeline that /flux endpoints invoke
+    when face_filter=true, but returns the full picture:
+      - detected face count (significant + raw)
+      - per-identity scores (cosine similarity, sorted descending)
+      - the blocked/not-blocked verdict at the current threshold
+      - any skipped blocklist files that would have been candidates
+
+    Use this when a face you thought would block sails through. The
+    response tells you exactly which knob is responsible: low detection?
+    score below threshold? target identity in the skipped list? Etc.
+    """
+    _require_admin(authorization)
+    if face_safety is None:
+        raise HTTPException(503, "face filter module unavailable")
+
+    import io
+    import numpy as np
+    from PIL import Image as PILImage
+
+    raw = await image.read()
+    if not raw:
+        raise HTTPException(400, "image is empty")
+
+    # Force a reload to ensure we're testing against the current state.
+    face_safety._maybe_reload()
+    filt = face_safety._FILTER
+    if filt is None:
+        raise HTTPException(503, f"filter not initialized: {face_safety._FILTER_INIT_ERROR}")
+
+    try:
+        pil = PILImage.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(400, f"could not decode image: {e}")
+    arr = np.array(pil)
+    img_h, img_w = arr.shape[:2]
+    img_area = img_h * img_w
+
+    app_ = filt["app"]
+    blocklist = filt["blocklist"]
+    threshold = filt["threshold"]
+
+    raw_faces = app_.get(arr)
+    significant_faces = [
+        f for f in raw_faces
+        if (max(0.0, f.bbox[2] - f.bbox[0]) * max(0.0, f.bbox[3] - f.bbox[1])
+            / max(1, img_area)) >= face_safety.MIN_FACE_AREA_RATIO
+    ]
+
+    # For each detected face, compute scores against ALL blocklist
+    # identities and pick the best per-face score. Then aggregate the
+    # overall best across faces.
+    per_face: list[dict] = []
+    overall_best: tuple[float, str | None] = (-1.0, None)
+    for fi, face in enumerate(significant_faces):
+        emb = face.normed_embedding
+        scored: list[tuple[str, float]] = []
+        for identity, ref_emb in blocklist.items():
+            scored.append((identity, float(np.dot(emb, ref_emb))))
+        scored.sort(key=lambda t: t[1], reverse=True)
+        if scored and scored[0][1] > overall_best[0]:
+            overall_best = (scored[0][1], scored[0][0])
+        bbox = face.bbox
+        per_face.append({
+            "face_index": fi,
+            "bbox": [float(x) for x in bbox],
+            "area_ratio": round(
+                (max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1]) / max(1, img_area)), 4
+            ),
+            "top_scores": [{"identity": i, "score": round(s, 4)} for i, s in scored[:top_n]],
+        })
+
+    return {
+        "image_size": [img_w, img_h],
+        "raw_face_count": len(raw_faces),
+        "significant_face_count": len(significant_faces),
+        "min_face_area_ratio": face_safety.MIN_FACE_AREA_RATIO,
+        "match_threshold": threshold,
+        "blocked": overall_best[0] > threshold,
+        "best_match": {"identity": overall_best[1], "score": round(overall_best[0], 4)} if overall_best[1] else None,
+        "per_face": per_face,
+        "blocklist_size": len(blocklist),
+        "skipped_count": len(filt.get("skipped_files", [])),
+        "hint": (
+            "raw_face_count=0 → detector failed; try a clearer / higher-contrast image."
+            if not raw_faces
+            else "significant_face_count=0 → face detected but too small (< min_face_area_ratio). Lower FACE_MIN_AREA_RATIO env var, or crop tighter."
+            if not significant_faces
+            else f"best score {round(overall_best[0], 4)} < threshold {threshold} → either no match in the loaded blocklist OR your target identity is in skipped_files (check /admin/reload-filter response)."
+            if not (overall_best[0] > threshold)
+            else "blocked correctly."
+        ),
+    }
+
+
 @app.get("/admin/blocklist")
 async def admin_list_blocklist(authorization: str = Header(default=None)):
     """List all identities currently on the blocklist."""
