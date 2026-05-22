@@ -937,31 +937,28 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         }},
         "322": {"class_type": "LTXVPreprocess", "inputs": {"image": ["321", 0], "img_compression": 18}},
 
-        # ─── Standard LTXVAddGuide with DWPose skeleton ───────────
-        # Reverted away from LTXAddVideoICLoRAGuide. Across v19-v28 the
-        # IC-LoRA's latent_downscale_factor=2 halved temporal coverage,
-        # producing the 50%-onward noise. v27 confirmed factor=1.0 fixes
-        # coverage but disables the character render step. v28 stacking
-        # two guides at factor=2.0 caused double-character ghosting.
+        # ─── LTXVAddGuidesFromBatch: native multi-frame conditioning ─
+        # v29 (LTXVAddGuide w/ skeleton, no IC-LoRA loader) and v30
+        # (same guide + IC-LoRA loader) both rendered skeletons
+        # literally — model didn't translate them into a character.
+        # The IC-LoRA guide node's processing is required for that
+        # translation but it does the 50% halving.
         #
-        # The standard LTXVAddGuide has no latent_downscale_factor → no
-        # temporal halving → full output coverage from a single guide.
-        # It treats the input image as a raw RGB conditioning signal —
-        # which previously caused appearance leak (reference person's
-        # clothes on character). But we're now feeding it the BLACK-BG
-        # DWPose skeleton, not the raw ref video. The skeleton's
-        # "appearance" is just colored bones on a dark background, so
-        # there's no character appearance to leak through. The model
-        # gets pose-driven motion structure + the character image at
-        # frame 0 via LTXVImgToVideoConditionOnly, and the result
-        # should be Marco doing the pose sequence cleanly throughout.
-        "330": {"class_type": "LTXVAddGuide", "inputs": {
+        # LTXVAddGuidesFromBatch takes a "batch of images - non-black
+        # images will be used as guides" per the tooltip — it likely
+        # auto-distributes keyframes across the output latent's
+        # temporal slots. No latent_downscale_factor input → no
+        # halving. The colored skeleton-on-black DWPose frames are
+        # non-black so all 121 of them should become keyframes spread
+        # across the output. Combined with the IC-LoRA loader (which
+        # gives the model the skeleton-to-character translation
+        # capability) this should fix both problems at once.
+        "330": {"class_type": "LTXVAddGuidesFromBatch", "inputs": {
             "positive": ["239", 0],
             "negative": ["239", 1],
             "vae": ["236", 2],
             "latent": ["325", 0],   # character-conditioned latent
-            "image": ["322", 0],    # DWPose skeleton (black bg + bones)
-            "frame_idx": 0,
+            "images": ["322", 0],   # DWPose skeleton batch
             "strength": motion_strength,
         }},
 
