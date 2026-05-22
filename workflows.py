@@ -946,18 +946,16 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         }},
 
         # ─── IC-LoRA guide (Advanced variant) ─────────────────────
-        # Switched from LTXAddVideoICLoRAGuide to LTXAddVideoICLoRAGuide-
-        # Advanced. v19-v25 all showed conditioning landing in only the
-        # first 50% of output latent slices regardless of pose length,
-        # output length, fps, or strength tweaks — suggests the regular
-        # node has a temporal-coverage quirk this Advanced version may
-        # handle differently. Advanced also exposes attention_strength
-        # and attention_mask (currently using full conditioning, no
-        # mask) which give finer control if the temporal split persists.
-        # frame_idx tooltip on Advanced says "rounded to nearest frame
-        # and wrapped modulo the number of video frames" (different from
-        # regular's "1 modulo 8" snap) — wrapping might be why coverage
-        # was bounded.
+        # latent_downscale_factor HARDCODED to 1.0 (not wired from the
+        # loader's slot 1 which outputs 2.0). v19-v26 all collapsed to
+        # noise at exactly 50% of the output — pose video covers the
+        # first half of output latent slices, the second half has no
+        # conditioning. The agent's research said latent_downscale_factor
+        # only halves spatial dims, but empirically the temporal coverage
+        # is also halving. Overriding to 1.0 forces "no downscale" which
+        # may either (a) fix the coverage at the cost of spatial detail,
+        # or (b) error out at validation because the IC-LoRA was trained
+        # with factor=2. If (b), next try is stacked guides.
         "330": {"class_type": "LTXAddVideoICLoRAGuideAdvanced", "inputs": {
             "positive": ["239", 0],
             "negative": ["239", 1],
@@ -966,7 +964,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "image": ["321", 0],               # DWPose skeleton video
             "frame_idx": 0,
             "strength": motion_strength,
-            "latent_downscale_factor": ["262", 1],  # from IC-LoRA loader
+            "latent_downscale_factor": 1.0,    # HARDCODED, was ["262", 1]
             "crop": "disabled",
             "use_tiled_encode": False,
             "tile_size": 256,
