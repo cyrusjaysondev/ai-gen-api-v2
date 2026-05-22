@@ -128,25 +128,66 @@ def _build_filter():
             return
     app = _CACHED_APP
 
-    # Load blocklist
+    # Load blocklist. Each successful embedding is one identity the
+    # filter can actually block at query time. If detection FAILS on a
+    # blocklist image, that identity is unblockable until the file is
+    # replaced — so we apply the same autocontrast + larger-canvas
+    # fallbacks that detect_face_count uses on inbound images. Anything
+    # we still can't extract gets logged as a hard miss so admins can
+    # see the gap in /admin/comfy-status or a future stats endpoint.
+    from PIL import ImageOps  # local import — ImageOps isn't bound at top
     blocklist: dict[str, "np.ndarray"] = {}
-    if blocklist_dir.is_dir():
-        for img_path in sorted(blocklist_dir.iterdir()):
-            if img_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
-                continue
+    skipped: list[str] = []
+    for img_path in sorted(blocklist_dir.iterdir()) if blocklist_dir.is_dir() else []:
+        if img_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+            continue
+        try:
+            pil = Image.open(img_path).convert("RGB")
+        except Exception as e:
+            print(f"[face-filter] WARN: cannot open {img_path.name}: {e}")
+            continue
+
+        arr = np.array(pil)
+        faces = app.get(arr)
+
+        # Fallback 1 — autocontrast (histogram stretch). Recovers
+        # washed-out / older photos where SCRFD's detector falls below
+        # threshold at default exposure.
+        if not faces:
             try:
-                arr = np.array(Image.open(img_path).convert("RGB"))
+                enhanced = ImageOps.autocontrast(pil, cutoff=2)
+                arr = np.array(enhanced)
+                faces = app.get(arr)
+                if faces:
+                    print(f"[face-filter] {img_path.name}: detection recovered via autocontrast")
             except Exception as e:
-                print(f"[face-filter] WARN: cannot open {img_path.name}: {e}")
-                continue
-            faces = app.get(arr)
-            if not faces:
-                print(f"[face-filter] WARN: no face detected in blocklist image {img_path.name} — skipping")
-                continue
-            # Use the largest face if multiple are detected (assume the
-            # blocklist image is well-cropped around one identity)
-            face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-            blocklist[img_path.stem] = face.normed_embedding
+                print(f"[face-filter] {img_path.name}: autocontrast errored: {e}")
+
+        # Fallback 2 — upscale to 2x then retry. Helps when the face is
+        # small relative to the canvas; SCRFD at det_size=1024 still
+        # struggles when the face is < ~100px wide in the source.
+        if not faces:
+            try:
+                w, h = pil.size
+                up = pil.resize((w * 2, h * 2), Image.LANCZOS)
+                arr = np.array(up)
+                faces = app.get(arr)
+                if faces:
+                    print(f"[face-filter] {img_path.name}: detection recovered via 2× upscale")
+            except Exception as e:
+                print(f"[face-filter] {img_path.name}: 2× upscale errored: {e}")
+
+        if not faces:
+            skipped.append(img_path.name)
+            print(f"[face-filter] WARN: no face detected in blocklist image {img_path.name} — skipping (will not be blockable!)")
+            continue
+
+        # Use the largest face if multiple are detected (assume the
+        # blocklist image is well-cropped around one identity)
+        face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        blocklist[img_path.stem] = face.normed_embedding
+    if skipped:
+        print(f"[face-filter] WARNING: {len(skipped)} blocklist images had no detectable face: {skipped[:10]}{'...' if len(skipped) > 10 else ''}")
 
     _FILTER = {
         "app": app,
@@ -154,8 +195,9 @@ def _build_filter():
         "threshold": threshold,
         "np": np,
         "Image": Image,
+        "skipped_files": skipped,
     }
-    print(f"[face-filter] ready: {len(blocklist)} identities loaded from {blocklist_dir}, threshold={threshold}")
+    print(f"[face-filter] ready: {len(blocklist)} identities loaded from {blocklist_dir}, threshold={threshold}, skipped={len(skipped)}")
 
 
 # Smallest fraction of the image area a detected bbox must cover to count
@@ -208,6 +250,7 @@ def force_reload_filter() -> dict:
             "ok": False,
             "error": _FILTER_INIT_ERROR or "filter rebuild produced no state",
         }
+    skipped = _FILTER.get("skipped_files", [])
     return {
         "ok": True,
         "threshold": _FILTER["threshold"],
@@ -215,6 +258,12 @@ def force_reload_filter() -> dict:
         # Surface a small sample so admins eyeballing the response can
         # confirm the entries they expect are loaded.
         "sample_identities": sorted(_FILTER["blocklist"].keys())[:10],
+        # Hard misses: images on disk that produced no embedding, even
+        # after autocontrast + 2× upscale fallbacks. These identities
+        # are UNBLOCKABLE — the admin should replace them with a clearer
+        # photo.
+        "skipped_count": len(skipped),
+        "skipped_files": skipped[:30],
     }
 
 
