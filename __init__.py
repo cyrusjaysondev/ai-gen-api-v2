@@ -34,16 +34,27 @@ FILES_TO_REFRESH = ("main.py", "workflows.py", "safety.py", "logo_safety.py", "w
 # Bump this suffix to force the refresh to re-run after a subsequent push.
 # We use a versioned marker so legit ComfyUI restarts after the work is
 # done don't trigger another uvicorn cycle.
-MARKER = Path("/tmp/api-refresh-claimed-290700f")
+MARKER = Path("/tmp/api-refresh-claimed-290700f-v2")
+DIAG_LOG = Path("/workspace/setup-vhs.log")  # piggyback on the log surfaced by /admin/comfy-status
+
+
+def _diag(line: str) -> None:
+    """Write to the install log so /admin/comfy-status surfaces it."""
+    try:
+        with DIAG_LOG.open("a") as f:
+            f.write(f"[refresh-shim] {line}\n")
+    except Exception:
+        pass
 
 
 def _refresh_api_files() -> None:
     """Fetch latest API .py files from main + kill uvicorn so it reloads."""
+    _diag("import-time entry — shim is being loaded by ComfyUI")
     if MARKER.exists():
-        print("[refresh-api-shim] marker present — skipping (already refreshed)")
+        _diag(f"marker {MARKER.name} present — skipping (already refreshed)")
         return
     if not API_DIR.is_dir():
-        print(f"[refresh-api-shim] {API_DIR} missing — wrong pod layout, bailing")
+        _diag(f"{API_DIR} missing — wrong pod layout, bailing")
         return
 
     for filename in FILES_TO_REFRESH:
@@ -54,12 +65,12 @@ def _refresh_api_files() -> None:
             urllib.request.urlretrieve(url, str(tmp))
             if tmp.stat().st_size > 0:
                 os.replace(str(tmp), str(target))
-                print(f"[refresh-api-shim] refreshed {filename} ({target.stat().st_size} bytes)")
+                _diag(f"refreshed {filename} ({target.stat().st_size} bytes)")
             else:
                 tmp.unlink(missing_ok=True)
-                print(f"[refresh-api-shim] empty download for {filename} — kept existing")
+                _diag(f"empty download for {filename} — kept existing")
         except Exception as e:
-            print(f"[refresh-api-shim] failed to fetch {filename}: {e}")
+            _diag(f"failed to fetch {filename}: {e}")
             try:
                 tmp.unlink(missing_ok=True)
             except Exception:
@@ -81,7 +92,7 @@ def _refresh_api_files() -> None:
             pid = tail.split("/")[0]
             if pid.isdigit():
                 subprocess.run(["kill", "-9", pid], capture_output=True, timeout=5)
-                print(f"[refresh-api-shim] killed uvicorn PID={pid} (port :7860 owner)")
+                _diag(f"killed uvicorn PID={pid} (port :7860 owner)")
                 killed = True
                 break
     except Exception as e:
