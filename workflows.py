@@ -775,12 +775,17 @@ def build_ltx_motion_workflow(reference_video_filename: str,
     distilled_lora_strength = LTX_PRESETS["fast"]["lora_strength"]  # 0.5
     sigmas = _LTX_DISTILLED_LOW_SIGMAS
 
-    # ─── Snap canvas dims to a multiple of 32 ─────────────────────
-    # Standard LTX requires image dims divisible by the latent stride
-    # of 32. No IC-LoRA factor=2 constraint anymore since v29 dropped
-    # the IC-LoRA path. 544×960 is already aligned (17 × 30 latent).
-    width = ((width + 31) // 32) * 32
-    height = ((height + 31) // 32) * 32
+    # ─── Snap canvas dims to a multiple of 64 ─────────────────────
+    # v32 reverted to the IC-LoRA Union-Control path which has
+    # latent_downscale_factor=2.0 — meaning the latent spatial dims
+    # must be divisible by 2, which means image dims must be divisible
+    # by 32 (LTX latent stride) × 2 = 64. Without this we hit:
+    # "Latent spatial size 17x30 must be divisible by
+    # latent_downscale_factor 2.0" (17 = 544/32 is odd → fail).
+    # Snap UP so the canvas never shrinks; 544×960 → 576×960
+    # (still 9:16, latent 18×30 — both even).
+    width = ((width + 63) // 64) * 64
+    height = ((height + 63) // 64) * 64
 
     # ─── Length + fps: match the Lightricks Union-Control example ─
     # Reverted v22's "halve EmptyLTXVLatentVideo length" — that was
