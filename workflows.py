@@ -945,8 +945,20 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "scale_method": "lanczos",
         }},
 
-        # ─── IC-LoRA guide ────────────────────────────────────────
-        "330": {"class_type": "LTXAddVideoICLoRAGuide", "inputs": {
+        # ─── IC-LoRA guide (Advanced variant) ─────────────────────
+        # Switched from LTXAddVideoICLoRAGuide to LTXAddVideoICLoRAGuide-
+        # Advanced. v19-v25 all showed conditioning landing in only the
+        # first 50% of output latent slices regardless of pose length,
+        # output length, fps, or strength tweaks — suggests the regular
+        # node has a temporal-coverage quirk this Advanced version may
+        # handle differently. Advanced also exposes attention_strength
+        # and attention_mask (currently using full conditioning, no
+        # mask) which give finer control if the temporal split persists.
+        # frame_idx tooltip on Advanced says "rounded to nearest frame
+        # and wrapped modulo the number of video frames" (different from
+        # regular's "1 modulo 8" snap) — wrapping might be why coverage
+        # was bounded.
+        "330": {"class_type": "LTXAddVideoICLoRAGuideAdvanced", "inputs": {
             "positive": ["239", 0],
             "negative": ["239", 1],
             "vae": ["236", 2],
@@ -959,6 +971,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "use_tiled_encode": False,
             "tile_size": 256,
             "tile_overlap": 64,
+            "attention_strength": 1.0,
         }},
 
         # ─── Sampler chain ─────────────────────────────────────────
