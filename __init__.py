@@ -124,7 +124,23 @@ except Exception as e:
     print(f"[refresh-api-shim] outer error: {e}")
 
 
-# Required by ComfyUI's custom-node loader. Empty dicts = we expose zero
-# nodes, which is correct — we exist only for the import-time side effect.
-NODE_CLASS_MAPPINGS: dict = {}
-NODE_DISPLAY_NAME_MAPPINGS: dict = {}
+# Required by ComfyUI's custom-node loader. We register a single no-op
+# sentinel node — exposing zero nodes was indistinguishable from "ComfyUI
+# never loaded this module," but a registered node shows up in
+# /admin/comfy-status's loaded_node_count + (if added to the watchlist)
+# key_nodes_loaded. Confirms the import ran.
+class _RefreshShimSentinel:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+    RETURN_TYPES = ()
+    FUNCTION = "noop"
+    CATEGORY = "_internal/RefreshShim"
+    def noop(self):
+        return ()
+
+
+NODE_CLASS_MAPPINGS: dict = {"_RefreshShimSentinel_290700f_v2": _RefreshShimSentinel}
+NODE_DISPLAY_NAME_MAPPINGS: dict = {
+    "_RefreshShimSentinel_290700f_v2": "Refresh Shim Sentinel (delete me)",
+}
