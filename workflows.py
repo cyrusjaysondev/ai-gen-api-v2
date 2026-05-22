@@ -787,29 +787,34 @@ def build_ltx_motion_workflow(reference_video_filename: str,
     width = ((width + 63) // 64) * 64
     height = ((height + 63) // 64) * 64
 
-    # ─── Latent + pose length: matched, halved for 2× decode ─────
-    # v23 confirmed the IC-LoRA's "Conditioning frames exceed..."
-    # validation is RAW-latent based: pose_raw must be ≤ output_raw.
-    # So we cannot feed a longer pose to compensate for the temporal
-    # halving inside the IC-LoRA. Pose stays equal to the (halved)
-    # latent length.
+    # ─── Length + fps: match the Lightricks Union-Control example ─
+    # Reverted v22's "halve EmptyLTXVLatentVideo length" — that was
+    # based on a misreading of `ref0.5` (the IC-LoRA name suffix
+    # refers to SPATIAL reference scale only, not temporal; see
+    # iclora.py in ComfyUI-LTXVideo where `latent_downscale_factor`
+    # only affects the dilate width/height, not the time dim).
     #
-    # The mid-clip noise at exactly 50% in v22 isn't from temporal
-    # coverage (otherwise reducing further would extend the clean
-    # region — it didn't); it's the IC-LoRA at strength=1.0
-    # over-conditioning later latent slices and de-anchoring from the
-    # character image. We address that via strength tuning below
-    # (LTXICLoRALoaderModelOnly strength_model lowered to 0.7).
+    # The real cause of the mid-clip noise was an fps mismatch:
+    # Lightricks' official Union-Control workflow uses fps=30
+    # throughout (VHS source rate, LTXVConditioning frame_rate, and
+    # CreateVideo output fps). Our v19-v24 used fps=24 from the user
+    # request. LTXAddVideoICLoRAGuide maps pose frames to output
+    # latent slots positionally — there is no fps-aware re-sampling.
+    # With our 121-frame pose video at 24fps and the model's
+    # "expected timeline" at 30fps, the pose conditioning landed in
+    # only the first ~60% of output latent slots; the remaining
+    # slots had no control signal → colored-noise free generation.
     #
-    # Layout for user-requested length=121:
-    #   internal_length = 57   (EmptyLTXVLatentVideo, 8 raw latents)
-    #   pose_length     = 57   (VHS, matches → validation passes)
-    #   output decoded  ≈ 121 image frames @ 24fps ≈ 5s
-    internal_length = max(9, ((length // 2 - 1) // 8) * 8 + 1)
-    if internal_length < 9:
-        internal_length = 9
-    pose_length = internal_length
-    length = internal_length
+    # Fix: force fps=30 for the motion workflow regardless of the
+    # user's `fps` parameter. The output mp4 will be at 30fps —
+    # slightly different feel from 24fps but coherent throughout.
+    # ffmpeg in main.py is also overridden to extract at 30fps.
+    pose_length = length
+    # Force the IC-LoRA-required 30fps timeline. The user's `fps`
+    # parameter is accepted but overridden here — the IC-LoRA was
+    # trained at this rate and any deviation causes the conditioning
+    # to land in wrong latent slots.
+    fps = 30
 
     # ─── Resolve DWPose preprocessor input (resize) target ────────
     # DWPose works best around 512px. We resize the reference video so
@@ -843,16 +848,15 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         # wire into LTXAddVideoICLoRAGuide so the guide knows the LoRA's
         # grid size).
         #
-        # strength_model lowered to 0.7 (was 1.0 matching Lightricks'
-        # example). At 1.0 the IC-LoRA over-conditioned later latent
-        # slices and produced colored-noise collapse from ~50% of the
-        # clip onward, even with proper pose coverage. 0.7 leaves the
-        # base LTX with enough say to keep later slices coherent while
-        # still letting the IC-LoRA drive the pose-skeleton conditioning.
+        # strength_model restored to 1.0 — the v24 dip to 0.7 made
+        # things much worse (TV-static across the entire clip). The
+        # IC-LoRA needs full strength to function; the mid-clip noise
+        # we saw before is fixed by the fps=30 alignment above, not
+        # by reducing this LoRA's contribution.
         "262": {"class_type": "LTXICLoRALoaderModelOnly", "inputs": {
             "model": ["232", 0],
             "lora_name": "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
-            "strength_model": 0.7,
+            "strength_model": 1.0,
         }},
 
         # ─── Prompts ───────────────────────────────────────────────

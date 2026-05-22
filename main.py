@@ -823,13 +823,21 @@ async def ltx_motion_control(
     # validates pose_latent_slices <= output_latent_slices, so we
     # match exactly (v20's 2*length+7 hit the validation error).
     ref_frame_count = length
+    # IC-LoRA Union-Control was trained on 30fps timelines (matches
+    # Lightricks' official example which sets CreateVideo fps=30).
+    # The user's `fps` param is accepted but the motion workflow
+    # forces 30 internally — keeping the user's fps would mismatch
+    # the pose timeline against the model's expected slots and cause
+    # the mid-clip noise we saw across v19-v24. The output mp4 is
+    # therefore at 30fps regardless of the requested fps.
+    motion_fps = 30
     ffmpeg_cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-stream_loop", "-1", "-i", raw_video_path,
         "-vf", (
             f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
-            f"fps={fps}"
+            f"fps={motion_fps}"
         ),
         "-frames:v", str(ref_frame_count),
         "-an",
