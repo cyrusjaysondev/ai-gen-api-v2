@@ -1743,21 +1743,45 @@ async def admin_install_comfy_node(
         # nothing. Walk a list of broad-to-specific patterns; first match
         # wins. The supervisor relaunches within ~5s with the new node
         # registered.
-        kill_patterns = [
-            "runpod-slim/ComfyUI/.venv",   # most specific — full path inside venv
-            "ComfyUI.*main.py",             # ComfyUI followed by main.py anywhere
-            "/ComfyUI/main.py",             # works on legacy layouts
-            "python.*main.py.*--listen",   # any python main.py with the --listen flag ComfyUI uses
-        ]
-        for pat in kill_patterns:
-            rc, _ = _run(["pkill", "-9", "-f", pat])
-            if rc == 0:
-                trace.append(f"pkill matched pattern: {pat!r}")
-                restarted = True
-                break
+        # Restart by killing the :8188 port owner — same logic
+        # start_comfy.sh's STALE_PID check uses. Avoids the brittle
+        # argv-regex approach that quietly failed across all four
+        # patterns even though ComfyUI was running.
+        try:
+            ns = subprocess.run(["netstat", "-tlnp"], capture_output=True, timeout=10)
+            comfy_pid: str | None = None
+            for line in (ns.stdout or b"").decode(errors="replace").splitlines():
+                if ":8188" not in line:
+                    continue
+                tail = line.split()[-1] if line.split() else ""
+                if "/" in tail:
+                    pid_part = tail.split("/")[0]
+                    if pid_part.isdigit():
+                        comfy_pid = pid_part
+                        break
+            if comfy_pid:
+                rc, _ = _run(["kill", "-9", comfy_pid])
+                trace.append(f"kill -9 {comfy_pid} (ComfyUI :8188 owner) → exit {rc}")
+                if rc == 0:
+                    restarted = True
+            else:
+                trace.append("netstat -tlnp found no :8188 listener — "
+                             "ComfyUI may already be down")
+        except Exception as e:
+            trace.append(f"netstat-based kill failed: {e}")
+
+        # Fallback if netstat is missing: literal-substring pkill
+        # against the exact argv start_comfy.sh emits.
         if not restarted:
-            trace.append("pkill found no ComfyUI process across any pattern — "
-                         "supervisor may already be down OR cmdline shape changed")
+            rc, _ = _run([
+                "pkill", "-9", "-f",
+                "main.py --listen 0.0.0.0 --port 8188",
+            ])
+            trace.append(
+                f"pkill -9 -f 'main.py --listen 0.0.0.0 --port 8188' → exit {rc}"
+            )
+            if rc == 0:
+                restarted = True
 
     return {
         "ok": True,
@@ -1903,23 +1927,57 @@ async def admin_restart_comfyui(authorization: str = Header(default=None)):
     _require_admin(authorization)
     import subprocess
 
-    kill_patterns = [
-        "runpod-slim/ComfyUI/.venv",
-        "ComfyUI.*main.py",
-        "/ComfyUI/main.py",
-        "python.*main.py.*--listen",
-    ]
+    # Find ComfyUI by port owner (mirrors start_comfy.sh's STALE_PID
+    # logic). pkill -f against argv patterns was flaky: start_comfy.sh
+    # launches via `"$PYTHON" main.py ...` and the resolved argv[0] in
+    # /proc shaped my regexes off, so all four patterns returned exit 1
+    # while a perfectly good ComfyUI process was running. Port-owner is
+    # the one signal that's always right.
     trace: list[str] = []
     matched: str | None = None
-    for pat in kill_patterns:
-        try:
-            res = subprocess.run(["pkill", "-9", "-f", pat], capture_output=True, timeout=10)
-            trace.append(f"pkill -9 -f {pat!r} → exit {res.returncode}")
+    killed_pid: str | None = None
+    try:
+        netstat = subprocess.run(
+            ["netstat", "-tlnp"], capture_output=True, timeout=10,
+        )
+        ns_out = (netstat.stdout or b"").decode(errors="replace")
+        for line in ns_out.splitlines():
+            if ":8188 " not in line and ":8188\t" not in line and not line.rstrip().endswith(":8188"):
+                # be permissive about whitespace + look for both LISTEN
+                # rows and bound rows ending in :8188
+                if ":8188" not in line:
+                    continue
+            tail = line.split()[-1] if line.split() else ""
+            if "/" in tail:
+                pid_part = tail.split("/")[0]
+                if pid_part.isdigit():
+                    killed_pid = pid_part
+                    break
+        if killed_pid:
+            res = subprocess.run(["kill", "-9", killed_pid], capture_output=True, timeout=10)
+            trace.append(f"kill -9 {killed_pid} (port :8188 owner) → exit {res.returncode}")
             if res.returncode == 0:
-                matched = pat
-                break
+                matched = f"port:8188:pid={killed_pid}"
+        else:
+            trace.append("netstat -tlnp showed no owner for :8188")
+    except Exception as e:
+        trace.append(f"netstat path error: {e}")
+
+    # Fallback for environments without netstat: pattern-match
+    # against the literal `main.py --listen 0.0.0.0 --port 8188`
+    # string that start_comfy.sh always uses. The :8188 makes it
+    # unambiguous (won't match the FastAPI uvicorn on :7860).
+    if matched is None:
+        try:
+            res = subprocess.run(
+                ["pkill", "-9", "-f", "main.py --listen 0.0.0.0 --port 8188"],
+                capture_output=True, timeout=10,
+            )
+            trace.append(f"pkill -9 -f 'main.py --listen 0.0.0.0 --port 8188' → exit {res.returncode}")
+            if res.returncode == 0:
+                matched = "pattern:start_comfy_argv"
         except Exception as e:
-            trace.append(f"pkill -9 -f {pat!r} → error {e}")
+            trace.append(f"pkill fallback error: {e}")
 
     return {
         "ok": matched is not None,
