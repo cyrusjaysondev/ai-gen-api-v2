@@ -976,22 +976,22 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "tile_overlap": 64,
         }},
 
-        # ─── Sparse character anchors for identity consistency ────
-        # v36 had 4 anchors at strength 0.4 — clean dance + audio but
-        # face still drifted from Marco (slimmer/younger version of
-        # him, not an exact identity match). v37 doubles the anchor
-        # density (4 → 7) AND increases strength (0.4 → 0.5).
+        # ─── Sparse character anchors (back to v36's sweet spot) ──
+        # v37 used 7 anchors at strength 0.5 to fight identity drift,
+        # but it caused visible ghosting — two overlapping Marcos in
+        # the frame. Each static-pose anchor adds a "Marco standing
+        # still" signal that conflicts with the IC-LoRA's "Marco
+        # dancing" pose conditioning; too many such signals make the
+        # second character literally render in the output.
         #
-        # frame_idx values are spaced every 16 latent positions
-        # (1, 17, 33, 49, 65, 81, 97) — all 1 mod 8 which is the LTX
-        # multi-frame guide constraint. 7 anchors cover latent slots
-        # 1-12 (the trim-surviving region for length=121-257).
+        # v38 reverts to v36's 4 anchors at strength 0.4 — the user's
+        # "almost perfect" version. Slight identity drift (slimmer /
+        # younger Marco at the end), but NO ghosting. This is the
+        # current sweet spot.
         #
-        # strength=0.5 — at each anchor frame the character latent
-        # gets a 50% write that replaces half the IC-LoRA pose
-        # conditioning at that slot. Between anchors, the model
-        # interpolates appearance forward and the next anchor
-        # re-asserts Marco before drift accumulates.
+        # Eliminating the residual drift requires a fundamentally
+        # different approach (face-swap post-processing) since any
+        # static-pose anchor density above this triggers ghosting.
         "331a": {"class_type": "LTXVAddGuide", "inputs": {
             "positive": ["330", 0],
             "negative": ["330", 1],
@@ -999,7 +999,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "latent": ["330", 2],
             "image": ["238", 0],
             "frame_idx": 1,
-            "strength": 0.5,
+            "strength": 0.4,
         }},
         "331b": {"class_type": "LTXVAddGuide", "inputs": {
             "positive": ["331a", 0],
@@ -1007,8 +1007,8 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "vae": ["236", 2],
             "latent": ["331a", 2],
             "image": ["238", 0],
-            "frame_idx": 17,
-            "strength": 0.5,
+            "frame_idx": 33,
+            "strength": 0.4,
         }},
         "331c": {"class_type": "LTXVAddGuide", "inputs": {
             "positive": ["331b", 0],
@@ -1016,8 +1016,8 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "vae": ["236", 2],
             "latent": ["331b", 2],
             "image": ["238", 0],
-            "frame_idx": 33,
-            "strength": 0.5,
+            "frame_idx": 65,
+            "strength": 0.4,
         }},
         "331d": {"class_type": "LTXVAddGuide", "inputs": {
             "positive": ["331c", 0],
@@ -1025,35 +1025,8 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "vae": ["236", 2],
             "latent": ["331c", 2],
             "image": ["238", 0],
-            "frame_idx": 49,
-            "strength": 0.5,
-        }},
-        "331e": {"class_type": "LTXVAddGuide", "inputs": {
-            "positive": ["331d", 0],
-            "negative": ["331d", 1],
-            "vae": ["236", 2],
-            "latent": ["331d", 2],
-            "image": ["238", 0],
-            "frame_idx": 65,
-            "strength": 0.5,
-        }},
-        "331f": {"class_type": "LTXVAddGuide", "inputs": {
-            "positive": ["331e", 0],
-            "negative": ["331e", 1],
-            "vae": ["236", 2],
-            "latent": ["331e", 2],
-            "image": ["238", 0],
-            "frame_idx": 81,
-            "strength": 0.5,
-        }},
-        "331g": {"class_type": "LTXVAddGuide", "inputs": {
-            "positive": ["331f", 0],
-            "negative": ["331f", 1],
-            "vae": ["236", 2],
-            "latent": ["331f", 2],
-            "image": ["238", 0],
             "frame_idx": 97,
-            "strength": 0.5,
+            "strength": 0.4,
         }},
 
         # ─── Sampler chain ─────────────────────────────────────────
@@ -1066,8 +1039,8 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         # across all output frames.
         "231": {"class_type": "CFGGuider", "inputs": {
             "model": ["262", 0],
-            "positive": ["331g", 0],
-            "negative": ["331g", 1],
+            "positive": ["331d", 0],
+            "negative": ["331d", 1],
             "cfg": 1.0,
         }},
         "209": {"class_type": "KSamplerSelect", "inputs": {
@@ -1080,7 +1053,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "guider": ["231", 0],
             "sampler": ["209", 0],
             "sigmas": ["252", 0],
-            "latent_image": ["331g", 2],  # last identity anchor
+            "latent_image": ["331d", 2],  # last identity anchor
         }},
 
         # ─── Decode + colour-match + output ───────────────────────
