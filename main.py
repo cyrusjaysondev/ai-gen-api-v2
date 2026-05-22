@@ -1374,25 +1374,49 @@ def _blocklist_count() -> int:
 def _detect_comfy_root() -> str:
     """Mirror setup.sh's COMFY_ROOT detection so admin endpoints look at
     the same custom_nodes/ that setup.sh + start_comfy.sh use. Order:
-      1. COMFY_ROOT env var (set by start_api.sh via setup.sh's saved paths)
-      2. /workspace/runpod-slim/ComfyUI (slim image default)
-      3. /workspace/ComfyUI (legacy path)
-      4. Filesystem scan for any */ComfyUI/main.py under /workspace
+      1. COMFY_ROOT env var (when start_api.sh exported it)
+      2. /workspace/api/config.env — setup.sh writes COMFY_ROOT here
+      3. Known image locations (/workspace/runpod-slim/ComfyUI,
+         /workspace/ComfyUI, /ComfyUI, /app/ComfyUI, /root/ComfyUI)
+      4. Filesystem scan for any */ComfyUI/main.py under /workspace and /
     """
     import os
     env = os.environ.get("COMFY_ROOT")
     if env and Path(env).is_dir():
         return env
-    for candidate in ("/workspace/runpod-slim/ComfyUI", "/workspace/ComfyUI"):
+
+    # setup.sh writes its detected path here — most reliable source.
+    cfg_path = Path("/workspace/api/config.env")
+    if cfg_path.is_file():
+        try:
+            for line in cfg_path.read_text().splitlines():
+                if line.startswith("COMFY_ROOT="):
+                    candidate = line.split("=", 1)[1].strip().strip("'\"")
+                    if candidate and Path(candidate).is_dir():
+                        return candidate
+        except Exception:
+            pass
+
+    for candidate in (
+        "/workspace/runpod-slim/ComfyUI",
+        "/workspace/ComfyUI",
+        "/ComfyUI",
+        "/app/ComfyUI",
+        "/root/ComfyUI",
+    ):
         if Path(candidate).is_dir():
             return candidate
-    # Last-resort scan — cheap because /workspace is small at the top level.
-    try:
-        for p in Path("/workspace").rglob("ComfyUI/main.py"):
-            return str(p.parent)
-    except Exception:
-        pass
-    return "/workspace/ComfyUI"  # fall back to legacy so callers see a path
+
+    # Broader filesystem scan — caps depth so we don't recurse into models/.
+    for root in ("/workspace", "/"):
+        try:
+            for p in Path(root).glob("**/ComfyUI/main.py"):
+                # main.py at <X>/ComfyUI/main.py means X/ComfyUI is the root.
+                return str(p.parent)
+        except Exception:
+            continue
+
+    return "/workspace/ComfyUI"  # last-resort fallback so callers see a path
 
 
 @app.get("/admin/comfy-status")
