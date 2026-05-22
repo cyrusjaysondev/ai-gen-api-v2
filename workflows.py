@@ -775,11 +775,24 @@ def build_ltx_motion_workflow(reference_video_filename: str,
     distilled_lora_strength = LTX_PRESETS["fast"]["lora_strength"]  # 0.5
     sigmas = _LTX_DISTILLED_LOW_SIGMAS
 
+    # ─── Snap canvas dims to a multiple of 64 ─────────────────────
+    # Union-Control IC-LoRA has latent_downscale_factor = 2.0, meaning
+    # the guide expects the latent spatial dims to be divisible by 2.
+    # LTX's latent stride is 32 (image_dim / 32 = latent_dim), so for an
+    # even latent the image dim must be divisible by 32 * 2 = 64.
+    # Without this, the guide errors out: "Latent spatial size 17x30
+    # must be divisible by latent_downscale_factor 2.0" (17 = 544/32 is
+    # odd → fail). We snap UP to the next multiple of 64 so the canvas
+    # never shrinks; for 544×960 the user gets 576×960 (still 9:16).
+    width = ((width + 63) // 64) * 64
+    height = ((height + 63) // 64) * 64
+
     # ─── Resolve DWPose preprocessor input (resize) target ────────
     # DWPose works best around 512px. We resize the reference video so
     # the shorter dimension is the SHORTER of (canvas-width, canvas-
     # height) — that way pose tracking has resolution while staying
-    # cheap. The output then gets resized to the canvas dims directly.
+    # cheap. The output then gets resized to a multiple of 64 (same
+    # grid as the canvas) so its encoded latent is even-divisible.
     dw_shorter = min(width, height)
     if dw_shorter < 384:
         dw_shorter = 384  # floor — below this DWPose loses confidence
@@ -878,15 +891,17 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "pose_estimator": "dw-ll_ucoco_384_bs5.torchscript.pt",
             "scale_stick_for_xinsr_cn": "disable",
         }},
-        # Resize the skeleton frames to a multiple of 32 so they align
-        # with the latent grid. Union-Control's latent_downscale_factor
-        # is 1.0 → multiple = 32. (The official workflow computes this
-        # dynamically with SimpleMath+ but that node isn't installed
-        # here; for Union-Control specifically, 32 is correct.)
+        # Resize the skeleton frames to a multiple of 64 so the pose
+        # video's encoded latent has even spatial dims (Union-Control
+        # IC-LoRA's latent_downscale_factor is 2 → image dim must be
+        # divisible by 32*2 = 64). The official workflow computes this
+        # dynamically via SimpleMath+ (`a*32` where `a` is the loader's
+        # latent_downscale_factor output), but SimpleMath+ isn't on
+        # this pod — 64 is the right hardcoded value for Union-Control.
         "321": {"class_type": "ResizeImageMaskNode", "inputs": {
             "input": ["320", 0],
             "resize_type": "scale to multiple",
-            "resize_type.multiple": 32,
+            "resize_type.multiple": 64,
             "scale_method": "lanczos",
         }},
 
