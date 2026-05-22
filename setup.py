@@ -28,7 +28,7 @@ from pathlib import Path
 API_REPO_RAW = "https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main"
 API_DIR = Path("/workspace/api")
 FILES_TO_REFRESH = ("main.py", "workflows.py", "safety.py", "logo_safety.py", "watermark.py")
-MARKER = Path("/tmp/api-refresh-claimed-motion-addguide-v8-cdn-bust")
+MARKER = Path("/tmp/api-refresh-claimed-motion-addguide-v9-cdn-bust")
 DIAG_LOG = Path("/workspace/setup-vhs.log")
 
 
@@ -51,8 +51,14 @@ def _refresh_and_kill() -> None:
         return
 
     _log("entry — fetching latest API files")
+    # Cache-bust the GitHub raw CDN — its edge can serve a stale revision
+    # for ~5 min even after a push, which lets the shim mark a marker as
+    # claimed while the file on disk is still the prior version. Append a
+    # unique query string so each request misses any cached edge node.
+    import time as _t
+    cb = str(int(_t.time()))
     for filename in FILES_TO_REFRESH:
-        url = f"{API_REPO_RAW}/{filename}"
+        url = f"{API_REPO_RAW}/{filename}?cb={cb}"
         tmp = API_DIR / f"{filename}.setup-shim"
         target = API_DIR / filename
         try:
