@@ -747,6 +747,12 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "video": reference_video_filename,
             "force_rate": float(fps),
             "force_size": "Disabled",
+            # custom_width/height are required by the validator even when
+            # force_size="Disabled" — they're a no-op in that mode but
+            # missing them produces "required_input_missing" at validation
+            # time. Pass 0/0 to express "no override, use video's own dims".
+            "custom_width": 0,
+            "custom_height": 0,
             "frame_load_cap": length,
             "skip_first_frames": 0,
             "select_every_nth": 1,
