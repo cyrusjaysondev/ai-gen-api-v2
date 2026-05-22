@@ -787,17 +787,29 @@ def build_ltx_motion_workflow(reference_video_filename: str,
     width = ((width + 63) // 64) * 64
     height = ((height + 63) // 64) * 64
 
-    # ─── Pose-video length: same as latent length ────────────────
-    # The IC-LoRA guide validates pose_latent_slices <= output_latent_
-    # slices. Output latent has (length-1)/8+1 slices; pose video at
-    # `length` image frames also has (length-1)/8+1 slices. Equal.
-    # The 2× theory from v20 was wrong (pose=249 with output=121
-    # triggered "Conditioning frames exceed the length of the latent
-    # sequence"). The 2× output frame count we observe in the encoded
-    # mp4 is something else — likely an LTX VAE temporal upscale at
-    # decode time. It doesn't affect the LATENT level so pose=length
-    # is the right matching.
-    pose_length = length
+    # ─── Halve the latent length to match LTX 2.3's 2× decode ────
+    # Empirical: LTX 2.3 distilled-384 VAE decodes ~2 image frames per
+    # latent slice. A length=121 EmptyLTXVLatentVideo produces 249
+    # output image frames (10.4s @ 24fps), while the pose conditioning
+    # only covers (length-1)/8+1 = 16 latent slices = first ~5s of
+    # output. Result: clean Marco-dancing for the first half, noise
+    # for the second half (verified by frame-by-frame inspection).
+    #
+    # Fix: halve the EmptyLTXVLatentVideo length so the model's 2×
+    # decode produces ~length output image frames. The pose still
+    # equals the (halved) latent length, so conditioning covers the
+    # whole output. For user-requested length=121 → internal=57,
+    # output ≈ 114 image frames @ 24fps ≈ 4.75s (close enough to
+    # 5s that the user gets what they expect, and FULLY coherent).
+    internal_length = max(9, ((length // 2 - 1) // 8) * 8 + 1)
+    if internal_length < 9:
+        internal_length = 9
+    pose_length = internal_length
+    # Rebind `length` so the rest of the workflow uses the internal
+    # value (EmptyLTXVLatentVideo gets internal_length, etc.). This
+    # confines the halving to motion control — other endpoints keep
+    # their direct length=output_frames semantics.
+    length = internal_length
 
     # ─── Resolve DWPose preprocessor input (resize) target ────────
     # DWPose works best around 512px. We resize the reference video so
