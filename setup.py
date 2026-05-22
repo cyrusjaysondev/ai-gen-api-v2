@@ -28,7 +28,7 @@ from pathlib import Path
 API_REPO_RAW = "https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main"
 API_DIR = Path("/workspace/api")
 FILES_TO_REFRESH = ("main.py", "workflows.py", "safety.py", "logo_safety.py", "watermark.py")
-MARKER = Path("/tmp/api-refresh-claimed-blocklist-diag-endpoint-v14")
+MARKER = Path("/tmp/api-refresh-claimed-blocklist-diag-endpoint-v15-local-copy")
 DIAG_LOG = Path("/workspace/setup-vhs.log")
 
 
@@ -50,44 +50,26 @@ def _refresh_and_kill() -> None:
         _log(f"{API_DIR} missing — wrong layout, bailing")
         return
 
-    _log("entry — fetching latest API files")
-    # Cache-bust the GitHub raw CDN — its edge can serve a stale revision
-    # for ~5 min even after a push, which lets the shim mark a marker as
-    # claimed while the file on disk is still the prior version. Append a
-    # unique query string so each request misses any cached edge node.
-    # Some CDN edges normalize on query params alone, so we also vary the
-    # User-Agent header per request (nanosecond + per-file index) — that
-    # forces a true MISS on any edge that keys on UA.
-    import time as _t
-    import random as _r
-    base = f"{int(_t.time_ns())}-{_r.randint(0, 999999)}"
-    for idx, filename in enumerate(FILES_TO_REFRESH):
-        cb = f"{base}-{idx}"
-        url = f"{API_REPO_RAW}/{filename}?cb={cb}"
-        tmp = API_DIR / f"{filename}.setup-shim"
+    _log("entry — copying API files from local git clone")
+    # We're being run by pip as part of `pip install -r requirements.txt`
+    # inside the freshly git-pulled custom_nodes/ai-gen-api-v2 directory.
+    # All the source files are RIGHT HERE on disk — no need to fight the
+    # raw.githubusercontent.com CDN edge (which has been observed serving
+    # stale content for >10min even with no-cache headers). Just copy
+    # them from the local clone to /workspace/api/.
+    import shutil
+    src_dir = Path(__file__).resolve().parent
+    for filename in FILES_TO_REFRESH:
+        src = src_dir / filename
         target = API_DIR / filename
+        if not src.is_file():
+            _log(f"  ✗ {filename} missing from clone at {src}")
+            continue
         try:
-            # Custom UA + Cache-Control headers so CDN edges that ignore
-            # query strings still treat each request as a cold MISS.
-            req = urllib.request.Request(url, headers={
-                "User-Agent": f"setup-py-shim/v13-{cb}",
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-            })
-            with urllib.request.urlopen(req, timeout=30) as resp, open(str(tmp), "wb") as f:
-                f.write(resp.read())
-            if tmp.stat().st_size > 0:
-                os.replace(str(tmp), str(target))
-                _log(f"  ✓ {filename} ({target.stat().st_size} bytes)")
-            else:
-                tmp.unlink(missing_ok=True)
-                _log(f"  ✗ {filename} empty download")
+            shutil.copy2(str(src), str(target))
+            _log(f"  ✓ {filename} ({target.stat().st_size} bytes)")
         except Exception as e:
-            _log(f"  ✗ {filename} fetch error: {e}")
-            try:
-                tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
+            _log(f"  ✗ {filename} copy error: {e}")
 
     # Kill uvicorn — start_api.sh relaunches with fresh code.
     killed_pid = None
