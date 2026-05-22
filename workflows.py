@@ -945,17 +945,23 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "scale_method": "lanczos",
         }},
 
-        # ─── IC-LoRA guide (Advanced variant) ─────────────────────
-        # latent_downscale_factor HARDCODED to 1.0 (not wired from the
-        # loader's slot 1 which outputs 2.0). v19-v26 all collapsed to
-        # noise at exactly 50% of the output — pose video covers the
-        # first half of output latent slices, the second half has no
-        # conditioning. The agent's research said latent_downscale_factor
-        # only halves spatial dims, but empirically the temporal coverage
-        # is also halving. Overriding to 1.0 forces "no downscale" which
-        # may either (a) fix the coverage at the cost of spatial detail,
-        # or (b) error out at validation because the IC-LoRA was trained
-        # with factor=2. If (b), next try is stacked guides.
+        # ─── IC-LoRA guide: STACKED to cover full output latent ───
+        # v27 confirmed the IC-LoRA at latent_downscale_factor=2.0 (its
+        # trained value) halves the temporal coverage of each guide.
+        # Overriding factor to 1.0 in v27 fixed the coverage but the
+        # output was just a clean stick figure — the IC-LoRA's
+        # character-rendering step depends on factor=2.0.
+        #
+        # Fix: keep factor=2.0 (so the IC-LoRA renders the character),
+        # but STACK TWO guides at different frame_idx so their 8-slice
+        # write windows tile the full 16-slice output latent:
+        #   Guide 1 (node 330): frame_idx=0  → writes output slices 0-7
+        #   Guide 2 (node 331): frame_idx=64 → writes output slices 8-15
+        # frame_idx=64 = 8*8, so it maps to output latent slot 8.
+        # Validation check `latent_idx + guide.shape[2] <= latent_length`:
+        # 8 + 8 = 16 ≤ 16 → passes. Both guides feed the same DWPose
+        # video — they share motion, just write to different temporal
+        # positions of the output latent.
         "330": {"class_type": "LTXAddVideoICLoRAGuideAdvanced", "inputs": {
             "positive": ["239", 0],
             "negative": ["239", 1],
@@ -964,7 +970,25 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "image": ["321", 0],               # DWPose skeleton video
             "frame_idx": 0,
             "strength": motion_strength,
-            "latent_downscale_factor": 1.0,    # HARDCODED, was ["262", 1]
+            "latent_downscale_factor": ["262", 1],  # 2.0 from loader
+            "crop": "disabled",
+            "use_tiled_encode": False,
+            "tile_size": 256,
+            "tile_overlap": 64,
+            "attention_strength": 1.0,
+        }},
+        # Guide 2 stacked on Guide 1's output — fills the second half
+        # of the output latent that the single-guide setup left
+        # unconditioned (hence the 50%-onward noise we saw in v19-v26).
+        "331": {"class_type": "LTXAddVideoICLoRAGuideAdvanced", "inputs": {
+            "positive": ["330", 0],
+            "negative": ["330", 1],
+            "vae": ["236", 2],
+            "latent": ["330", 2],              # build on Guide 1's latent
+            "image": ["321", 0],               # same DWPose skeleton
+            "frame_idx": 64,                   # output latent slot 8 (8×8)
+            "strength": motion_strength,
+            "latent_downscale_factor": ["262", 1],
             "crop": "disabled",
             "use_tiled_encode": False,
             "tile_size": 256,
@@ -973,10 +997,16 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         }},
 
         # ─── Sampler chain ─────────────────────────────────────────
+        # Read from Guide 2 (node 331) — the second stacked IC-LoRA
+        # guide whose latent has both Guide 1's first-half write AND
+        # Guide 2's second-half write composed together. Conditioning
+        # outputs also come from 331 (which inherits Guide 1's
+        # additive conditioning composition via its positive/negative
+        # inputs being wired from 330's outputs).
         "231": {"class_type": "CFGGuider", "inputs": {
             "model": ["262", 0],              # IC-LoRA-loaded model
-            "positive": ["330", 0],
-            "negative": ["330", 1],
+            "positive": ["331", 0],
+            "negative": ["331", 1],
             "cfg": 1.0,
         }},
         "209": {"class_type": "KSamplerSelect", "inputs": {
@@ -989,7 +1019,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "guider": ["231", 0],
             "sampler": ["209", 0],
             "sigmas": ["252", 0],
-            "latent_image": ["330", 2],       # IC-LoRA guide's latent output
+            "latent_image": ["331", 2],       # Guide 2's latent (full coverage)
         }},
 
         # ─── Decode + colour-match + output ───────────────────────
