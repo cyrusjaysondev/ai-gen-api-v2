@@ -881,15 +881,11 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "resize_type.width": width, "resize_type.height": height,
             "resize_type.crop": "center", "scale_method": "lanczos",
         }},
-        # Multi-frame character batch — repeat the character image
-        # `length` times so a downstream LTXVAddGuide can inject
-        # appearance conditioning at EVERY output frame, fighting the
-        # identity drift we saw in v34 (Marco at frame 0 → unknown man
-        # with beard + headband at frame 5).
-        "332": {"class_type": "RepeatImageBatch", "inputs": {
-            "image": ["238", 0],
-            "amount": length,
-        }},
+        # No RepeatImageBatch — v35 hit OOM trying to VAE-encode 257
+        # character frames at once. v36 uses sparse single-frame
+        # anchors (see nodes 331a-331e below) instead, each a single
+        # character image at a different frame_idx. Tiny VAE memory
+        # footprint, same identity-reinforcement effect.
         "228": {"class_type": "EmptyLTXVLatentVideo", "inputs": {
             "width": width, "height": height, "length": length, "batch_size": 1,
         }},
@@ -980,27 +976,63 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "tile_overlap": 64,
         }},
 
-        # ─── Character-batch guide stacked on IC-LoRA output ──────
-        # v34 shipped clean ~6s output but identity drifted across the
-        # clip — Marco at frame 0, a different person with beard +
-        # headband by frame 5. LTXVImgToVideoConditionOnly only
-        # anchors frame 0; the model interpolates appearance forward
-        # and drifts because the IC-LoRA pose conditioning has no
-        # identity info (skeleton bones don't carry face / clothing).
+        # ─── Sparse character anchors for identity consistency ────
+        # v34 shipped clean ~6s output but identity drifted — Marco at
+        # frame 0, bearded stranger with headband at frame 5.
+        # v35 tried a full-length RepeatImageBatch but OOM'd at 257
+        # character frames VAE-encoded at once.
+        # v36 stacks SINGLE-FRAME LTXVAddGuide calls at sparse frame_idx
+        # positions across the clip. Each guide encodes just one image,
+        # so VAE memory is trivial. The model sees the character image
+        # re-asserted every ~32 latent frames, which fights the drift
+        # without requiring multi-frame VAE encoding.
         #
-        # Fix: inject the character image at EVERY output frame via a
-        # standard LTXVAddGuide fed by RepeatImageBatch (node 332).
-        # Strength 0.3 — low enough that the IC-LoRA's pose still
-        # dominates the motion structure, high enough to keep face
-        # and clothing locked to the character image throughout.
-        "331": {"class_type": "LTXVAddGuide", "inputs": {
-            "positive": ["330", 0],   # build on IC-LoRA guide's output
+        # frame_idx values: 1, 33, 65, 97 (all valid: 1 mod 8). 4
+        # anchors cover up to latent slot ~12, which is the surviving
+        # region after the 40% trim for length=121 (covers all of it)
+        # and length=257 (covers 36% of raw = the trimmed region).
+        #
+        # strength=0.4 per anchor. Stacking is additive in conditioning
+        # but last-wins for latent writes at the anchor frame, so the
+        # character latent gets written at each anchor frame with full
+        # strength 0.4 (replaces 40% of the IC-LoRA pose conditioning
+        # at that one latent slot — enough to lock identity without
+        # disrupting motion).
+        "331a": {"class_type": "LTXVAddGuide", "inputs": {
+            "positive": ["330", 0],
             "negative": ["330", 1],
             "vae": ["236", 2],
             "latent": ["330", 2],
-            "image": ["332", 0],      # character image × length frames
-            "frame_idx": 0,
-            "strength": 0.3,
+            "image": ["238", 0],  # single character image
+            "frame_idx": 1,
+            "strength": 0.4,
+        }},
+        "331b": {"class_type": "LTXVAddGuide", "inputs": {
+            "positive": ["331a", 0],
+            "negative": ["331a", 1],
+            "vae": ["236", 2],
+            "latent": ["331a", 2],
+            "image": ["238", 0],
+            "frame_idx": 33,
+            "strength": 0.4,
+        }},
+        "331c": {"class_type": "LTXVAddGuide", "inputs": {
+            "positive": ["331b", 0],
+            "negative": ["331b", 1],
+            "vae": ["236", 2],
+            "latent": ["331b", 2],
+            "image": ["238", 0],
+            "frame_idx": 65,
+            "strength": 0.4,
+        }},
+        "331d": {"class_type": "LTXVAddGuide", "inputs": {
+            "positive": ["331c", 0],
+            "negative": ["331c", 1],
+            "vae": ["236", 2],
+            "latent": ["331c", 2],
+            "image": ["238", 0],
+            "frame_idx": 97,
+            "strength": 0.4,
         }},
 
         # ─── Sampler chain ─────────────────────────────────────────
@@ -1013,8 +1045,8 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         # across all output frames.
         "231": {"class_type": "CFGGuider", "inputs": {
             "model": ["262", 0],
-            "positive": ["331", 0],
-            "negative": ["331", 1],
+            "positive": ["331d", 0],
+            "negative": ["331d", 1],
             "cfg": 1.0,
         }},
         "209": {"class_type": "KSamplerSelect", "inputs": {
@@ -1027,7 +1059,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "guider": ["231", 0],
             "sampler": ["209", 0],
             "sigmas": ["252", 0],
-            "latent_image": ["331", 2],   # identity-reinforced latent
+            "latent_image": ["331d", 2],  # last identity anchor
         }},
 
         # ─── Decode + colour-match + output ───────────────────────
