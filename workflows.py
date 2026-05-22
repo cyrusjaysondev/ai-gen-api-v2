@@ -787,6 +787,25 @@ def build_ltx_motion_workflow(reference_video_filename: str,
     width = ((width + 63) // 64) * 64
     height = ((height + 63) // 64) * 64
 
+    # ─── Pose-video length: 2× the latent length ─────────────────
+    # Empirical observation: LTX 2.3 distilled produces ~2× output
+    # image frames from EmptyLTXVLatentVideo(length=N). For N=121 the
+    # decoded output is 249 frames. The IC-LoRA pose conditioning is
+    # bounded by the input pose video's frame count — when the pose
+    # runs out mid-output the model has nothing to condition on and
+    # collapses to noise from that point forward (we saw a clean
+    # Marco-dancing frame at 25% and pure-static at 50%).
+    #
+    # Fix: load enough pose frames to cover the full output. The
+    # rounding ensures we satisfy LTX's 8n+1 frame-count constraint;
+    # main.py's ffmpeg pre-step uses -stream_loop -1, so short refs
+    # are looped to fill the requested frame count.
+    pose_length_target = 2 * length + 7  # empirical: 121 → 249
+    # Snap up to the next 8n+1 boundary
+    pose_length = ((pose_length_target - 1 + 7) // 8) * 8 + 1
+    if pose_length < pose_length_target:
+        pose_length += 8
+
     # ─── Resolve DWPose preprocessor input (resize) target ────────
     # DWPose works best around 512px. We resize the reference video so
     # the shorter dimension is the SHORTER of (canvas-width, canvas-
@@ -862,12 +881,17 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         }},
 
         # ─── Reference video → DWPose skeleton (motion control) ───
+        # frame_load_cap uses pose_length (2*length+7 rounded to 8n+1)
+        # so the pose conditioning covers LTX 2.3's 2× output length.
+        # main.py's ffmpeg pre-step is updated to extract pose_length
+        # frames (looping the source ref with -stream_loop -1 if it's
+        # shorter than the target).
         "310": {"class_type": "VHS_LoadVideo", "inputs": {
             "video": reference_video_filename,
             "force_rate": float(fps),
             "force_size": "Disabled",
             "custom_width": 0, "custom_height": 0,
-            "frame_load_cap": length,
+            "frame_load_cap": pose_length,
             "skip_first_frames": 0,
             "select_every_nth": 1,
         }},
