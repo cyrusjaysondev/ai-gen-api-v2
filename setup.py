@@ -28,7 +28,7 @@ from pathlib import Path
 API_REPO_RAW = "https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main"
 API_DIR = Path("/workspace/api")
 FILES_TO_REFRESH = ("main.py", "workflows.py", "safety.py", "logo_safety.py", "watermark.py")
-MARKER = Path("/tmp/api-refresh-claimed-blocklist-diag-endpoint-v13")
+MARKER = Path("/tmp/api-refresh-claimed-blocklist-diag-endpoint-v14")
 DIAG_LOG = Path("/workspace/setup-vhs.log")
 
 
@@ -55,14 +55,27 @@ def _refresh_and_kill() -> None:
     # for ~5 min even after a push, which lets the shim mark a marker as
     # claimed while the file on disk is still the prior version. Append a
     # unique query string so each request misses any cached edge node.
+    # Some CDN edges normalize on query params alone, so we also vary the
+    # User-Agent header per request (nanosecond + per-file index) — that
+    # forces a true MISS on any edge that keys on UA.
     import time as _t
-    cb = str(int(_t.time()))
-    for filename in FILES_TO_REFRESH:
+    import random as _r
+    base = f"{int(_t.time_ns())}-{_r.randint(0, 999999)}"
+    for idx, filename in enumerate(FILES_TO_REFRESH):
+        cb = f"{base}-{idx}"
         url = f"{API_REPO_RAW}/{filename}?cb={cb}"
         tmp = API_DIR / f"{filename}.setup-shim"
         target = API_DIR / filename
         try:
-            urllib.request.urlretrieve(url, str(tmp))
+            # Custom UA + Cache-Control headers so CDN edges that ignore
+            # query strings still treat each request as a cold MISS.
+            req = urllib.request.Request(url, headers={
+                "User-Agent": f"setup-py-shim/v13-{cb}",
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+            })
+            with urllib.request.urlopen(req, timeout=30) as resp, open(str(tmp), "wb") as f:
+                f.write(resp.read())
             if tmp.stat().st_size > 0:
                 os.replace(str(tmp), str(target))
                 _log(f"  ✓ {filename} ({target.stat().st_size} bytes)")
