@@ -854,25 +854,27 @@ def build_ltx_motion_workflow(reference_video_filename: str,
 
     if two_pass:
         # Two-pass refine — re-apply guides into the upsampled latent.
-        # Refine pass uses slightly higher identity strength (matches i2v's
-        # refine_strength), motion stays the same.
+        # Same swap-order discipline as the first pass (reference first,
+        # then character) so identity wins at frame 0 here too. Refine
+        # uses slightly higher identity strength (refine_strength = min(1,
+        # inplace_strength + 0.3)), motion strength is unchanged.
         workflow["340"] = {"class_type": "LTXVAddGuide", "inputs": {
             "positive": ["239", 0],
             "negative": ["239", 1],
             "vae": ["236", 2],
             "latent": ["253", 0],
-            "image": ["248", 0],
+            "image": ["315", 0],
             "frame_idx": 0,
-            "strength": refine_strength,
+            "strength": motion_strength,
         }}
         workflow["341"] = {"class_type": "LTXVAddGuide", "inputs": {
             "positive": ["340", 0],
             "negative": ["340", 1],
             "vae": ["236", 2],
             "latent": ["340", 2],
-            "image": ["315", 0],
+            "image": ["248", 0],
             "frame_idx": 0,
-            "strength": motion_strength,
+            "strength": refine_strength,
         }}
         # ltx_base_nodes' refine sampler nodes are conventionally at 218/220.
         # Wire them to use the second-stage guide outputs.
