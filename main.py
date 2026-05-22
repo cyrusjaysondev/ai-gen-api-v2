@@ -1741,6 +1741,49 @@ async def admin_refresh_api_code(authorization: str = Header(default=None)):
     }
 
 
+@app.get("/admin/comfy-objects")
+async def admin_comfy_objects(
+    filter: str = "",
+    show_inputs: bool = False,
+    authorization: str = Header(default=None),
+):
+    """Return the names (or full schema) of every node type ComfyUI's
+    currently exposing via /object_info. Useful when /admin/comfy-status's
+    hardcoded `key_nodes_loaded` list doesn't cover what you need to find.
+
+    Query params:
+      filter      Case-insensitive substring filter on node names.
+      show_inputs If true, return each node's input/output schema too
+                  (heavyweight — only for the specific node you're
+                  investigating). False returns just the name list.
+    """
+    _require_admin(authorization)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{COMFYUI_URL}/object_info")
+        if resp.status_code != 200:
+            raise HTTPException(503, f"ComfyUI /object_info returned {resp.status_code}")
+        data = resp.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(503, f"could not reach ComfyUI: {e}")
+
+    names = sorted(data.keys())
+    if filter:
+        f_lower = filter.lower()
+        names = [n for n in names if f_lower in n.lower()]
+
+    if not show_inputs:
+        return {"count": len(names), "filter": filter, "names": names}
+
+    return {
+        "count": len(names),
+        "filter": filter,
+        "nodes": {n: data[n] for n in names},
+    }
+
+
 @app.post("/admin/restart-comfyui")
 async def admin_restart_comfyui(authorization: str = Header(default=None)):
     """Kill ComfyUI so start_comfy.sh's supervisor relaunches it.
