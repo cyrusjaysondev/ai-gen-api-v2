@@ -1,3 +1,4 @@
+import asyncio
 import re
 import subprocess
 import uuid, json, httpx, os
@@ -148,9 +149,62 @@ def _extract_video_thumbnail(video_path: Path) -> Path | None:
 # Core job runner
 # ─────────────────────────────────────────────
 
+def _mux_reference_audio(video_path: Path, audio_source: Path) -> tuple[bool, str]:
+    """Replace the audio track on `video_path` with the audio from
+    `audio_source`. Returns (changed, message). `changed` is True only if
+    the file on disk was actually rewritten with audio.
+
+    Kling-style behavior: if the source audio is shorter than the output
+    video, loop it (-stream_loop -1). If longer, trim to the video's
+    duration (-shortest). If the source has no audio stream at all, this
+    is a no-op (caller's `audio=true` is silently honored as best-effort).
+    """
+    import subprocess
+    if not audio_source.exists():
+        return False, "audio source missing"
+
+    # Probe — ffprobe is faster than letting ffmpeg discover mid-encode.
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0",
+             str(audio_source)],
+            capture_output=True, timeout=15,
+        )
+    except Exception as e:
+        return False, f"ffprobe error: {e}"
+    if probe.returncode != 0 or b"audio" not in probe.stdout:
+        return False, "reference has no audio track"
+
+    # Write to a sibling temp then atomic replace — never half-mutate the
+    # output file while the URL is already advertised.
+    tmp_out = video_path.with_suffix(video_path.suffix + ".muxing")
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", str(video_path),
+        "-stream_loop", "-1", "-i", str(audio_source),
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-shortest",
+        str(tmp_out),
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, timeout=120)
+    except Exception as e:
+        tmp_out.unlink(missing_ok=True)
+        return False, f"ffmpeg error: {e}"
+    if res.returncode != 0 or not tmp_out.exists() or tmp_out.stat().st_size == 0:
+        tmp_out.unlink(missing_ok=True)
+        err = (res.stderr or b"").decode(errors="replace")[-300:]
+        return False, f"ffmpeg failed: {err}"
+    os.replace(str(tmp_out), str(video_path))
+    return True, "ok"
+
+
 async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                   watermark_text: str | None = None,
-                  watermark_image: bool = False):
+                  watermark_image: bool = False,
+                  audio_source_path: str | None = None):
     jobs[job_id] = {**jobs.get(job_id, {}), "status": "processing", "started_at": datetime.now(timezone.utc).isoformat()}
     try:
         client_id = str(uuid.uuid4())
@@ -205,6 +259,24 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                             url = f"{BASE_URL}/image/{filename}"
                         else:
                             url = f"{BASE_URL}/video/{filename}"
+                        # Optional reference-audio mux — only used by
+                        # /ltx/motion right now. Runs BEFORE watermark so
+                        # the (re-encoded) watermark video carries the
+                        # muxed audio too. Non-fatal: if mux fails we
+                        # still return the silent video.
+                        audio_mux_warning: str | None = None
+                        if audio_source_path and ext in _VIDEO_EXTS:
+                            try:
+                                ok, msg = await asyncio.to_thread(
+                                    _mux_reference_audio, path, Path(audio_source_path),
+                                )
+                                if not ok:
+                                    audio_mux_warning = msg
+                                    print(f"[{job_id}] audio mux skipped: {msg}")
+                            except Exception as mux_err:
+                                audio_mux_warning = str(mux_err)
+                                print(f"[{job_id}] audio mux raised: {mux_err}")
+
                         # Optional watermark — text and/or logo. Both run in
                         # place. Failures don't nuke the job; the
                         # unwatermarked file is still valid output.
@@ -249,6 +321,8 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                             completed["thumbnail_url"] = thumbnail_url
                         if wm_warnings:
                             completed["watermark_warning"] = " | ".join(wm_warnings)
+                        if audio_mux_warning:
+                            completed["audio_warning"] = audio_mux_warning
                         jobs[job_id] = completed
                         return
 
@@ -656,7 +730,7 @@ async def ltx_motion_control(
     length: int = Form(121, description="Number of output frames (also caps reference-video frames pulled in). 97≈4s, 121≈5s, 161≈6.7s @24fps."),
     fps: int = Form(24, description="Frames per second for both reference decode and output."),
     seed: int = Form(-1),
-    audio: bool = Form(False),
+    audio: bool = Form(False, description="Carry the reference video's original audio track onto the output (Kling-style). If the reference is shorter than the output, audio loops to fill. If the reference has no audio, this is a silent no-op. We do NOT use LTX's audio synthesis path here — the reference audio is muxed via ffmpeg post-generation."),
     enhance_prompt: bool = Form(True, description="Rewrite the prompt via Gemma using the character image as visual context. Recommended ON unless you've written a long detailed motion description yourself."),
     inplace_strength: float = Form(0.5, ge=0.0, le=1.0, description="Identity-anchor strength for LTXVAddGuide on the character image. 1.0 = locks first frame to character image (identity dominates, motion fights it). 0.5 = balanced. 0.1-0.2 = motion dominates (best dance match, identity drift possible). 0.0 = no identity anchor."),
     motion_strength: float = Form(1.0, ge=0.0, le=1.0, description="LTXVAddGuide strength for the reference video. 1.0 = full motion conditioning (recommended). <1.0 attenuates."),
@@ -668,13 +742,19 @@ async def ltx_motion_control(
     Pipeline:
       1. Save uploaded reference video + character image to ComfyUI input dir.
       2. ffmpeg normalize the reference: resample to `fps`, trim to `length`
-         frames, downscale to fit the target canvas (saves VAE encode time
-         + VRAM for refs that arrive as 4K phone clips).
+         frames, downscale to fit the target canvas, strip audio (saves
+         VAE-encode time + VRAM for refs that arrive as 4K phone clips).
       3. Build the LTX motion workflow — VHS_LoadVideo reads the normalized
          clip, the LTX VAE encodes its frames into a motion latent,
-         LTXVImgToVideoInplace mixes the character image identity in, and
-         the standard LTX sampler denoises toward the prompt + image.
+         LTXVAddGuide mixes the character image identity in, and the
+         standard LTX sampler denoises toward the prompt + image.
       4. Enqueue as a background job; client polls /status/<job_id>.
+      5. (If audio=True) After ComfyUI returns the silent output video,
+         ffmpeg-mux the ORIGINAL reference's audio onto it — looping the
+         audio with -stream_loop -1 if the source is shorter than the
+         output, trimming with -shortest. The LTX audio-synthesis path is
+         NOT used here — Kling-style carry-over of the source audio is
+         what users expect from a motion-control endpoint.
     """
     if preset not in LTX_PRESETS:
         raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
@@ -764,8 +844,12 @@ async def ltx_motion_control(
         Path(img_path).unlink(missing_ok=True)
         raise HTTPException(408, "reference video normalization timed out (>120s) — try a shorter / lower-res upload")
 
-    # Raw upload no longer needed once we have the normalized clip.
-    Path(raw_video_path).unlink(missing_ok=True)
+    # The raw upload is the source-of-truth for audio. If audio=True we
+    # need to hold onto it past the workflow run so run_job's audio mux
+    # step can pull its audio track. cleanup_paths gets it appended below
+    # so it's deleted after the job completes either way.
+    if not audio:
+        Path(raw_video_path).unlink(missing_ok=True)
 
     # Workflow selection — VHS path is faster (1 node loads N frames in
     # one shot) but requires ComfyUI-VideoHelperSuite. Fallback path
@@ -786,15 +870,24 @@ async def ltx_motion_control(
         print(f"[ltx/motion] object_info probe failed: {e} — using no-VHS path")
 
     cleanup_paths: list[str] = [img_path]
+    # When audio=True we held onto raw_video_path above so run_job can
+    # mux its audio onto the output. Add it to cleanup so it's removed
+    # after the job (success OR failure) is done.
+    if audio:
+        cleanup_paths.append(raw_video_path)
     if use_vhs:
         print(f"[ltx/motion] using VHS path (VHS_LoadVideo available)")
         cleanup_paths.append(ref_video_path)
+        # Force workflow audio=False — LTX's audio synthesis path would
+        # generate a fresh soundtrack, but for motion control users want
+        # the REFERENCE's audio carried over. We mux it post-generation
+        # in run_job via _mux_reference_audio.
         workflow = build_ltx_motion_workflow(
             reference_video_filename=ref_video_filename,
             character_image_filename=img_filename,
             prompt=prompt, negative_prompt=negative_prompt,
             width=width, height=height, length=length, fps=fps, seed=seed,
-            preset=preset, audio=audio, enhance_prompt=enhance_prompt,
+            preset=preset, audio=False, enhance_prompt=enhance_prompt,
             inplace_strength=inplace_strength, motion_strength=motion_strength,
         )
     else:
@@ -839,23 +932,33 @@ async def ltx_motion_control(
         # Original ref video is now redundant — we've got the frames.
         Path(ref_video_path).unlink(missing_ok=True)
 
+        # Same audio=False discipline as the VHS path — we mux ref audio
+        # after generation rather than synthesizing.
         workflow = build_ltx_motion_workflow_no_vhs(
             reference_frame_filenames=frame_filenames,
             character_image_filename=img_filename,
             prompt=prompt, negative_prompt=negative_prompt,
             width=width, height=height, length=length, fps=fps, seed=seed,
-            preset=preset, audio=audio, enhance_prompt=enhance_prompt,
+            preset=preset, audio=False, enhance_prompt=enhance_prompt,
             inplace_strength=inplace_strength, motion_strength=motion_strength,
         )
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    background_tasks.add_task(run_job, job_id, workflow, cleanup_paths, watermark, watermark_image)
+    # audio_source_path is only set when audio=True — that triggers
+    # _mux_reference_audio inside run_job to carry the reference's
+    # original audio onto the silent video LTX produced.
+    audio_source_path = raw_video_path if audio else None
+    background_tasks.add_task(
+        run_job, job_id, workflow, cleanup_paths, watermark, watermark_image,
+        audio_source_path,
+    )
     return {
         "job_id": job_id, "status": "queued", "model": "ltx-2.3-22b",
         "poll_url": f"{BASE_URL}/status/{job_id}",
         "workflow_path": "vhs" if use_vhs else "frame-extract",
         "ref_video_normalized_to": {"width": width, "height": height, "fps": fps, "max_frames": length},
+        "audio_source": "reference" if audio else "none",
     }
 
 
