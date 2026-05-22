@@ -787,28 +787,41 @@ def build_ltx_motion_workflow(reference_video_filename: str,
     width = ((width + 63) // 64) * 64
     height = ((height + 63) // 64) * 64
 
-    # ─── Halve the latent length to match LTX 2.3's 2× decode ────
-    # Empirical: LTX 2.3 distilled-384 VAE decodes ~2 image frames per
-    # latent slice. A length=121 EmptyLTXVLatentVideo produces 249
-    # output image frames (10.4s @ 24fps), while the pose conditioning
-    # only covers (length-1)/8+1 = 16 latent slices = first ~5s of
-    # output. Result: clean Marco-dancing for the first half, noise
-    # for the second half (verified by frame-by-frame inspection).
+    # ─── Latent + pose length split for IC-LoRA Union-Control ────
+    # LTX 2.3 distilled-384's VAE decodes ~2 image frames per latent
+    # slice — passing length=121 to EmptyLTXVLatentVideo yields ~121
+    # output image frames at 24fps. Empirically v22 confirmed the
+    # output duration matches `length` after halving the latent.
     #
-    # Fix: halve the EmptyLTXVLatentVideo length so the model's 2×
-    # decode produces ~length output image frames. The pose still
-    # equals the (halved) latent length, so conditioning covers the
-    # whole output. For user-requested length=121 → internal=57,
-    # output ≈ 114 image frames @ 24fps ≈ 4.75s (close enough to
-    # 5s that the user gets what they expect, and FULLY coherent).
+    # BUT we still see noise starting at 50% of the clip. Hypothesis
+    # (consistent with what we saw): the Union-Control IC-LoRA's
+    # `latent_downscale_factor = 2` applies temporally as well as
+    # spatially. A pose video at internal_length=57 frames encodes
+    # to 8 raw latent slices, which the IC-LoRA halves to 4 temporal
+    # slices — that only covers the first 4 of the output's 8 latent
+    # slices. Slices 5-8 are unconditioned → noise.
+    #
+    # Fix: keep the OUTPUT latent halved (so the decoded duration
+    # matches what the user asked for) but feed the FULL-length pose
+    # video (= the user's original `length`) so the IC-LoRA's
+    # post-downscale temporal slices match the output latent.
+    #
+    #   user requests length=121 (5s @ 24fps)
+    #   → internal_length=57       — EmptyLTXVLatentVideo, 8 latent slices
+    #   → pose_length=length=121   — VHS, 16 raw latent slices → 8 IC-LoRA
+    #                                  temporal slices → covers full output
+    #
+    # Whether the IC-LoRA validation rejects this depends on whether
+    # the "Conditioning frames exceed the length of the latent
+    # sequence" check runs on raw latent or post-downscale latent.
+    # If post-downscale (8 ≤ 8) it passes; if raw (16 > 8) it errors
+    # and we need to revert.
+    pose_length = length  # use the user's original (un-halved) length
     internal_length = max(9, ((length // 2 - 1) // 8) * 8 + 1)
     if internal_length < 9:
         internal_length = 9
-    pose_length = internal_length
-    # Rebind `length` so the rest of the workflow uses the internal
-    # value (EmptyLTXVLatentVideo gets internal_length, etc.). This
-    # confines the halving to motion control — other endpoints keep
-    # their direct length=output_frames semantics.
+    # Rebind `length` so EmptyLTXVLatentVideo gets the halved value
+    # while pose_length keeps the original for full temporal coverage.
     length = internal_length
 
     # ─── Resolve DWPose preprocessor input (resize) target ────────
