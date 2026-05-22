@@ -709,48 +709,68 @@ def build_ltx_motion_workflow(reference_video_filename: str,
                               preset: str = "fast", audio: bool = False,
                               enhance_prompt: bool = True,
                               inplace_strength: float = 0.5,
-                              motion_strength: float = 1.0) -> dict:
+                              motion_strength: float = 0.95) -> dict:
     """Build the LTX 2.3 motion-control workflow.
 
-    `reference_video_filename` and `character_image_filename` must already
-    exist in ComfyUI's input dir (main.py writes them there before calling).
+    Uses the LTXVAddGuide node — the proper motion-conditioning primitive
+    from ComfyUI-LTXVideo's `comfy_extras.nodes_lt`. The previous version
+    passed a VAE-encoded reference into LTXVImgToVideoInplace's `latent`
+    input, but that node is i2v-only (it overwrites the latent with the
+    image encoding), so the reference motion was being discarded — the
+    output looked like i2v of the character image rather than motion
+    transfer.
 
-    `inplace_strength`  — identity pinning. 0.7 = strong identity (i2v
-                          default), 0.5 = balanced (motion-control default),
-                          0.3 = motion dominates.
-    `motion_strength`   — multiplier on the encoded video latent before
-                          mixing. 1.0 = use motion as-is; <1 dampens it;
-                          >1 amplifies (risk of artifacts). Today wired
-                          via LatentMultiply between the VAE encode and
-                          the inplace mixer; can be removed once we know
-                          1.0 is right.
+    LTXVAddGuide actually injects the reference video into the conditioning
+    AND the latent at a specific frame_idx with controllable strength. Two
+    guides are stacked:
+
+      1. Character image at frame_idx=0, strength=inplace_strength  →
+         anchors WHO the output looks like (identity at the start).
+      2. Reference video starting at frame_idx=0, strength=motion_strength →
+         drives WHAT the output does (the actual motion to copy).
+
+    The reference video must satisfy LTX's `8*n + 1` frame constraint —
+    97, 121, 161, 257 all qualify so the default `length` values are
+    safe. main.py's ffmpeg pre-step already enforces this via -frames:v.
+
+    Knob meanings (renamed roles vs the old version):
+      inplace_strength  — identity guide strength. 0.4 = weak identity
+                          (motion dominates, face may drift), 0.5–0.7 =
+                          balanced, 0.9 = strong identity (face stays put
+                          but motion looks subdued).
+      motion_strength   — reference-video guide strength. 0.0–1.0 (LTX
+                          caps it at 1). 0.95 = strong copy of reference
+                          motion (default). Lower it to blend the
+                          character's natural motion with the reference's.
     """
     two_pass = LTX_PRESETS[preset]["two_pass"]
     refine_strength = min(1.0, inplace_strength + 0.3)
+    # LTXVAddGuide enforces strength in [0, 1] — clamp early so a
+    # passed-in motion_strength > 1 (legacy callers tuned for the broken
+    # LatentMultiply path) doesn't 400 the request.
+    motion_strength = max(0.0, min(1.0, motion_strength))
 
     img_nodes = {
-        # Character image — same chain as i2v.
+        # Character image chain — identical to i2v's first-frame setup.
+        # Acts as the identity guide via the first LTXVAddGuide call below.
         "269": {"class_type": "LoadImage", "inputs": {"image": character_image_filename}},
         "238": {"class_type": "ResizeImageMaskNode", "inputs": {
             "input": ["269", 0], "resize_type": "scale dimensions",
             "resize_type.width": width, "resize_type.height": height,
-            "resize_type.crop": "center", "scale_method": "lanczos"
+            "resize_type.crop": "center", "scale_method": "lanczos",
         }},
         "235": {"class_type": "ResizeImagesByLongerEdge", "inputs": {"images": ["238", 0], "longer_edge": 1536}},
         "248": {"class_type": "LTXVPreprocess", "inputs": {"image": ["235", 0], "img_compression": 18}},
 
-        # Reference video — load via VHS, resize to match target dims, then
-        # VAE-encode into motion latents. force_size locks to the LTX
-        # canvas; frame_load_cap caps at `length` so a 30s upload becomes
-        # the requested clip duration.
+        # Reference video chain — load with VHS, resize to canvas. The
+        # IMAGE tensor goes directly into LTXVAddGuide as a multi-frame
+        # guide; we don't VAE-encode it ourselves (LTXVAddGuide does that
+        # internally as part of its guide-injection logic, which gets the
+        # encoding right for the conditioning slot).
         "310": {"class_type": "VHS_LoadVideo", "inputs": {
             "video": reference_video_filename,
             "force_rate": float(fps),
             "force_size": "Disabled",
-            # custom_width/height are required by the validator even when
-            # force_size="Disabled" — they're a no-op in that mode but
-            # missing them produces "required_input_missing" at validation
-            # time. Pass 0/0 to express "no override, use video's own dims".
             "custom_width": 0,
             "custom_height": 0,
             "frame_load_cap": length,
@@ -760,74 +780,116 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         "311": {"class_type": "ResizeImageMaskNode", "inputs": {
             "input": ["310", 0], "resize_type": "scale dimensions",
             "resize_type.width": width, "resize_type.height": height,
-            "resize_type.crop": "center", "scale_method": "lanczos"
+            "resize_type.crop": "center", "scale_method": "lanczos",
         }},
-        "312": {"class_type": "VAEEncode", "inputs": {"pixels": ["311", 0], "vae": ["236", 2]}},
-
-        # Motion-strength scaler. Identity multiply when 1.0 — kept in the
-        # graph so we can adjust without editing the workflow shape later.
-        "313": {"class_type": "LatentMultiply", "inputs": {"samples": ["312", 0], "multiplier": motion_strength}},
-
-        # Mix character identity into the motion latent — same node i2v
-        # uses, but the `latent` input is the encoded reference (with
-        # motion structure) instead of an empty tensor.
-        #
-        # ⚠️ UNTESTED ASSUMPTION: the node was designed for empty
-        # latents (from EmptyLTXVLatentVideo). Whether it accepts a
-        # VAE-encoded video latent here is the riskiest unknown in this
-        # workflow. If ComfyUI errors with a shape/type mismatch on
-        # this node, the fix is to either:
-        #   (a) Replace with a different LTX node that explicitly takes
-        #       video latents (LTXVVideoExtend if available), OR
-        #   (b) Skip "313"/"312" and pass ["228", 0] (empty latent)
-        #       here, then plumb the motion latent as an extra
-        #       conditioning signal via LTXVConditioning. That preserves
-        #       i2v shape compatibility while still using the reference
-        #       for guidance.
-        # Either way, the API contract + the rest of the pipeline doesn't
-        # change — only this node's wiring.
-        "249": {"class_type": "LTXVImgToVideoInplace", "inputs": {
-            "vae": ["236", 2], "image": ["248", 0], "latent": ["313", 0],
-            "strength": inplace_strength, "bypass": False
-        }},
+        "315": {"class_type": "LTXVPreprocess", "inputs": {"image": ["311", 0], "img_compression": 18}},
     }
 
     if enhance_prompt:
-        # Same Gemma-driven prompt enhancement as i2v — it uses the
-        # character image as visual context so the enhanced prompt
-        # references the actual subject.
+        # Gemma-driven prompt enhancement — uses the character image as
+        # visual context. With proper motion guidance now in place, the
+        # prompt can stay simple ("the woman dances") and the reference
+        # video tells the model HOW to dance.
         img_nodes["274"] = {"class_type": "TextGenerateLTX2Prompt", "inputs": {
             "clip": ["272", 1], "image": ["269", 0], "prompt": prompt,
             "max_length": 256, "sampling_mode": "on",
             "sampling_mode.temperature": 0.7, "sampling_mode.top_k": 64,
             "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
-            "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": seed
+            "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": seed,
         }}
         img_nodes["240"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["243", 0], "text": ["274", 0]}}
 
-    if two_pass:
-        img_nodes["230"] = {"class_type": "LTXVImgToVideoInplace", "inputs": {
-            "vae": ["236", 2], "image": ["248", 0], "latent": ["253", 0], "strength": refine_strength, "bypass": False
-        }}
-        high_res_src = ["230", 0]
-    else:
-        high_res_src = None
-
     workflow = ltx_base_nodes(
         prompt, negative_prompt, width, height, length, fps, seed,
-        low_res_video_src=["249", 0], high_res_video_src=high_res_src,
-        prefix="ltx_motion", preset=preset, audio=audio
+        # Sentinel that gets rewritten below — see "high_res_src" + the
+        # guide chain. We need ltx_base_nodes to wire its sampler chain
+        # through OUR guide-conditioned positive/negative/latent rather
+        # than through 239 (the un-guided LTXVConditioning output it
+        # would normally pick). The simplest way is to let ltx_base_nodes
+        # set up the empty latent at "228", then OVERWRITE the sampler's
+        # inputs (CFGGuider 231, latent_image on 215) downstream of the
+        # guide chain. We do that after `workflow.update`.
+        low_res_video_src=["228", 0],
+        high_res_video_src=None,
+        prefix="ltx_motion", preset=preset, audio=audio,
     )
     workflow.update(img_nodes)
 
-    # Color-match each generated frame back to the input image (same
-    # rationale as i2v — fp8 VAE round-trip drifts warm; ColorMatch closes
-    # the gap without affecting motion).
+    # Stack the two LTXVAddGuide calls:
+    #   first: character image — identity anchor at frame 0
+    #   then:  reference video — motion driver across the whole clip
+    # Output of stage 2 becomes the conditioning + latent the sampler uses.
+    workflow["330"] = {"class_type": "LTXVAddGuide", "inputs": {
+        "positive": ["239", 0],
+        "negative": ["239", 1],
+        "vae": ["236", 2],
+        "latent": ["228", 0],
+        "image": ["248", 0],
+        "frame_idx": 0,
+        "strength": inplace_strength,
+    }}
+    workflow["331"] = {"class_type": "LTXVAddGuide", "inputs": {
+        "positive": ["330", 0],
+        "negative": ["330", 1],
+        "vae": ["236", 2],
+        "latent": ["330", 2],
+        "image": ["315", 0],
+        "frame_idx": 0,
+        "strength": motion_strength,
+    }}
+
+    # Rewire the sampler chain that ltx_base_nodes built so it consumes
+    # the guide outputs. CFGGuider (231) takes positive/negative from the
+    # final guide; SamplerCustomAdvanced (215) takes the guide latent as
+    # its starting point.
+    if "231" in workflow:
+        workflow["231"]["inputs"]["positive"] = ["331", 0]
+        workflow["231"]["inputs"]["negative"] = ["331", 1]
+    if "215" in workflow:
+        workflow["215"]["inputs"]["latent_image"] = ["331", 2]
+
+    if two_pass:
+        # Two-pass refine — re-apply guides into the upsampled latent.
+        # Refine pass uses slightly higher identity strength (matches i2v's
+        # refine_strength), motion stays the same.
+        workflow["340"] = {"class_type": "LTXVAddGuide", "inputs": {
+            "positive": ["239", 0],
+            "negative": ["239", 1],
+            "vae": ["236", 2],
+            "latent": ["253", 0],
+            "image": ["248", 0],
+            "frame_idx": 0,
+            "strength": refine_strength,
+        }}
+        workflow["341"] = {"class_type": "LTXVAddGuide", "inputs": {
+            "positive": ["340", 0],
+            "negative": ["340", 1],
+            "vae": ["236", 2],
+            "latent": ["340", 2],
+            "image": ["315", 0],
+            "frame_idx": 0,
+            "strength": motion_strength,
+        }}
+        # ltx_base_nodes' refine sampler nodes are conventionally at 218/220.
+        # Wire them to use the second-stage guide outputs.
+        if "220" in workflow:
+            workflow["220"]["inputs"]["latent_image"] = ["341", 2]
+        # The refine CFGGuider — if ltx_base_nodes named it 219 or wired
+        # 218's guider in-line, patch defensively.
+        for gid in ("219", "218"):
+            if gid in workflow and isinstance(workflow[gid].get("inputs", {}), dict):
+                if "positive" in workflow[gid]["inputs"]:
+                    workflow[gid]["inputs"]["positive"] = ["341", 0]
+                if "negative" in workflow[gid]["inputs"]:
+                    workflow[gid]["inputs"]["negative"] = ["341", 1]
+
+    # ColorMatch the output against the character image — same as i2v.
+    # Reduces the warm/saturated drift that fp8 VAE round-trips produce.
     workflow["280"] = {"class_type": "ColorMatch", "inputs": {
-        "image_ref":    ["269", 0],
+        "image_ref": ["269", 0],
         "image_target": ["251", 0],
-        "method":       "mkl",
-        "strength":     1.0,
+        "method": "mkl",
+        "strength": 1.0,
     }}
     workflow["242"]["inputs"]["images"] = ["280", 0]
     return workflow
