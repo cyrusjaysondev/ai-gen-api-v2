@@ -1074,32 +1074,31 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         }},
 
         # ─── ReActor face swap: lock identity to the character ────
-        # v38 ships clean motion + audio but identity is "Marco-like"
-        # not exactly Marco. The IC-LoRA wasn't designed to honor an
-        # image-driven character (it's prompt-driven); stacking
-        # character anchors caused ghosting.
+        # v39 produced clean motion + Marco's face but the output
+        # flickered frame-to-frame. Root cause: GFPGAN face restore
+        # was rebuilding facial micro-features independently on each
+        # frame, so subtle differences in pose/blur/light produced
+        # visibly different reconstructions stacked into the timeline.
         #
-        # The right architecture for image-driven identity is the
-        # two-stage pattern Kling et al use internally: generate the
-        # motion first, then face-swap each frame against the source
-        # character. ReActor's `ReActorFaceSwap` accepts an image batch
-        # and processes every frame in one call (InsightFace + the
-        # inswapper_128 ONNX model). Source = the loaded character
-        # image (node 269); input = the colour-matched LTX frames.
-        # face_restore_model=GFPGAN cleans up boundary artifacts.
+        # v40 disables face_restore (set to "none"). The raw inswapper
+        # output is temporally consistent because InsightFace's
+        # 5-point landmark warp produces the same identity vector
+        # given the same source face, regardless of target pose. We
+        # lose a small amount of boundary cleanup quality but get
+        # smooth playback in exchange.
         "285": {"class_type": "ReActorFaceSwap", "inputs": {
             "enabled": True,
-            "input_image": ["280", 0],            # the LTX output frames
-            "source_image": ["269", 0],           # the character image
+            "input_image": ["280", 0],
+            "source_image": ["269", 0],
             "swap_model": "inswapper_128.onnx",
             "facedetection": "retinaface_resnet50",
-            "face_restore_model": "GFPGANv1.4.pth",
-            "face_restore_visibility": 1.0,
-            "codeformer_weight": 0.5,
+            "face_restore_model": "none",        # was GFPGANv1.4.pth (flicker source)
+            "face_restore_visibility": 1.0,      # irrelevant when restore is "none"
+            "codeformer_weight": 0.5,            # irrelevant when restore is "none"
             "detect_gender_input": "no",
             "detect_gender_source": "no",
-            "input_faces_index": "0",             # swap the first detected face per frame
-            "source_faces_index": "0",            # use the first face in the character image
+            "input_faces_index": "0",
+            "source_faces_index": "0",
             "console_log_level": 1,
         }},
         "242": {"class_type": "VHS_VideoCombine", "inputs": {
