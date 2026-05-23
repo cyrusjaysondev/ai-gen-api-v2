@@ -1028,3 +1028,337 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         }},
     }
     return workflow
+
+
+# ─────────────────────────────────────────────
+# LTX 2.3 LipDub — supported Lightricks feature (NOT off-label like motion)
+#
+# Lip-syncs a reference video's speaker to new dialogue. Output keeps the
+# speaker's identity + voice characteristics, but the lip movements match
+# the new text. Useful for: dubbing into other languages, rephrasing,
+# fixing line reads without reshooting.
+#
+# Direct port of Lightricks' official example workflow
+# `LTX-2.3_ICLoRA_Lipdub_Two_Stage_Distilled.json` from the
+# ComfyUI-LTXVideo repo. Two-stage:
+#   Stage 1: generate at 960×544 with LipDub IC-LoRA + audio ref tokens
+#   Stage 2: 2× spatial upsample → refine at 1920×1088 with the same LoRA
+#
+# Key insight: LipDub IC-LoRA was trained with reference_downscale_factor=1
+# (the workflow comment confirms), so it doesn't have the temporal halving
+# bug that crippled the Union-Control motion path. This is a clean
+# implementation of a supported feature.
+#
+# Requires on disk:
+#   - ltx-2.3-22b-dev-fp8.safetensors           (already present)
+#   - ltx-2.3-22b-distilled-lora-384.safetensors (already present)
+#   - ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors (must be downloaded; gated)
+#   - ltx-2.3-spatial-upscaler-x2-1.0.safetensors (already present)
+#   - gemma_3_12B_it_fp4_mixed.safetensors        (already present)
+# ─────────────────────────────────────────────
+def build_ltx_lipdub_workflow(reference_video_filename: str,
+                              prompt: str, negative_prompt: str,
+                              seed: int,
+                              reference_strength: float = 1.0) -> dict:
+    """Build the LTX 2.3 LipDub workflow.
+
+    Inputs
+      reference_video_filename — name of the file in ComfyUI's input
+        dir (the source speaker video, with audio).
+      prompt — the NEW dialogue text. Per Lightricks' MarkdownNote:
+        include the translated words directly; the model won't
+        translate for you. Use native script (Cyrillic for Russian,
+        Chinese characters for Chinese, etc). Match the LENGTH of the
+        original dialogue for the best audio (too long → words
+        skipped; too short → unnatural pauses).
+      negative_prompt — the LTX default works fine here.
+      seed — sampling seed.
+      reference_strength — LipDub IC-LoRA strength (default 1.0,
+        matching the official example). Lower for lighter lip-sync
+        influence; not generally needed.
+
+    Output: ComfyUI prompt dict ready to POST to /prompt.
+    """
+    # Clamp strength to the LoRA loader's valid range.
+    reference_strength = max(0.0, min(2.0, reference_strength))
+    # Stage 1 sigmas (8 steps, distilled-LoRA tuned).
+    LOW_SIGMAS = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+    # Stage 2 refine sigmas (3 steps, matching the example).
+    HIGH_SIGMAS = "0.909375, 0.725, 0.421875, 0.0"
+
+    # Stage-1 canvas — Lightricks example uses 960×544 (9:16 horizontal
+    # but flipped; works for both portrait and landscape since stage 2
+    # upsamples 2x and the actual aspect matches the input video).
+    S1_W, S1_H = 960, 544
+    # Stage-2 canvas — 2× upsample of stage 1.
+    S2_W, S2_H = 1920, 1088
+
+    workflow: dict = {
+        # ─── Model + LoRA stack ───────────────────────────────────
+        "236": {"class_type": "CheckpointLoaderSimple", "inputs": {
+            "ckpt_name": "ltx-2.3-22b-dev-fp8.safetensors",
+        }},
+        # Distilled LoRA (matches the official example, strength 0.5).
+        "232": {"class_type": "LoraLoaderModelOnly", "inputs": {
+            "model": ["236", 0],
+            "lora_name": "ltx-2.3-22b-distilled-lora-384.safetensors",
+            "strength_model": 0.5,
+        }},
+        # LipDub IC-LoRA (the magic). reference_strength controls how
+        # tightly the model honors the LipDub-specific conditioning.
+        "262": {"class_type": "LTXICLoRALoaderModelOnly", "inputs": {
+            "model": ["232", 0],
+            "lora_name": "ltx-2.3-22b-ic-lora-lipdub-0.9.safetensors",
+            "strength_model": reference_strength,
+        }},
+
+        # ─── Text encoder + prompt ────────────────────────────────
+        "243": {"class_type": "LTXAVTextEncoderLoader", "inputs": {
+            "text_encoder": "gemma_3_12B_it_fp4_mixed.safetensors",
+            "ckpt_name":    "ltx-2.3-22b-dev-fp8.safetensors",
+            "device": "default",
+        }},
+        "240": {"class_type": "CLIPTextEncode", "inputs": {
+            "clip": ["243", 0], "text": prompt,
+        }},
+        "247": {"class_type": "CLIPTextEncode", "inputs": {
+            "clip": ["243", 0], "text": negative_prompt,
+        }},
+        # frame_rate gets wired below from the loaded video so the
+        # generated audio + video line up with the source timing.
+
+        # ─── Reference video load + decompose ─────────────────────
+        # LoadVideo (ComfyUI core) reads the file from input dir and
+        # outputs a VIDEO type. GetVideoComponents splits it into
+        # (images, audio, fps).
+        "300": {"class_type": "LoadVideo", "inputs": {
+            "file": reference_video_filename,
+        }},
+        "301": {"class_type": "GetVideoComponents", "inputs": {
+            "video": ["300", 0],
+        }},
+        # LTXVConditioning wires the source video's fps so generated
+        # timing matches.
+        "239": {"class_type": "LTXVConditioning", "inputs": {
+            "positive": ["240", 0],
+            "negative": ["247", 0],
+            "frame_rate": ["301", 2],   # fps from the source video
+        }},
+
+        # ─── Compute target length: snap source frame count to 8n+1
+        "302": {"class_type": "GetImageSizeAndCount", "inputs": {
+            "image": ["301", 0],         # source images
+        }},
+        # ComfyMathExpression evaluates `(int((a - 1) / 8)) * 8 + 1`
+        # against the source frame count → nearest 8n+1.
+        "303": {"class_type": "ComfyMathExpression", "inputs": {
+            "expression": "(int((a - 1) / 8)) * 8 + 1",
+            "a": ["302", 3],             # frame count
+        }},
+        # fps as INT for LTXVEmptyLatentAudio.
+        "304": {"class_type": "LTXFloatToInt", "inputs": {
+            "a": ["301", 2],             # fps (float)
+        }},
+
+        # ─── Resize source images for stage 1 + stage 2 ───────────
+        "305": {"class_type": "ResizeImageMaskNode", "inputs": {
+            "input": ["301", 0],
+            "resize_type": "scale dimensions",
+            "resize_type.width": S1_W, "resize_type.height": S1_H,
+            "resize_type.crop": "disabled", "scale_method": "area",
+        }},
+        "306": {"class_type": "ResizeImageMaskNode", "inputs": {
+            "input": ["301", 0],
+            "resize_type": "scale dimensions",
+            "resize_type.width": S2_W, "resize_type.height": S2_H,
+            "resize_type.crop": "disabled", "scale_method": "area",
+        }},
+
+        # ─── Audio VAE + encode source audio ──────────────────────
+        "310": {"class_type": "LTXVAudioVAELoader", "inputs": {
+            "ckpt_name": "ltx-2.3-22b-dev-fp8.safetensors",
+        }},
+        "311": {"class_type": "LTXVAudioVAEEncode", "inputs": {
+            "audio":     ["301", 1],
+            "audio_vae": ["310", 0],
+        }},
+        # Empty audio latent for the target (new dialogue) generation,
+        # length matched to the video.
+        "312": {"class_type": "LTXVEmptyLatentAudio", "inputs": {
+            "frames_number": ["303", 1],  # computed snap-to-8n+1
+            "frame_rate":    ["304", 0],
+            "batch_size":    1,
+            "audio_vae":     ["310", 0],
+        }},
+
+        # ─── Stage 1 video latent ─────────────────────────────────
+        "320": {"class_type": "EmptyLTXVLatentVideo", "inputs": {
+            "width":  S1_W, "height": S1_H,
+            "length": ["303", 1],         # snap-to-8n+1
+            "batch_size": 1,
+        }},
+
+        # ─── Stage 1: IC-LoRA guide + audio ref tokens ────────────
+        # LipDub LoRA was trained at reference_downscale_factor=1.0
+        # (workflow note confirms), so we hardcode 1.0 — no Union-
+        # Control style halving here. crop="disabled", use_tiled_encode
+        # True with 256/64 = workflow's defaults.
+        "330": {"class_type": "LTXAddVideoICLoRAGuide", "inputs": {
+            "positive": ["239", 0],
+            "negative": ["239", 1],
+            "vae": ["236", 2],
+            "latent": ["320", 0],
+            "image": ["305", 0],          # stage-1 sized source frames
+            "frame_idx": 0,
+            "strength": 1.0,
+            "latent_downscale_factor": 1.0,
+            "crop": "disabled",
+            "use_tiled_encode": True,
+            "tile_size": 256,
+            "tile_overlap": 64,
+        }},
+        # SetAudioRefTokens attaches the encoded source audio as
+        # conditioning — this is what makes the output speaker's voice
+        # match the source.
+        "331": {"class_type": "LTXVSetAudioRefTokens", "inputs": {
+            "positive": ["330", 0],
+            "negative": ["330", 1],
+            "audio_latent": ["311", 0],   # encoded source audio
+        }},
+        # Concat the video guide latent with the empty audio latent so
+        # the sampler operates on a combined AV latent.
+        "332": {"class_type": "LTXVConcatAVLatent", "inputs": {
+            "video_latent": ["330", 2],
+            "audio_latent": ["312", 0],
+        }},
+
+        # ─── Stage 1 sampler ──────────────────────────────────────
+        "340": {"class_type": "CFGGuider", "inputs": {
+            "model": ["262", 0],
+            "positive": ["331", 0],
+            "negative": ["331", 1],
+            "cfg": 1.0,
+        }},
+        "341": {"class_type": "KSamplerSelect", "inputs": {
+            "sampler_name": "euler",
+        }},
+        "342": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
+        "343": {"class_type": "ManualSigmas", "inputs": {"sigmas": LOW_SIGMAS}},
+        "344": {"class_type": "SamplerCustomAdvanced", "inputs": {
+            "noise":        ["342", 0],
+            "guider":       ["340", 0],
+            "sampler":      ["341", 0],
+            "sigmas":       ["343", 0],
+            "latent_image": ["332", 0],   # AV latent
+        }},
+        # Split AV back into separate video + audio latents.
+        "345": {"class_type": "LTXVSeparateAVLatent", "inputs": {
+            "av_latent": ["344", 0],
+        }},
+        # Crop guide regions from stage-1 conditioning.
+        "346": {"class_type": "LTXVCropGuides", "inputs": {
+            "positive": ["330", 0],
+            "negative": ["330", 1],
+            "latent":   ["345", 0],       # stage-1 video latent
+        }},
+
+        # ─── 2× spatial upsample for stage 2 ──────────────────────
+        "350": {"class_type": "LatentUpscaleModelLoader", "inputs": {
+            "model_name": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
+        }},
+        "351": {"class_type": "LTXVLatentUpsampler", "inputs": {
+            "samples":       ["346", 2],
+            "upscale_model": ["350", 0],
+            "vae":           ["236", 2],
+        }},
+
+        # ─── Stage 2: re-guide on the upsampled latent ────────────
+        "360": {"class_type": "LTXAddVideoICLoRAGuide", "inputs": {
+            "positive": ["346", 0],       # cropped positive from stage 1
+            "negative": ["346", 1],
+            "vae": ["236", 2],
+            "latent": ["351", 0],         # upsampled latent
+            "image": ["306", 0],          # stage-2 (hi-res) source frames
+            "frame_idx": 0,
+            "strength": 1.0,
+            "latent_downscale_factor": 1.0,
+            "crop": "disabled",
+            "use_tiled_encode": True,
+            "tile_size": 256,
+            "tile_overlap": 64,
+        }},
+        # Set audio ref tokens AGAIN on stage-2 conditioning, carrying
+        # forward the stage-1 audio split.
+        "361": {"class_type": "LTXVSetAudioRefTokens", "inputs": {
+            "positive": ["360", 0],
+            "negative": ["360", 1],
+            "audio_latent": ["345", 1],   # stage-1 audio split
+        }},
+        "362": {"class_type": "LTXVConcatAVLatent", "inputs": {
+            "video_latent": ["360", 2],
+            "audio_latent": ["361", 2],   # frozen audio from refs
+        }},
+
+        # ─── Stage 2 sampler (refine) ─────────────────────────────
+        "370": {"class_type": "CFGGuider", "inputs": {
+            "model": ["262", 0],
+            "positive": ["360", 0],
+            "negative": ["360", 1],
+            "cfg": 1.0,
+        }},
+        "371": {"class_type": "KSamplerSelect", "inputs": {
+            "sampler_name": "euler",
+        }},
+        # Different seed for the refine pass keeps the noise profile
+        # fresh and avoids artifacting from re-using stage-1 seed.
+        "372": {"class_type": "RandomNoise", "inputs": {
+            "noise_seed": (seed + 1) % 2**32,
+        }},
+        "373": {"class_type": "ManualSigmas", "inputs": {"sigmas": HIGH_SIGMAS}},
+        "374": {"class_type": "SamplerCustomAdvanced", "inputs": {
+            "noise":        ["372", 0],
+            "guider":       ["370", 0],
+            "sampler":      ["371", 0],
+            "sigmas":       ["373", 0],
+            "latent_image": ["362", 0],   # stage-2 AV latent
+        }},
+        # Final split + crop.
+        "375": {"class_type": "LTXVSeparateAVLatent", "inputs": {
+            "av_latent": ["374", 0],
+        }},
+        "376": {"class_type": "LTXVCropGuides", "inputs": {
+            "positive": ["360", 0],
+            "negative": ["360", 1],
+            "latent":   ["375", 0],
+        }},
+
+        # ─── Decode video (tiled) + audio ─────────────────────────
+        "380": {"class_type": "LTXVTiledVAEDecode", "inputs": {
+            "vae":             ["236", 2],
+            "latents":         ["376", 2],
+            "horizontal_tiles": 2,
+            "vertical_tiles":   2,
+            "overlap":          6,
+            "last_frame_fix":   False,
+        }},
+        "381": {"class_type": "LTXVAudioVAEDecode", "inputs": {
+            "samples":   ["375", 1],
+            "audio_vae": ["310", 0],
+        }},
+
+        # ─── Compose video + new audio, save ──────────────────────
+        # CreateVideo bakes images + generated audio into a single
+        # VIDEO type at the source fps (so playback timing matches).
+        "390": {"class_type": "CreateVideo", "inputs": {
+            "images": ["380", 0],
+            "audio":  ["381", 0],
+            "fps":    ["301", 2],         # source fps
+        }},
+        "391": {"class_type": "SaveVideo", "inputs": {
+            "video": ["390", 0],
+            "filename_prefix": "ltx_lipdub",
+            "format": "auto",
+            "codec":  "auto",
+        }},
+    }
+    return workflow

@@ -18,6 +18,7 @@ from workflows import (
     build_flux_i2i_workflow,
     build_t2i_workflow,
     build_ltx_i2v_workflow,
+    build_ltx_lipdub_workflow,
     build_ltx_motion_workflow,
     build_ltx_motion_workflow_no_vhs,
     build_ltx_t2v_workflow,
@@ -1072,6 +1073,80 @@ async def ltx_motion_control(
         "ref_video_normalized_to": {"width": width, "height": height, "fps": fps, "max_frames": length},
         "audio_source": "reference" if audio else "none",
         "note": "Output trimmed to first ~50% (IC-LoRA conditioning limit). Request 2× the desired duration in `length`.",
+    }
+
+
+# ─────────────────────────────────────────────
+# /ltx/lipdub — supported Lightricks LipDub IC-LoRA workflow
+# Direct port of LTX-2.3_ICLoRA_Lipdub_Two_Stage_Distilled.json.
+# Inputs: reference video (speaker) + new dialogue text.
+# Output: same speaker saying the new dialogue with synced lips +
+# generated voice matching the source speaker's tone.
+# ─────────────────────────────────────────────
+@app.post("/ltx/lipdub")
+async def ltx_lipdub(
+    background_tasks: BackgroundTasks,
+    reference_video: UploadFile = File(..., description="Source speaker video. Audio in this file is used as the voice reference (the output speaker will sound like them). Length determines output length — trim to the segment you want re-dubbed before upload."),
+    prompt: str = Form(..., description="The NEW dialogue text. Include translated words directly (the model does NOT translate). Use native script (Cyrillic for Russian, Chinese for Chinese, etc). Match the LENGTH of the original dialogue for best results: too long → words skipped, too short → unnatural pauses."),
+    negative_prompt: str = Form(LTX_DEFAULT_NEGATIVE),
+    seed: int = Form(-1),
+    reference_strength: float = Form(1.0, ge=0.0, le=2.0, description="LipDub IC-LoRA strength. 1.0 = Lightricks default (recommended). Lower if you want looser lip-sync. >1.0 increases adherence at the cost of identity blur."),
+):
+    """LTX 2.3 lip dubbing — re-sync a speaker's lips + voice to new dialogue.
+
+    Pipeline:
+      1. Save the uploaded reference video to ComfyUI input dir.
+      2. Build the LipDub two-stage workflow (low-res sample → 2x
+         upsample → high-res refine). The LipDub IC-LoRA was trained
+         with reference_downscale_factor=1, so unlike Union-Control
+         it doesn't have the temporal halving bug — output is fully
+         conditioned end-to-end.
+      3. Enqueue as a background job; client polls /status/<job_id>.
+
+    The output video has the source speaker's appearance + voice
+    timbre, but the lip movements and audio match the new prompt.
+    """
+    if not prompt.strip():
+        raise HTTPException(400, "prompt is required (the new dialogue text)")
+
+    # Save the reference video into ComfyUI's input dir so the
+    # LoadVideo node can find it.
+    raw_video_bytes = await reference_video.read()
+    REF_VIDEO_MAX_BYTES = 100 * 1024 * 1024
+    if len(raw_video_bytes) > REF_VIDEO_MAX_BYTES:
+        raise HTTPException(
+            413,
+            f"reference video too large: {len(raw_video_bytes) // (1024*1024)} MB > 100 MB.",
+        )
+    raw_video_ext = (reference_video.filename or "").lower().rsplit(".", 1)[-1] or "mp4"
+    ref_video_filename = f"ltx_lipdub_{uuid.uuid4().hex}.{raw_video_ext}"
+    ref_video_path = str(INPUT_DIR / ref_video_filename)
+    Path(ref_video_path).write_bytes(raw_video_bytes)
+
+    # Seed handling — same convention as other LTX endpoints.
+    if seed < 0:
+        import random as _random
+        seed = _random.randint(0, 2**32 - 1)
+
+    workflow = build_ltx_lipdub_workflow(
+        reference_video_filename=ref_video_filename,
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        seed=seed,
+        reference_strength=reference_strength,
+    )
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
+    background_tasks.add_task(
+        run_job, job_id, workflow, [ref_video_path], None, False,
+    )
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "model": "ltx-2.3-22b + LipDub IC-LoRA",
+        "poll_url": f"{BASE_URL}/status/{job_id}",
+        "note": "Two-stage workflow (960×544 sample + 1920×1088 refine). Typical runtime ~2-4 min depending on source length.",
     }
 
 
