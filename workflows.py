@@ -1072,8 +1072,38 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "method": "mkl",
             "strength": 1.0,
         }},
+
+        # ─── ReActor face swap: lock identity to the character ────
+        # v38 ships clean motion + audio but identity is "Marco-like"
+        # not exactly Marco. The IC-LoRA wasn't designed to honor an
+        # image-driven character (it's prompt-driven); stacking
+        # character anchors caused ghosting.
+        #
+        # The right architecture for image-driven identity is the
+        # two-stage pattern Kling et al use internally: generate the
+        # motion first, then face-swap each frame against the source
+        # character. ReActor's `ReActorFaceSwap` accepts an image batch
+        # and processes every frame in one call (InsightFace + the
+        # inswapper_128 ONNX model). Source = the loaded character
+        # image (node 269); input = the colour-matched LTX frames.
+        # face_restore_model=GFPGAN cleans up boundary artifacts.
+        "285": {"class_type": "ReActorFaceSwap", "inputs": {
+            "enabled": True,
+            "input_image": ["280", 0],            # the LTX output frames
+            "source_image": ["269", 0],           # the character image
+            "swap_model": "inswapper_128.onnx",
+            "facedetection": "retinaface_resnet50",
+            "face_restore_model": "GFPGANv1.4.pth",
+            "face_restore_visibility": 1.0,
+            "codeformer_weight": 0.5,
+            "detect_gender_input": "no",
+            "detect_gender_source": "no",
+            "input_faces_index": "0",             # swap the first detected face per frame
+            "source_faces_index": "0",            # use the first face in the character image
+            "console_log_level": 1,
+        }},
         "242": {"class_type": "VHS_VideoCombine", "inputs": {
-            "images": ["280", 0],
+            "images": ["285", 0],                 # face-swapped frames
             "frame_rate": fps,
             "loop_count": 0,
             "filename_prefix": "ltx_motion",
