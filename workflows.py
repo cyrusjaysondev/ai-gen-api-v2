@@ -881,11 +881,6 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "resize_type.width": width, "resize_type.height": height,
             "resize_type.crop": "center", "scale_method": "lanczos",
         }},
-        # No RepeatImageBatch — v35 hit OOM trying to VAE-encode 257
-        # character frames at once. v36 uses sparse single-frame
-        # anchors (see nodes 331a-331e below) instead, each a single
-        # character image at a different frame_idx. Tiny VAE memory
-        # footprint, same identity-reinforcement effect.
         "228": {"class_type": "EmptyLTXVLatentVideo", "inputs": {
             "width": width, "height": height, "length": length, "batch_size": 1,
         }},
@@ -977,70 +972,16 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         }},
 
         # ─── Sparse character anchors (back to v36's sweet spot) ──
-        # v37 used 7 anchors at strength 0.5 to fight identity drift,
-        # but it caused visible ghosting — two overlapping Marcos in
-        # the frame. Each static-pose anchor adds a "Marco standing
-        # still" signal that conflicts with the IC-LoRA's "Marco
-        # dancing" pose conditioning; too many such signals make the
-        # second character literally render in the output.
-        #
-        # v38 reverts to v36's 4 anchors at strength 0.4 — the user's
-        # "almost perfect" version. Slight identity drift (slimmer /
-        # younger Marco at the end), but NO ghosting. This is the
-        # current sweet spot.
-        #
-        # Eliminating the residual drift requires a fundamentally
-        # different approach (face-swap post-processing) since any
-        # static-pose anchor density above this triggers ghosting.
-        "331a": {"class_type": "LTXVAddGuide", "inputs": {
-            "positive": ["330", 0],
-            "negative": ["330", 1],
-            "vae": ["236", 2],
-            "latent": ["330", 2],
-            "image": ["238", 0],
-            "frame_idx": 1,
-            "strength": 0.4,
-        }},
-        "331b": {"class_type": "LTXVAddGuide", "inputs": {
-            "positive": ["331a", 0],
-            "negative": ["331a", 1],
-            "vae": ["236", 2],
-            "latent": ["331a", 2],
-            "image": ["238", 0],
-            "frame_idx": 33,
-            "strength": 0.4,
-        }},
-        "331c": {"class_type": "LTXVAddGuide", "inputs": {
-            "positive": ["331b", 0],
-            "negative": ["331b", 1],
-            "vae": ["236", 2],
-            "latent": ["331b", 2],
-            "image": ["238", 0],
-            "frame_idx": 65,
-            "strength": 0.4,
-        }},
-        "331d": {"class_type": "LTXVAddGuide", "inputs": {
-            "positive": ["331c", 0],
-            "negative": ["331c", 1],
-            "vae": ["236", 2],
-            "latent": ["331c", 2],
-            "image": ["238", 0],
-            "frame_idx": 97,
-            "strength": 0.4,
-        }},
-
         # ─── Sampler chain ─────────────────────────────────────────
-        # Model: ["262", 0] = distilled + IC-LoRA weights baked in. The
-        # IC-LoRA's pose-to-character training is what enables the model
-        # to interpret skeleton pixels as a character pose rather than
-        # literally rendering colored bones. Positive/negative come from
-        # the character-batch guide (node 331) which sits AFTER the
-        # IC-LoRA's pose conditioning and adds identity reinforcement
-        # across all output frames.
+        # No character anchors, no face swap, no temporal smoothing —
+        # those were post-v32 experiments that introduced ghosting,
+        # flicker, or both. v32 is the simplest config that produces
+        # a clean (but identity-drifty) clip with the IC-LoRA guide
+        # alone, trimmed to first ~50% (the conditioning window).
         "231": {"class_type": "CFGGuider", "inputs": {
             "model": ["262", 0],
-            "positive": ["331d", 0],
-            "negative": ["331d", 1],
+            "positive": ["330", 0],
+            "negative": ["330", 1],
             "cfg": 1.0,
         }},
         "209": {"class_type": "KSamplerSelect", "inputs": {
@@ -1053,7 +994,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "guider": ["231", 0],
             "sampler": ["209", 0],
             "sigmas": ["252", 0],
-            "latent_image": ["331d", 2],  # last identity anchor
+            "latent_image": ["330", 2],
         }},
 
         # ─── Decode + colour-match + output ───────────────────────
@@ -1072,37 +1013,8 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "method": "mkl",
             "strength": 1.0,
         }},
-
-        # ─── ReActor face swap: lock identity to the character ────
-        # v39 produced clean motion + Marco's face but the output
-        # flickered frame-to-frame. Root cause: GFPGAN face restore
-        # was rebuilding facial micro-features independently on each
-        # frame, so subtle differences in pose/blur/light produced
-        # visibly different reconstructions stacked into the timeline.
-        #
-        # v40 disables face_restore (set to "none"). The raw inswapper
-        # output is temporally consistent because InsightFace's
-        # 5-point landmark warp produces the same identity vector
-        # given the same source face, regardless of target pose. We
-        # lose a small amount of boundary cleanup quality but get
-        # smooth playback in exchange.
-        "285": {"class_type": "ReActorFaceSwap", "inputs": {
-            "enabled": True,
-            "input_image": ["280", 0],
-            "source_image": ["269", 0],
-            "swap_model": "inswapper_128.onnx",
-            "facedetection": "retinaface_resnet50",
-            "face_restore_model": "none",        # was GFPGANv1.4.pth (flicker source)
-            "face_restore_visibility": 1.0,      # irrelevant when restore is "none"
-            "codeformer_weight": 0.5,            # irrelevant when restore is "none"
-            "detect_gender_input": "no",
-            "detect_gender_source": "no",
-            "input_faces_index": "0",
-            "source_faces_index": "0",
-            "console_log_level": 1,
-        }},
         "242": {"class_type": "VHS_VideoCombine", "inputs": {
-            "images": ["285", 0],                 # face-swapped frames
+            "images": ["280", 0],
             "frame_rate": fps,
             "loop_count": 0,
             "filename_prefix": "ltx_motion",

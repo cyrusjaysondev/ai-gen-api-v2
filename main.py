@@ -205,49 +205,7 @@ def _mux_reference_audio(video_path: Path, audio_source: Path) -> tuple[bool, st
     return True, "ok"
 
 
-_MOTION_CLEAN_FRACTION = 0.40  # see comment below
-
-
-def _temporal_smooth_video(video_path: Path) -> tuple[bool, str]:
-    """Apply a 5-frame temporal blend to dampen face-swap flicker.
-
-    ReActor's per-frame face swap detects target landmarks
-    independently on each frame; tiny landmark variations between
-    consecutive frames produce visibly different warps when played
-    back, which we see as flicker. ffmpeg's `tmix` filter blends each
-    frame with its 2 neighbors on either side, weighted with the
-    middle frame dominant. The face's actual position barely moves
-    frame-to-frame in a dance shot so the spatial smoothing penalty
-    is negligible, but the per-frame stochastic detail differences
-    average out — flicker disappears.
-
-    weights='1 2 4 2 1' — bell-curve, center frame gets 40% of the
-    total weight, edges 10% each. Slightly more aggressive than a
-    flat 1:1:1:1:1 average; less than a hard median filter.
-    """
-    import subprocess
-    if not video_path.exists():
-        return False, "input missing"
-    tmp_out = video_path.with_name(f"{video_path.stem}.smooth{video_path.suffix}")
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-i", str(video_path),
-        "-vf", "tmix=frames=5:weights='1 2 4 2 1'",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
-        "-c:a", "copy",
-        str(tmp_out),
-    ]
-    try:
-        res = subprocess.run(cmd, capture_output=True, timeout=180)
-    except Exception as e:
-        tmp_out.unlink(missing_ok=True)
-        return False, f"smooth ffmpeg error: {e}"
-    if res.returncode != 0 or not tmp_out.exists() or tmp_out.stat().st_size == 0:
-        tmp_out.unlink(missing_ok=True)
-        err = (res.stderr or b"").decode(errors="replace")[-300:]
-        return False, f"smooth failed: {err}"
-    os.replace(str(tmp_out), str(video_path))
-    return True, "5-frame tmix applied"
+_MOTION_CLEAN_FRACTION = 0.50  # v32 value — IC-LoRA conditioning window
 
 
 def _trim_first_half(video_path: Path) -> tuple[bool, str]:
@@ -409,25 +367,6 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                                 trim_warning = str(trim_err)
                                 print(f"[{job_id}] trim raised: {trim_err}")
 
-                        # Optional temporal smoothing — used by /ltx/motion
-                        # to suppress the per-frame jitter that ReActor's
-                        # face-swap introduces. Runs AFTER trim (so we
-                        # only smooth the kept frames), BEFORE watermark
-                        # (so the watermark re-encode lands on the
-                        # smoothed video).
-                        smooth_warning: str | None = None
-                        if trim_first_half and ext in _VIDEO_EXTS:
-                            try:
-                                ok, msg = await asyncio.to_thread(
-                                    _temporal_smooth_video, path,
-                                )
-                                print(f"[{job_id}] smooth: {msg}")
-                                if not ok:
-                                    smooth_warning = msg
-                            except Exception as smooth_err:
-                                smooth_warning = str(smooth_err)
-                                print(f"[{job_id}] smooth raised: {smooth_err}")
-
                         # Optional watermark — text and/or logo. Both run in
                         # place. Failures don't nuke the job; the
                         # unwatermarked file is still valid output.
@@ -478,8 +417,6 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                             completed["trim_warning"] = trim_warning
                         elif trim_first_half:
                             completed["trimmed"] = "first_half_only"
-                        if smooth_warning:
-                            completed["smooth_warning"] = smooth_warning
                         jobs[job_id] = completed
                         return
 
