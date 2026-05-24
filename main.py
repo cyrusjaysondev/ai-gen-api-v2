@@ -2292,19 +2292,59 @@ async def admin_test_face_filter(
 
 @app.get("/admin/blocklist")
 async def admin_list_blocklist(authorization: str = Header(default=None)):
-    """List all identities currently on the blocklist."""
+    """List all identities currently on the blocklist.
+
+    Includes a `loaded` flag per entry — true if the face filter
+    successfully embedded the face from this image, false if the file
+    is on disk but detection failed and the file is effectively a no-op
+    at filter time. The loader (`safety._build_filter`) tries multiple
+    fallbacks (autocontrast, sharpen, 2× upscale, 4× upscale, center
+    crop) before giving up; anything in the `skipped` list means even
+    those fallbacks couldn't find a face and the entry won't actually
+    block uploads.
+
+    Admins should re-upload skipped entries with clearer crops.
+    """
     _require_admin(authorization)
     BLOCKLIST_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Pull the skipped-files set from the in-memory filter state. If
+    # the filter hasn't been initialized yet (e.g. cold pod) we treat
+    # everything as "unknown" — better than lying.
+    skipped_set: set[str] = set()
+    filter_initialized = False
+    if face_safety is not None:
+        try:
+            status = face_safety.get_status()
+            skipped_set = set(status.get("skipped_files", []))
+            filter_initialized = True
+        except Exception as e:
+            print(f"[admin_list_blocklist] could not fetch filter status: {e}")
+
     entries = []
+    loaded_count = 0
+    skipped_count = 0
     for p in sorted(BLOCKLIST_DIR.iterdir()):
         if p.is_file() and p.suffix.lower() in ALLOWED_BLOCKLIST_EXTS:
+            is_skipped = p.name in skipped_set
             entries.append({
                 "identity": p.stem,
                 "filename": p.name,
                 "size_bytes": p.stat().st_size,
                 "added_at": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(),
+                "loaded": (not is_skipped) if filter_initialized else None,
             })
-    return {"count": len(entries), "blocklist": entries}
+            if is_skipped:
+                skipped_count += 1
+            else:
+                loaded_count += 1
+    return {
+        "count": len(entries),
+        "loaded_count": loaded_count if filter_initialized else None,
+        "skipped_count": skipped_count if filter_initialized else None,
+        "filter_initialized": filter_initialized,
+        "blocklist": entries,
+    }
 
 
 @app.post("/admin/blocklist")

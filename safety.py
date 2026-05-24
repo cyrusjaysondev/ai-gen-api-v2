@@ -150,22 +150,46 @@ def _build_filter():
         arr = np.array(pil)
         faces = app.get(arr)
 
+        # Fallback chain — most blocklist images that fail naive
+        # SCRFD detection at default exposure are recoverable with a
+        # bit of preprocessing. We try progressively stronger
+        # interventions; first one that gets a face wins. Audit logs
+        # tell admins WHICH fallback recovered the file (so old
+        # archive photos can be flagged for replacement with better
+        # crops if too many fall through to the late stages).
+
         # Fallback 1 — autocontrast (histogram stretch). Recovers
-        # washed-out / older photos where SCRFD's detector falls below
-        # threshold at default exposure.
+        # washed-out / older photos.
         if not faces:
             try:
                 enhanced = ImageOps.autocontrast(pil, cutoff=2)
                 arr = np.array(enhanced)
                 faces = app.get(arr)
                 if faces:
-                    print(f"[face-filter] {img_path.name}: detection recovered via autocontrast")
+                    print(f"[face-filter] {img_path.name}: recovered via autocontrast")
             except Exception as e:
                 print(f"[face-filter] {img_path.name}: autocontrast errored: {e}")
 
-        # Fallback 2 — upscale to 2x then retry. Helps when the face is
-        # small relative to the canvas; SCRFD at det_size=1024 still
-        # struggles when the face is < ~100px wide in the source.
+        # Fallback 2 — autocontrast + sharpen. B&W archive photos
+        # often have soft focus / grain that confuses SCRFD's edge-
+        # sensitive features. Sharpening at 130% strength tightens
+        # those edges.
+        if not faces:
+            try:
+                from PIL import ImageFilter as _IF
+                sharp = ImageOps.autocontrast(pil, cutoff=2).filter(
+                    _IF.UnsharpMask(radius=1.5, percent=130, threshold=2),
+                )
+                arr = np.array(sharp)
+                faces = app.get(arr)
+                if faces:
+                    print(f"[face-filter] {img_path.name}: recovered via autocontrast+sharpen")
+            except Exception as e:
+                print(f"[face-filter] {img_path.name}: sharpen errored: {e}")
+
+        # Fallback 3 — upscale to 2x then retry. Helps when the face
+        # is small relative to the canvas; SCRFD at det_size=1024
+        # still struggles when the face is < ~100px wide in the source.
         if not faces:
             try:
                 w, h = pil.size
@@ -173,9 +197,43 @@ def _build_filter():
                 arr = np.array(up)
                 faces = app.get(arr)
                 if faces:
-                    print(f"[face-filter] {img_path.name}: detection recovered via 2× upscale")
+                    print(f"[face-filter] {img_path.name}: recovered via 2× upscale")
             except Exception as e:
                 print(f"[face-filter] {img_path.name}: 2× upscale errored: {e}")
+
+        # Fallback 4 — 4× upscale + autocontrast. Last-resort upsample
+        # for very low-res archival scans where 2× isn't enough.
+        if not faces:
+            try:
+                w, h = pil.size
+                up4 = ImageOps.autocontrast(pil, cutoff=2).resize(
+                    (w * 4, h * 4), Image.LANCZOS,
+                )
+                arr = np.array(up4)
+                faces = app.get(arr)
+                if faces:
+                    print(f"[face-filter] {img_path.name}: recovered via 4× upscale + autocontrast")
+            except Exception as e:
+                print(f"[face-filter] {img_path.name}: 4× upscale errored: {e}")
+
+        # Fallback 5 — center-crop to inner 80% then 2× upscale. Some
+        # blocklist photos have wide borders / frames / busy
+        # backgrounds that confuse the detector; cropping forces
+        # attention to the centered face. Combined with upscale so
+        # the resulting face is large enough to detect.
+        if not faces:
+            try:
+                w, h = pil.size
+                margin_x, margin_y = int(w * 0.1), int(h * 0.1)
+                cropped = pil.crop((margin_x, margin_y, w - margin_x, h - margin_y))
+                cw, ch = cropped.size
+                cropped_up = cropped.resize((cw * 2, ch * 2), Image.LANCZOS)
+                arr = np.array(cropped_up)
+                faces = app.get(arr)
+                if faces:
+                    print(f"[face-filter] {img_path.name}: recovered via center-crop + 2× upscale")
+            except Exception as e:
+                print(f"[face-filter] {img_path.name}: crop+upscale errored: {e}")
 
         if not faces:
             skipped.append(img_path.name)
@@ -222,6 +280,27 @@ def _count_significant_faces(faces, img_area: int) -> int:
         if img_area > 0 and (area / img_area) >= MIN_FACE_AREA_RATIO:
             n += 1
     return n
+
+
+def get_status() -> dict:
+    """Return the current filter state WITHOUT rebuilding.
+
+    Used by /admin/blocklist GET to annotate each entry with whether
+    it actually got loaded (vs being silently skipped). Lazily triggers
+    a build on first call if the filter hasn't been initialized yet,
+    so a fresh pod that's never run a generation can still answer.
+    """
+    _maybe_reload()
+    if _FILTER is None:
+        return {"initialized": False, "error": _FILTER_INIT_ERROR}
+    skipped = _FILTER.get("skipped_files", [])
+    return {
+        "initialized": True,
+        "threshold": _FILTER["threshold"],
+        "blocklist_count": len(_FILTER["blocklist"]),
+        "skipped_count": len(skipped),
+        "skipped_files": list(skipped),  # full list, not truncated
+    }
 
 
 def force_reload_filter() -> dict:
