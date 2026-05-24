@@ -97,14 +97,15 @@ def _build_filter():
     blocklist_dir = _blocklist_dir()
     model_root    = os.environ.get("INSIGHTFACE_MODEL_ROOT", "/workspace/insightface_models")
     # Cosine-similarity cutoff for "this detected face matches a blocked
-    # identity". Was 0.6, bumped to 0.7 after a confirmed false-positive
-    # (unrelated woman scoring 0.666 against a Hun Sen entry). 0.7 is the
-    # practical sweet spot for buffalo_l/Arcface — genuine same-person
-    # matches typically land at 0.75–0.9, so the threshold catches real
-    # hits while shaking off coincidental similarity between two faces of
-    # similar demographics. If a known real identity slips past 0.7, drop
-    # FACE_FILTER_THRESHOLD via env to widen the net for that pod only.
-    threshold     = float(os.environ.get("FACE_FILTER_THRESHOLD", "0.7"))
+    # identity". History: 0.5 (original) → 0.6 → 0.7 (after a single
+    # confirmed false-positive of an unrelated woman scoring 0.666
+    # against Hun Sen) → 0.55 (current — the 0.7 jump caused many real
+    # blocked identities to slip past with scores in the 0.55-0.69
+    # range). Genuine same-person matches for buffalo_l/ArcFace land
+    # around 0.65-0.9; 0.55 catches real hits including borderline
+    # cases at the cost of occasional false positives on demographics-
+    # adjacent faces. Override via FACE_FILTER_THRESHOLD if needed.
+    threshold     = float(os.environ.get("FACE_FILTER_THRESHOLD", "0.55"))
     # InsightFace's default detection threshold (0.5) — and even our earlier
     # bump to 0.3 — kept rejecting clearly-visible elderly faces. SCRFD-10G
     # under-trains on older subjects and on photos with washed-out colour,
@@ -259,13 +260,23 @@ def _build_filter():
 
 
 # Smallest fraction of the image area a detected bbox must cover to count
-# as a "real" face. Below this, we treat the detection as noise — at the
-# permissive detector settings we run (det_thresh=0.1), SCRFD sometimes
-# reports a tiny background artifact as a low-confidence face, which used
-# to manifest as spurious "detected 2 faces" rejections on otherwise clean
-# portraits. 3% of the image area corresponds to a ~177×177 face inside
-# a 1024×1024 frame — well below any reasonable portrait crop.
+# as a "real" face during upload/face-count checks. Below this, we treat
+# the detection as noise — at the permissive detector settings we run
+# (det_thresh=0.1), SCRFD sometimes reports a tiny background artifact
+# as a low-confidence face. 3% of the image area corresponds to a
+# ~177×177 face inside a 1024×1024 frame.
 MIN_FACE_AREA_RATIO = float(os.environ.get("FACE_MIN_AREA_RATIO", "0.03"))
+
+# Separate (smaller) threshold for the BLOCKLIST QUERY path. We want
+# to catch blocked identities even when they appear small in the
+# input — a distant face in a group shot, or a target image where the
+# blocked person is just one element. The upload check stays strict
+# (so admins don't accidentally add bad photos as identity references),
+# but matching is permissive so real blocks don't slip through just
+# because the target face happens to be small.
+# 0.5% area = ~70×70 face in a 1024² frame — small but a real face,
+# not background noise.
+MIN_FACE_AREA_RATIO_QUERY = float(os.environ.get("FACE_MIN_AREA_RATIO_QUERY", "0.005"))
 
 
 def _count_significant_faces(faces, img_area: int) -> int:
@@ -466,13 +477,16 @@ def check_image(image_bytes: bytes) -> FilterResult:
 
     # Filter detections by area before matching. At det_thresh=0.1 the
     # detector occasionally produces low-confidence pseudo-faces from
-    # background texture; those have garbage embeddings that can match
-    # blocklist entries by chance and produce false positives. The same
-    # MIN_FACE_AREA_RATIO that gates uploads also applies here so the
-    # detect/match policy stays consistent.
+    # background texture. We use MIN_FACE_AREA_RATIO_QUERY (0.5%)
+    # rather than the upload-side 3%: matching needs to catch real
+    # blocked identities even when they appear small (group shots,
+    # distant subjects, target images where the blocked person is a
+    # secondary element). 0.5% area = ~70×70 face in a 1024² frame,
+    # well above true background noise but small enough to catch
+    # distant blocked subjects.
     faces = [
         f for f in raw_faces
-        if (max(0.0, f.bbox[2] - f.bbox[0]) * max(0.0, f.bbox[3] - f.bbox[1]) / max(1, img_area)) >= MIN_FACE_AREA_RATIO
+        if (max(0.0, f.bbox[2] - f.bbox[0]) * max(0.0, f.bbox[3] - f.bbox[1]) / max(1, img_area)) >= MIN_FACE_AREA_RATIO_QUERY
     ]
     if not faces:
         # Detector saw only noise — nothing significant to match.
