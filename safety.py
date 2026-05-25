@@ -119,11 +119,34 @@ def _detect_with_fallbacks(app, pil_image, *, np, label_for_log: str = ""):
                         these dims, not the original image's.
 
     Idempotent — never modifies the input PIL image.
+
+    ── CRITICAL: channel-order convention ──
+    InsightFace's SCRFD detector + ArcFace embedder both expect **BGR**
+    input (OpenCV convention). They were trained on BGR via cv2.imread.
+    PIL's Image.open().convert("RGB") + np.array() gives **RGB**, which
+    feeds the model swapped R↔B channels. Effect:
+       • detection RECALL drops sharply on borderline cases (archival
+         B&W, faded photos, certain lighting) — the model can't find a
+         face it would otherwise easily detect
+       • match SCORES on detected faces shift unpredictably — could
+         still match same-person but cross identity boundaries
+    Symptom: crystal-clear front-facing portraits returning 0 detections
+    while heavily-degraded photos detect fine. THE bug that bypassed
+    To Lam / archival portraits in /Users/cyrus/Desktop/testblockedface.
+    Fix: explicit RGB→BGR conversion before every app.get() call.
     """
     from PIL import Image as _Image, ImageOps as _ImageOps, ImageFilter as _IF
 
-    # Pass 1: original image, no preprocessing. Most images pass here.
-    arr = np.array(pil_image)
+    def _to_bgr(pil_im):
+        """PIL RGB → BGR numpy array. The slice [..., ::-1] reverses the
+        last axis (the channel axis). .copy() ensures a contiguous array
+        because InsightFace's cv2-backed kernels reject non-contiguous
+        memory layouts."""
+        return np.array(pil_im)[:, :, ::-1].copy()
+
+    # Pass 1: original image, no preprocessing. Most images pass here
+    # (now that channels are correct).
+    arr = _to_bgr(pil_image)
     faces = app.get(arr)
     if faces:
         return faces, None, arr.shape[:2]
@@ -192,7 +215,8 @@ def _detect_with_fallbacks(app, pil_image, *, np, label_for_log: str = ""):
     for name, transform in variants:
         try:
             transformed = transform(pil_image)
-            arr2 = np.array(transformed)
+            # Same RGB→BGR conversion as pass 1 — InsightFace expects BGR.
+            arr2 = _to_bgr(transformed)
             faces = app.get(arr2)
             if faces:
                 # Log at INFO level so admins reading the pod log can see

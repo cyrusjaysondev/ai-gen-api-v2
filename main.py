@@ -2374,7 +2374,11 @@ async def admin_test_face_filter(
         pil = PILImage.open(io.BytesIO(raw)).convert("RGB")
     except Exception as e:
         raise HTTPException(400, f"could not decode image: {e}")
-    arr = np.array(pil)
+    # CRITICAL: InsightFace expects BGR (OpenCV convention). Feeding RGB
+    # gives the model swapped R↔B channels, which dramatically lowers
+    # detection recall on borderline images (archival B&W, faded photos).
+    # See _detect_with_fallbacks in safety.py for the full explanation.
+    arr = np.array(pil)[:, :, ::-1].copy()  # RGB → BGR
     img_h, img_w = arr.shape[:2]
     img_area = img_h * img_w
 
