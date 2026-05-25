@@ -2392,10 +2392,32 @@ async def admin_test_face_filter(
     #      "would this image be blocked during a real face-swap?".
     # The `blocked` verdict below uses the recovered set + the query-side
     # area threshold (0.5%) — same as the real check_image path.
-    raw_faces = app_.get(arr)
-    recovered_faces, fallback_used, (detect_h, detect_w) = face_safety._detect_with_fallbacks(
-        app_, pil, np=np, label_for_log="admin_test",
-    )
+    # Wrap detection in a try/except so any internal exception (cv2 missing,
+    # weird image mode, numpy edge case) surfaces in the JSON response with a
+    # full traceback instead of dying as a generic 500 with no detail. This is
+    # an admin-only diagnostic endpoint — the verbosity is intentional.
+    import traceback as _tb
+    try:
+        raw_faces = app_.get(arr)
+    except Exception as e:
+        return {
+            "error": "raw detection failed",
+            "exception": f"{type(e).__name__}: {e}",
+            "traceback": _tb.format_exc().splitlines()[-15:],
+            "image_size": [img_w, img_h],
+        }
+    try:
+        recovered_faces, fallback_used, (detect_h, detect_w) = face_safety._detect_with_fallbacks(
+            app_, pil, np=np, label_for_log="admin_test",
+        )
+    except Exception as e:
+        return {
+            "error": "fallback chain detection failed",
+            "exception": f"{type(e).__name__}: {e}",
+            "traceback": _tb.format_exc().splitlines()[-15:],
+            "raw_face_count": len(raw_faces),
+            "image_size": [img_w, img_h],
+        }
     detect_area = max(1, detect_h * detect_w)
     # Use the QUERY threshold (0.5%) for the verdict — that's what check_image
     # uses. The MIN_FACE_AREA_RATIO (3%) is upload-side strict and would give
