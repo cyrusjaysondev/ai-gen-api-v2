@@ -28,7 +28,7 @@ from pathlib import Path
 API_REPO_RAW = "https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main"
 API_DIR = Path("/workspace/api")
 FILES_TO_REFRESH = ("main.py", "workflows.py", "safety.py", "logo_safety.py", "watermark.py")
-MARKER = Path("/tmp/api-refresh-claimed-pad-out-detection-v50")
+MARKER = Path("/tmp/api-refresh-claimed-significant-face-loop-v51")
 DIAG_LOG = Path("/workspace/setup-vhs.log")
 
 

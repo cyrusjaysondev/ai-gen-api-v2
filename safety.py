@@ -144,12 +144,59 @@ def _detect_with_fallbacks(app, pil_image, *, np, label_for_log: str = ""):
         memory layouts."""
         return np.array(pil_im)[:, :, ::-1].copy()
 
+    # Helper: is at least one face in the result "significant" (≥0.5%
+    # of image area)? Below that, the detection is likely a low-confidence
+    # noise blob from the permissive det_thresh=0.1 — accepting it as the
+    # final answer causes downstream area filtering to drop us into the
+    # "no significant face" bypass branch. Keep trying variants if so.
+    #
+    # ⚠️ 0.005 (0.5%) here is INTENTIONALLY 10× the MIN_FACE_AREA_RATIO_QUERY
+    # (0.05%). The query-time area filter is super-permissive — it accepts
+    # any face the detector emits — but THIS check is about "is this variant
+    # giving us a real face or just noise". We want to keep trying for a
+    # real face before accepting noise.
+    SIGNIFICANT_AREA_RATIO = 0.005
+
+    def _is_significant(face_list, h: int, w: int) -> bool:
+        img_area = max(1, h * w)
+        for f in face_list:
+            x1, y1, x2, y2 = f.bbox
+            area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+            if (area / img_area) >= SIGNIFICANT_AREA_RATIO:
+                return True
+        return False
+
+    # Track the best (largest-face) fallback we've seen so far, so if no
+    # variant produces a significant face we still return the biggest noise
+    # blob as a last resort. None until we get our first detection.
+    best_faces: list = []
+    best_fallback: Optional[str] = None
+    best_shape: tuple = (0, 0)
+    best_area: float = -1.0
+
+    def _maybe_remember(face_list, name, shape):
+        """If `face_list` has a face larger than what we've seen, remember it."""
+        nonlocal best_faces, best_fallback, best_shape, best_area
+        h, w = shape
+        img_area = max(1, h * w)
+        for f in face_list:
+            x1, y1, x2, y2 = f.bbox
+            area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+            ratio = area / img_area
+            if ratio > best_area:
+                best_area = ratio
+                best_faces = face_list
+                best_fallback = name
+                best_shape = shape
+
     # Pass 1: original image, no preprocessing. Most images pass here
     # (now that channels are correct).
     arr = _to_bgr(pil_image)
     faces = app.get(arr)
     if faces:
-        return faces, None, arr.shape[:2]
+        _maybe_remember(faces, None, arr.shape[:2])
+        if _is_significant(faces, *arr.shape[:2]):
+            return faces, None, arr.shape[:2]
 
     # Build the variant pipeline. Each tuple is (name, transform_fn). Order
     # matters — cheap + most-likely-to-work first. We DON'T try all of them
@@ -213,25 +260,27 @@ def _detect_with_fallbacks(app, pil_image, *, np, label_for_log: str = ""):
         return canvas
 
     variants = [
-        ("autocontrast",       lambda im: _ImageOps.autocontrast(im, cutoff=2)),
-        ("autocontrast+sharpen", lambda im: _ImageOps.autocontrast(im, cutoff=2).filter(
-            _IF.UnsharpMask(radius=1.5, percent=130, threshold=2))),
-        # CLAHE is the biggest single recovery vector for archival photos;
-        # try it BEFORE upscaling because it's faster and a successful
-        # detection at original resolution gives a more accurate embedding.
-        ("clahe",              _clahe),
-        # ── PAD-OUT VARIANTS (face too big) ──
-        # Crystal-clear portrait crops (e.g. profile pictures cropped
-        # tightly around the face) often fail SCRFD detection because
-        # the face exceeds the anchor box scale range. Zooming OUT by
-        # padding brings the face back into a detectable scale. Try
-        # WHITE padding first (common for headshot backdrops), then
-        # BLACK (for dark-background inputs). These run early in the
-        # chain because they're cheap (just paste onto a larger canvas)
-        # and target a common failure mode the previous chain missed.
+        # ── PAD-OUT VARIANTS FIRST (face too big) ──
+        # Front-loaded because face-TOO-BIG is the #1 confirmed bypass
+        # mode for our user base (tight portrait crops of public
+        # figures). SCRFD's anchor boxes are tuned for faces at 10-30%
+        # of frame — when a face fills >60%, the original-pass detector
+        # returns 0 faces. Padding (zooming out) brings the face into
+        # the anchor sweet spot. These are also CHEAP (just paste onto
+        # a bigger canvas) so trying them first costs little even when
+        # they're not needed. White first (common for headshot backdrops),
+        # 2x for severe cases, black for dark-background photos.
         ("pad_white_1.5x",     lambda im: _pad_out(im, 1.5, fill=(255, 255, 255))),
         ("pad_white_2x",       lambda im: _pad_out(im, 2.0, fill=(255, 255, 255))),
         ("pad_black_2x",       lambda im: _pad_out(im, 2.0, fill=(0, 0, 0))),
+        ("autocontrast",       lambda im: _ImageOps.autocontrast(im, cutoff=2)),
+        ("autocontrast+sharpen", lambda im: _ImageOps.autocontrast(im, cutoff=2).filter(
+            _IF.UnsharpMask(radius=1.5, percent=130, threshold=2))),
+        # CLAHE is the biggest single recovery vector for archival photos.
+        # At det_thresh=0.1 it can produce TINY noise detections — we now
+        # require a "significant" face (≥0.5% of image area) before
+        # returning, so CLAHE no longer hijacks the chain with noise blobs.
+        ("clahe",              _clahe),
         # Gamma variants help when the face is silhouetted (gamma>1) or
         # the face is very bright on a dark background (gamma<1).
         ("gamma_0.7_dark",     lambda im: _gamma(im, 0.7)),
@@ -257,15 +306,27 @@ def _detect_with_fallbacks(app, pil_image, *, np, label_for_log: str = ""):
             arr2 = _to_bgr(transformed)
             faces = app.get(arr2)
             if faces:
-                # Log at INFO level so admins reading the pod log can see
-                # which variant recovered. The label_for_log is the
-                # blocklist filename (build path) or a query hint (check
-                # path) so trends are debuggable.
-                if label_for_log:
-                    print(f"[face-filter] {label_for_log}: recovered via {name}")
-                return faces, name, arr2.shape[:2]
+                _maybe_remember(faces, name, arr2.shape[:2])
+                if _is_significant(faces, *arr2.shape[:2]):
+                    # Log at INFO level so admins reading the pod log can
+                    # see which variant recovered.
+                    if label_for_log:
+                        print(f"[face-filter] {label_for_log}: recovered via {name} (significant)")
+                    return faces, name, arr2.shape[:2]
         except Exception as e:
             print(f"[face-filter] fallback {name} errored: {e}")
+
+    # No variant produced a significant face. If we collected ANY detection
+    # along the way (even a tiny one), return that — better to attempt
+    # matching against a noise blob than return zero faces (zero-face means
+    # the safety filter passes the image through). The matching threshold
+    # (cosine ≥ 0.55 against a real identity) protects us from random
+    # noise scoring as a real person.
+    if best_faces:
+        if label_for_log:
+            print(f"[face-filter] {label_for_log}: only tiny detections found, "
+                  f"best via {best_fallback} (area_ratio={best_area:.5f})")
+        return best_faces, best_fallback, best_shape
 
     return [], None, arr.shape[:2]
 

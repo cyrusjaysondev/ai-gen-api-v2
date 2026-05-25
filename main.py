@@ -1544,8 +1544,8 @@ async def flux_face_swap(
     cfg: float = Form(1.0),
     guidance: float = Form(4.0),
     lora_strength: float = Form(1.0),
-    face_filter: bool = Form(False, description="Reject the request if either input image matches a face in /workspace/blocklist/. Off by default."),
-    logo_filter: bool = Form(False, description="Reject the request if either input image matches a logo/flag in /workspace/blocklist_logos/. Off by default."),
+    face_filter: bool = Form(True, description="Reject the request if either input image matches a face in /workspace/blocklist/. ON by default — clients must explicitly pass face_filter=false to skip (and the proxies/edge functions always force True so this default only matters for direct pod callers)."),
+    logo_filter: bool = Form(True, description="Reject the request if either input image matches a logo/flag in /workspace/blocklist_logos/. ON by default — same defense-in-depth rationale as face_filter."),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark."),
     watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
 ):
@@ -1730,8 +1730,8 @@ async def flux_image_to_image(
     composition_mode: str = Form("none", description="Pre-baked prompt + LoRA preset for prompt-less callers. `none` (default) = no template, behaves like before. `auto` | `scene_blend` | `outfit_swap` | `style_transfer` = use that mode's template. See API.md → Composition modes."),
     quality_preset: str = Form("none", description="`none` (default) = use `steps` directly. `fast` = 4 steps, `balanced` = 8 steps, `high` = 12 steps. Overrides `steps` when set."),
     scene_image_index: int = Form(-1, description="For `composition_mode=scene_blend` only: which input image is the scene/canvas. -1 (default) = last image, which matches the typical 'user uploads first, library scene last' UI flow. Ignored for other modes.", ge=-1, le=4),
-    face_filter: bool = Form(False, description="Reject if any input image matches a face in /workspace/blocklist/. Off by default."),
-    logo_filter: bool = Form(False, description="Reject if any input image matches a logo/flag in /workspace/blocklist_logos/. Off by default."),
+    face_filter: bool = Form(True, description="Reject if any input image matches a face in /workspace/blocklist/. ON by default — clients must explicitly pass false to skip. Proxies/edge functions always force True so this default only matters for direct pod callers."),
+    logo_filter: bool = Form(True, description="Reject if any input image matches a logo/flag in /workspace/blocklist_logos/. ON by default — same defense-in-depth rationale as face_filter."),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark."),
     watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
 ):
