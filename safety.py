@@ -188,6 +188,30 @@ def _detect_with_fallbacks(app, pil_image, *, np, label_for_log: str = ""):
         cw, ch = cropped.size
         return cropped.resize((cw * scale, ch * scale), _Image.LANCZOS)
 
+    def _pad_out(im, factor: float, fill=(255, 255, 255)):
+        """Surround the image with a solid border so the face occupies a
+        smaller fraction of the canvas. Critical for the under-recognized
+        SCRFD failure mode: face TOO BIG (filling >60% of frame). SCRFD's
+        anchor boxes are tuned for faces at 10-30% of frame — when a face
+        is the entire image (clear portrait crops, profile pics) the
+        detector can fail. Padding (zoom out) brings the face into the
+        anchor sweet spot.
+          factor=1.5 → final canvas 1.5× the original (face goes from
+                       100% → ~44% of canvas)
+          factor=2.0 → final canvas 2× the original (face goes to 25%)
+        White fill is chosen because most face-swap inputs have light
+        backgrounds; for dark-background inputs the border could create
+        an edge that SCRFD interprets as a structural feature, but in
+        practice padding is harmless even when imperfect.
+        """
+        w, h = im.size
+        nw, nh = int(w * factor), int(h * factor)
+        canvas = _Image.new("RGB", (nw, nh), fill)
+        # Paste centered.
+        ox, oy = (nw - w) // 2, (nh - h) // 2
+        canvas.paste(im, (ox, oy))
+        return canvas
+
     variants = [
         ("autocontrast",       lambda im: _ImageOps.autocontrast(im, cutoff=2)),
         ("autocontrast+sharpen", lambda im: _ImageOps.autocontrast(im, cutoff=2).filter(
@@ -196,6 +220,18 @@ def _detect_with_fallbacks(app, pil_image, *, np, label_for_log: str = ""):
         # try it BEFORE upscaling because it's faster and a successful
         # detection at original resolution gives a more accurate embedding.
         ("clahe",              _clahe),
+        # ── PAD-OUT VARIANTS (face too big) ──
+        # Crystal-clear portrait crops (e.g. profile pictures cropped
+        # tightly around the face) often fail SCRFD detection because
+        # the face exceeds the anchor box scale range. Zooming OUT by
+        # padding brings the face back into a detectable scale. Try
+        # WHITE padding first (common for headshot backdrops), then
+        # BLACK (for dark-background inputs). These run early in the
+        # chain because they're cheap (just paste onto a larger canvas)
+        # and target a common failure mode the previous chain missed.
+        ("pad_white_1.5x",     lambda im: _pad_out(im, 1.5, fill=(255, 255, 255))),
+        ("pad_white_2x",       lambda im: _pad_out(im, 2.0, fill=(255, 255, 255))),
+        ("pad_black_2x",       lambda im: _pad_out(im, 2.0, fill=(0, 0, 0))),
         # Gamma variants help when the face is silhouetted (gamma>1) or
         # the face is very bright on a dark background (gamma<1).
         ("gamma_0.7_dark",     lambda im: _gamma(im, 0.7)),
@@ -206,6 +242,8 @@ def _detect_with_fallbacks(app, pil_image, *, np, label_for_log: str = ""):
         ("clahe+2x_upscale",   lambda im: _clahe(im).resize((im.size[0] * 2, im.size[1] * 2), _Image.LANCZOS)),
         ("4x_autocontrast",    lambda im: _ImageOps.autocontrast(im, cutoff=2).resize(
             (im.size[0] * 4, im.size[1] * 4), _Image.LANCZOS)),
+        # CLAHE + pad-out — for archival portraits that are ALSO tight crops.
+        ("clahe+pad_white_2x", lambda im: _pad_out(_clahe(im), 2.0, fill=(255, 255, 255))),
         # Crop fallbacks for photos with heavy frames / borders / busy
         # backgrounds that confuse the detector. Tries inner 80% then 60%.
         ("center_crop_80+2x",  lambda im: _center_crop_upscale(im, 0.10, 2)),
@@ -345,9 +383,19 @@ MIN_FACE_AREA_RATIO = float(os.environ.get("FACE_MIN_AREA_RATIO", "0.03"))
 # (so admins don't accidentally add bad photos as identity references),
 # but matching is permissive so real blocks don't slip through just
 # because the target face happens to be small.
-# 0.5% area = ~70×70 face in a 1024² frame — small but a real face,
-# not background noise.
-MIN_FACE_AREA_RATIO_QUERY = float(os.environ.get("FACE_MIN_AREA_RATIO_QUERY", "0.005"))
+#
+# 2026-05-26 LOWERED from 0.005 → 0.0005 (50× more permissive). Real
+# bypass case observed: user uploaded 542×542 thumbnails where the
+# detected face bbox was ~30×30 (0.3% of image area). At the old 0.5%
+# floor those went unmatched even though they cleanly resolved to
+# Hun Sen / To Lam under closer inspection. 0.05% = ~18×18 in a 1024²
+# frame — close to "anything the detector emits with det_thresh=0.1".
+# False-positive risk from comparing tiny detections against the
+# blocklist is bounded by the COSINE-SIMILARITY threshold (0.55), which
+# is independent of size — random noise blobs won't accidentally score
+# >0.55 against a real identity embedding even if they pass the area
+# filter, so loosening here is safe.
+MIN_FACE_AREA_RATIO_QUERY = float(os.environ.get("FACE_MIN_AREA_RATIO_QUERY", "0.0005"))
 
 
 def _count_significant_faces(faces, img_area: int) -> int:
