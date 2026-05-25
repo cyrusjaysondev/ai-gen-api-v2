@@ -2382,11 +2382,30 @@ async def admin_test_face_filter(
     blocklist = filt["blocklist"]
     threshold = filt["threshold"]
 
+    # Two-pass detection so the admin can see BOTH:
+    #   1. raw_faces: what the detector finds on the original image with no
+    #      preprocessing — this is what the OLD test endpoint reported, kept
+    #      for backward compatibility with admin debug habits.
+    #   2. recovered_faces: what `check_image` actually runs in production,
+    #      including the 10-variant preprocessing fallback chain (CLAHE,
+    #      gamma, upscale, center-crops). This is the source of truth for
+    #      "would this image be blocked during a real face-swap?".
+    # The `blocked` verdict below uses the recovered set + the query-side
+    # area threshold (0.5%) — same as the real check_image path.
     raw_faces = app_.get(arr)
+    recovered_faces, fallback_used, (detect_h, detect_w) = face_safety._detect_with_fallbacks(
+        app_, pil, np=np, label_for_log="admin_test",
+    )
+    detect_area = max(1, detect_h * detect_w)
+    # Use the QUERY threshold (0.5%) for the verdict — that's what check_image
+    # uses. The MIN_FACE_AREA_RATIO (3%) is upload-side strict and would give
+    # false-negative verdicts here (e.g. a Hun Sen photo with a small face
+    # would say "not blocked" via that path even though check_image would
+    # absolutely catch it at query time).
     significant_faces = [
-        f for f in raw_faces
+        f for f in recovered_faces
         if (max(0.0, f.bbox[2] - f.bbox[0]) * max(0.0, f.bbox[3] - f.bbox[1])
-            / max(1, img_area)) >= face_safety.MIN_FACE_AREA_RATIO
+            / detect_area) >= face_safety.MIN_FACE_AREA_RATIO_QUERY
     ]
 
     # For each detected face, compute scores against ALL blocklist
@@ -2415,8 +2434,10 @@ async def admin_test_face_filter(
     return {
         "image_size": [img_w, img_h],
         "raw_face_count": len(raw_faces),
+        "recovered_face_count": len(recovered_faces),
+        "fallback_used": fallback_used or "none (raw detection passed)",
         "significant_face_count": len(significant_faces),
-        "min_face_area_ratio": face_safety.MIN_FACE_AREA_RATIO,
+        "min_face_area_ratio_query": face_safety.MIN_FACE_AREA_RATIO_QUERY,
         "match_threshold": threshold,
         "blocked": overall_best[0] > threshold,
         "best_match": {"identity": overall_best[1], "score": round(overall_best[0], 4)} if overall_best[1] else None,
@@ -2424,11 +2445,11 @@ async def admin_test_face_filter(
         "blocklist_size": len(blocklist),
         "skipped_count": len(filt.get("skipped_files", [])),
         "hint": (
-            "raw_face_count=0 → detector failed; try a clearer / higher-contrast image."
-            if not raw_faces
-            else "significant_face_count=0 → face detected but too small (< min_face_area_ratio). Lower FACE_MIN_AREA_RATIO env var, or crop tighter."
+            "recovered_face_count=0 → detector failed even with all 10 preprocessing variants. The face is genuinely undetectable by SCRFD — try a sharper, larger, front-facing crop."
+            if not recovered_faces
+            else "significant_face_count=0 → face detected but too small (< min_face_area_ratio_query). At query time we accept faces down to 0.5% of image area."
             if not significant_faces
-            else f"best score {round(overall_best[0], 4)} < threshold {threshold} → either no match in the loaded blocklist OR your target identity is in skipped_files (check /admin/reload-filter response)."
+            else f"best score {round(overall_best[0], 4)} < threshold {threshold} → either no match in the loaded blocklist OR the target identity is in skipped_files (call /admin/reload-filter to see)."
             if not (overall_best[0] > threshold)
             else "blocked correctly."
         ),
