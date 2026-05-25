@@ -84,6 +84,130 @@ def _maybe_reload():
 _CACHED_APP = None  # InsightFace FaceAnalysis instance — survives blocklist reloads
 
 
+# ─────────────────────────────────────────────
+# Shared detection fallback chain
+#
+# Why this exists: SCRFD (the detector behind buffalo_l) has known blind
+# spots — old archival B&W portraits, washed-out faces, grainy/soft-focus
+# photos, faces that occupy a small fraction of the canvas, oddly-cropped
+# faces with heavy borders. The first detection pass often returns zero
+# faces on these inputs even when a human can clearly see the face.
+#
+# Until 2026-05-25 the fallback chain only ran during blocklist BUILD —
+# `check_image` used a naive single-pass detector. Result: a generation
+# whose input image had any of the above traits silently bypassed the
+# face filter (face_count=0 → return blocked=False → no match attempted).
+# Admins saw the blocklist load 53/86 photos but had no visibility that
+# generation-time checks were ALSO missing on many inputs.
+#
+# This helper unifies the chain so build AND check use the SAME
+# preprocessing variants. The variants below are ordered by speed-to-
+# effectiveness ratio so the common case (face detected on first pass)
+# stays fast (~50ms) and only stubborn images pay the full price (~400ms).
+# ─────────────────────────────────────────────
+
+def _detect_with_fallbacks(app, pil_image, *, np, label_for_log: str = ""):
+    """Run face detection with progressive preprocessing fallbacks.
+
+    Returns (faces, fallback_used, detect_img_shape):
+      faces           — InsightFace face objects from the variant that worked
+      fallback_used   — None if original passed; else the name of the
+                        preprocessing step that recovered (for telemetry)
+      detect_img_shape — (height, width) of the image the detection ran on.
+                        IMPORTANT: bbox coordinates are in this coordinate
+                        system, so callers computing area ratios must use
+                        these dims, not the original image's.
+
+    Idempotent — never modifies the input PIL image.
+    """
+    from PIL import Image as _Image, ImageOps as _ImageOps, ImageFilter as _IF
+
+    # Pass 1: original image, no preprocessing. Most images pass here.
+    arr = np.array(pil_image)
+    faces = app.get(arr)
+    if faces:
+        return faces, None, arr.shape[:2]
+
+    # Build the variant pipeline. Each tuple is (name, transform_fn). Order
+    # matters — cheap + most-likely-to-work first. We DON'T try all of them
+    # exhaustively; we return as soon as one succeeds. The naming should be
+    # stable so the audit log lets admins spot trends ("everything is
+    # recovering via clahe — start uploading clearer photos").
+    def _gamma(im, value: float):
+        """Apply gamma correction. <1.0 darkens midtones (helps washed-out
+        photos), >1.0 brightens (helps backlit / silhouetted faces)."""
+        arr_g = np.array(im).astype(np.float32) / 255.0
+        arr_g = np.power(arr_g, value)
+        return _Image.fromarray((arr_g * 255.0).clip(0, 255).astype(np.uint8))
+
+    def _clahe(im):
+        """Contrast-Limited Adaptive Histogram Equalization — the gold
+        standard for resurrecting faces in faded archival photos. Operates
+        on the L channel of LAB so colors stay sane."""
+        try:
+            import cv2  # opencv-python is already a dependency via insightface
+            arr_c = np.array(im)
+            lab = cv2.cvtColor(arr_c, cv2.COLOR_RGB2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            l2 = clahe.apply(l)
+            merged = cv2.merge((l2, a, b))
+            rgb = cv2.cvtColor(merged, cv2.COLOR_LAB2RGB)
+            return _Image.fromarray(rgb)
+        except Exception:
+            # Fall back to global autocontrast if cv2 is unavailable.
+            return _ImageOps.autocontrast(im, cutoff=2)
+
+    def _center_crop_upscale(im, margin_frac: float, scale: int):
+        w, h = im.size
+        mx, my = int(w * margin_frac), int(h * margin_frac)
+        cropped = im.crop((mx, my, w - mx, h - my))
+        cw, ch = cropped.size
+        return cropped.resize((cw * scale, ch * scale), _Image.LANCZOS)
+
+    variants = [
+        ("autocontrast",       lambda im: _ImageOps.autocontrast(im, cutoff=2)),
+        ("autocontrast+sharpen", lambda im: _ImageOps.autocontrast(im, cutoff=2).filter(
+            _IF.UnsharpMask(radius=1.5, percent=130, threshold=2))),
+        # CLAHE is the biggest single recovery vector for archival photos;
+        # try it BEFORE upscaling because it's faster and a successful
+        # detection at original resolution gives a more accurate embedding.
+        ("clahe",              _clahe),
+        # Gamma variants help when the face is silhouetted (gamma>1) or
+        # the face is very bright on a dark background (gamma<1).
+        ("gamma_0.7_dark",     lambda im: _gamma(im, 0.7)),
+        ("gamma_1.4_bright",   lambda im: _gamma(im, 1.4)),
+        # Upscales help with small faces — try clahe-then-upscale so we get
+        # both benefits without a sixth pass.
+        ("2x_upscale",         lambda im: im.resize((im.size[0] * 2, im.size[1] * 2), _Image.LANCZOS)),
+        ("clahe+2x_upscale",   lambda im: _clahe(im).resize((im.size[0] * 2, im.size[1] * 2), _Image.LANCZOS)),
+        ("4x_autocontrast",    lambda im: _ImageOps.autocontrast(im, cutoff=2).resize(
+            (im.size[0] * 4, im.size[1] * 4), _Image.LANCZOS)),
+        # Crop fallbacks for photos with heavy frames / borders / busy
+        # backgrounds that confuse the detector. Tries inner 80% then 60%.
+        ("center_crop_80+2x",  lambda im: _center_crop_upscale(im, 0.10, 2)),
+        ("center_crop_60+2x",  lambda im: _center_crop_upscale(im, 0.20, 2)),
+    ]
+
+    for name, transform in variants:
+        try:
+            transformed = transform(pil_image)
+            arr2 = np.array(transformed)
+            faces = app.get(arr2)
+            if faces:
+                # Log at INFO level so admins reading the pod log can see
+                # which variant recovered. The label_for_log is the
+                # blocklist filename (build path) or a query hint (check
+                # path) so trends are debuggable.
+                if label_for_log:
+                    print(f"[face-filter] {label_for_log}: recovered via {name}")
+                return faces, name, arr2.shape[:2]
+        except Exception as e:
+            print(f"[face-filter] fallback {name} errored: {e}")
+
+    return [], None, arr.shape[:2]
+
+
 def _build_filter():
     global _FILTER, _FILTER_INIT_ERROR, _CACHED_APP
     try:
@@ -132,11 +256,18 @@ def _build_filter():
     # Load blocklist. Each successful embedding is one identity the
     # filter can actually block at query time. If detection FAILS on a
     # blocklist image, that identity is unblockable until the file is
-    # replaced — so we apply the same autocontrast + larger-canvas
-    # fallbacks that detect_face_count uses on inbound images. Anything
-    # we still can't extract gets logged as a hard miss so admins can
-    # see the gap in /admin/comfy-status or a future stats endpoint.
-    from PIL import ImageOps  # local import — ImageOps isn't bound at top
+    # replaced — so we run the full `_detect_with_fallbacks` chain
+    # (10 preprocessing variants including CLAHE for archival photos,
+    # gamma for backlit shots, upscale for small faces, and crops for
+    # bordered scans). Anything we still can't extract is recorded in
+    # `skipped` so admins can see the gap via /admin/blocklist's
+    # per-entry `loaded` flag.
+    #
+    # The SAME helper is used by `check_image` — so an admin uploading a
+    # tricky reference photo can be confident that if it loaded here, the
+    # detector will also catch the same identity in a generated image
+    # (provided the generation isn't even MORE degraded than the
+    # reference, which is rare for FLUX outputs).
     blocklist: dict[str, "np.ndarray"] = {}
     skipped: list[str] = []
     for img_path in sorted(blocklist_dir.iterdir()) if blocklist_dir.is_dir() else []:
@@ -148,93 +279,9 @@ def _build_filter():
             print(f"[face-filter] WARN: cannot open {img_path.name}: {e}")
             continue
 
-        arr = np.array(pil)
-        faces = app.get(arr)
-
-        # Fallback chain — most blocklist images that fail naive
-        # SCRFD detection at default exposure are recoverable with a
-        # bit of preprocessing. We try progressively stronger
-        # interventions; first one that gets a face wins. Audit logs
-        # tell admins WHICH fallback recovered the file (so old
-        # archive photos can be flagged for replacement with better
-        # crops if too many fall through to the late stages).
-
-        # Fallback 1 — autocontrast (histogram stretch). Recovers
-        # washed-out / older photos.
-        if not faces:
-            try:
-                enhanced = ImageOps.autocontrast(pil, cutoff=2)
-                arr = np.array(enhanced)
-                faces = app.get(arr)
-                if faces:
-                    print(f"[face-filter] {img_path.name}: recovered via autocontrast")
-            except Exception as e:
-                print(f"[face-filter] {img_path.name}: autocontrast errored: {e}")
-
-        # Fallback 2 — autocontrast + sharpen. B&W archive photos
-        # often have soft focus / grain that confuses SCRFD's edge-
-        # sensitive features. Sharpening at 130% strength tightens
-        # those edges.
-        if not faces:
-            try:
-                from PIL import ImageFilter as _IF
-                sharp = ImageOps.autocontrast(pil, cutoff=2).filter(
-                    _IF.UnsharpMask(radius=1.5, percent=130, threshold=2),
-                )
-                arr = np.array(sharp)
-                faces = app.get(arr)
-                if faces:
-                    print(f"[face-filter] {img_path.name}: recovered via autocontrast+sharpen")
-            except Exception as e:
-                print(f"[face-filter] {img_path.name}: sharpen errored: {e}")
-
-        # Fallback 3 — upscale to 2x then retry. Helps when the face
-        # is small relative to the canvas; SCRFD at det_size=1024
-        # still struggles when the face is < ~100px wide in the source.
-        if not faces:
-            try:
-                w, h = pil.size
-                up = pil.resize((w * 2, h * 2), Image.LANCZOS)
-                arr = np.array(up)
-                faces = app.get(arr)
-                if faces:
-                    print(f"[face-filter] {img_path.name}: recovered via 2× upscale")
-            except Exception as e:
-                print(f"[face-filter] {img_path.name}: 2× upscale errored: {e}")
-
-        # Fallback 4 — 4× upscale + autocontrast. Last-resort upsample
-        # for very low-res archival scans where 2× isn't enough.
-        if not faces:
-            try:
-                w, h = pil.size
-                up4 = ImageOps.autocontrast(pil, cutoff=2).resize(
-                    (w * 4, h * 4), Image.LANCZOS,
-                )
-                arr = np.array(up4)
-                faces = app.get(arr)
-                if faces:
-                    print(f"[face-filter] {img_path.name}: recovered via 4× upscale + autocontrast")
-            except Exception as e:
-                print(f"[face-filter] {img_path.name}: 4× upscale errored: {e}")
-
-        # Fallback 5 — center-crop to inner 80% then 2× upscale. Some
-        # blocklist photos have wide borders / frames / busy
-        # backgrounds that confuse the detector; cropping forces
-        # attention to the centered face. Combined with upscale so
-        # the resulting face is large enough to detect.
-        if not faces:
-            try:
-                w, h = pil.size
-                margin_x, margin_y = int(w * 0.1), int(h * 0.1)
-                cropped = pil.crop((margin_x, margin_y, w - margin_x, h - margin_y))
-                cw, ch = cropped.size
-                cropped_up = cropped.resize((cw * 2, ch * 2), Image.LANCZOS)
-                arr = np.array(cropped_up)
-                faces = app.get(arr)
-                if faces:
-                    print(f"[face-filter] {img_path.name}: recovered via center-crop + 2× upscale")
-            except Exception as e:
-                print(f"[face-filter] {img_path.name}: crop+upscale errored: {e}")
+        faces, fallback_used, _ = _detect_with_fallbacks(
+            app, pil, np=np, label_for_log=img_path.name,
+        )
 
         if not faces:
             skipped.append(img_path.name)
@@ -242,7 +289,7 @@ def _build_filter():
             continue
 
         # Use the largest face if multiple are detected (assume the
-        # blocklist image is well-cropped around one identity)
+        # blocklist image is well-cropped around one identity).
         face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
         blocklist[img_path.stem] = face.normed_embedding
     if skipped:
@@ -360,15 +407,22 @@ def force_reload_filter() -> dict:
 def detect_face_count(image_bytes: bytes) -> int:
     """Count significant faces in the image.
 
-    Used by the admin upload endpoint to validate a blocklist entry. We
-    filter detections by bbox area so background noise (a tiny artifact
-    that the detector picks up at low det_thresh) doesn't get counted
-    as a second face and trigger a false "detected 2 faces" rejection.
+    Used by the admin upload endpoint to validate a blocklist entry.
+    Uses the SAME `_detect_with_fallbacks` chain as `_build_filter` and
+    `check_image` — critical invariant: if this returns N>=1, then
+    `_build_filter` will also load this photo (same detector, same
+    preprocessing chain, same input image). The reverse is also true:
+    if a photo gets skipped at build time, it would have returned 0
+    here too. No more "upload accepted but silently skipped at load".
 
-    If the first pass returns 0 significant faces, we retry on a
-    contrast-equalized copy of the image. Older / washed-out portraits
-    often fall below SCRFD's detection floor at default exposure but
-    pass after a histogram stretch.
+    Filters detections by bbox area so background noise (low-confidence
+    pseudo-faces from the permissive det_thresh=0.1) doesn't count as a
+    second face and trigger a false "detected 2 faces" rejection.
+
+    The area filter uses the dimensions of the IMAGE VARIANT that
+    succeeded — `_detect_with_fallbacks` returns those — so a successful
+    recovery via 2x upscale doesn't inflate area ratios against the
+    smaller original.
     """
     _maybe_reload()
     if _FILTER is None:
@@ -381,29 +435,12 @@ def detect_face_count(image_bytes: bytes) -> int:
     except Exception:
         return 0
 
-    arr = np.array(pil)
-    img_h, img_w = arr.shape[:2]
-    img_area = img_h * img_w
-
-    n = _count_significant_faces(app.get(arr), img_area)
-    if n > 0:
-        return n
-
-    # Fallback: enhance and retry. ImageOps.autocontrast stretches the
-    # histogram per channel so washed-out faces look closer to standard
-    # exposure; that alone catches a lot of the "elderly photo" misses.
-    try:
-        from PIL import ImageOps
-        enhanced = ImageOps.autocontrast(pil, cutoff=2)
-        arr2 = np.array(enhanced)
-        n2 = _count_significant_faces(app.get(arr2), img_area)
-        if n2 > 0:
-            print(f"[face-filter] detection recovered via autocontrast fallback (found {n2})")
-            return n2
-    except Exception as e:
-        print(f"[face-filter] autocontrast fallback errored: {e}")
-
-    return 0
+    faces, fallback_used, (detect_h, detect_w) = _detect_with_fallbacks(
+        app, pil, np=np, label_for_log="upload",
+    )
+    if not faces:
+        return 0
+    return _count_significant_faces(faces, max(1, detect_h * detect_w))
 
 
 # Max edge length we store for a blocklist entry. Embeddings are computed by
@@ -446,6 +483,19 @@ def check_image(image_bytes: bytes) -> FilterResult:
     Returns FilterResult(blocked, matched_identity, score, face_count).
     If the filter can't initialize (missing deps, etc.) this raises
     RuntimeError — the caller should decide whether to fail closed or open.
+
+    ── 2026-05-25 — bypass fix ──
+    Previously this function ran SCRFD once on the original image and
+    returned (False, None, 0.0, 0) if detection failed. That silently
+    bypassed the filter whenever the input image happened to confuse the
+    detector — common on FLUX-generated inputs with unusual contrast,
+    archival reference photos used as face-swap targets, or any image
+    where the face is small / faded / oddly cropped.
+    Now it runs the SAME fallback chain as `_build_filter` (autocontrast,
+    sharpen, CLAHE, gamma, 2x/4x upscale, center-crops). If any variant
+    recovers a detection, we proceed to embedding + matching. Plus every
+    call writes one line to /workspace/face_filter_check.log with the
+    outcome so a future bypass is auditable instead of invisible.
     """
     # Self-heal: pick up any blocklist additions/removals since last call.
     _maybe_reload()
@@ -459,37 +509,52 @@ def check_image(image_bytes: bytes) -> FilterResult:
     Image     = _FILTER["Image"]
 
     # An empty blocklist means nothing to compare against → never blocks.
+    # Log it so an admin reviewing bypass.log can distinguish "filter ran
+    # but blocklist empty" from "filter never ran".
     if not blocklist:
+        _log_check(outcome="no_blocklist", score=0.0, identity=None, faces=0, fallback=None)
         return FilterResult(False, None, 0.0, 0)
 
     try:
-        arr = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
-    except Exception as e:
-        # Unparseable image → let the workflow caller surface its own error
+        pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        _log_check(outcome="decode_error", score=0.0, identity=None, faces=0, fallback=None)
         return FilterResult(False, None, 0.0, 0)
 
-    img_h, img_w = arr.shape[:2]
-    img_area = img_h * img_w
-
-    raw_faces = app.get(arr)
+    # Run detection with the FULL fallback chain (same as _build_filter).
+    # This is the actual bypass fix — without the fallbacks, any input
+    # image SCRFD missed on first pass slipped through.
+    raw_faces, fallback_used, (detect_h, detect_w) = _detect_with_fallbacks(
+        app, pil, np=np, label_for_log="query",
+    )
     if not raw_faces:
+        # Truly no face anywhere — log so admins can audit. We can't match
+        # against the blocklist if we can't extract an embedding; this is
+        # the one bypass mode we CAN'T close without a second detector.
+        _log_check(outcome="no_face_detected_even_with_fallbacks",
+                   score=0.0, identity=None, faces=0, fallback=None)
         return FilterResult(False, None, 0.0, 0)
 
-    # Filter detections by area before matching. At det_thresh=0.1 the
-    # detector occasionally produces low-confidence pseudo-faces from
-    # background texture. We use MIN_FACE_AREA_RATIO_QUERY (0.5%)
-    # rather than the upload-side 3%: matching needs to catch real
-    # blocked identities even when they appear small (group shots,
-    # distant subjects, target images where the blocked person is a
-    # secondary element). 0.5% area = ~70×70 face in a 1024² frame,
-    # well above true background noise but small enough to catch
-    # distant blocked subjects.
+    # Filter detections by area before matching. CRITICAL: use the area
+    # of the IMAGE WE ACTUALLY DETECTED ON (which may be a transformed
+    # variant of the original — bboxes are in that coordinate system).
+    # Using the original img_area would give wrong ratios when a fallback
+    # variant succeeded after upscaling.
+    img_area = max(1, detect_h * detect_w)
+
+    # MIN_FACE_AREA_RATIO_QUERY (0.5%) is permissive enough to catch
+    # distant subjects in group shots while still filtering true noise
+    # from the permissive det_thresh=0.1.
     faces = [
         f for f in raw_faces
-        if (max(0.0, f.bbox[2] - f.bbox[0]) * max(0.0, f.bbox[3] - f.bbox[1]) / max(1, img_area)) >= MIN_FACE_AREA_RATIO_QUERY
+        if (max(0.0, f.bbox[2] - f.bbox[0]) * max(0.0, f.bbox[3] - f.bbox[1]) / img_area) >= MIN_FACE_AREA_RATIO_QUERY
     ]
     if not faces:
-        # Detector saw only noise — nothing significant to match.
+        # Detector saw only noise-tier blobs. Log so admins notice if
+        # this happens often — it means MIN_FACE_AREA_RATIO_QUERY may
+        # need tuning, or the input genuinely has no significant face.
+        _log_check(outcome="only_noise_detections",
+                   score=0.0, identity=None, faces=len(raw_faces), fallback=fallback_used)
         return FilterResult(False, None, 0.0, 0)
 
     best_score = -1.0
@@ -504,7 +569,46 @@ def check_image(image_bytes: bytes) -> FilterResult:
                 best_id = identity
 
     blocked = best_score > threshold
+    _log_check(
+        outcome="blocked" if blocked else "no_match",
+        score=best_score, identity=best_id, faces=len(faces), fallback=fallback_used,
+    )
     return FilterResult(blocked, best_id, best_score, len(faces))
+
+
+# ─────────────────────────────────────────────
+# check_image audit log — one line per call. Distinguishes the three
+# bypass scenarios so admins can see WHY an image wasn't blocked:
+#   • outcome=blocked              — match found, generation rejected
+#   • outcome=no_match             — face detected, no blocklist match
+#   • outcome=only_noise           — detector found blobs below area floor
+#   • outcome=no_face_detected_*   — detector + 10 fallbacks all failed
+#   • outcome=no_blocklist         — blocklist is empty (admin error)
+#   • outcome=decode_error         — input bytes not a valid image
+# Use `tail -f /workspace/face_filter_check.log | grep no_face_detected`
+# to surface bypass-risk inputs in real time.
+# ─────────────────────────────────────────────
+
+FACE_FILTER_CHECK_LOG = Path(os.environ.get("FACE_FILTER_CHECK_LOG", "/workspace/face_filter_check.log"))
+
+
+def _log_check(*, outcome: str, score: float, identity: Optional[str],
+               faces: int, fallback: Optional[str]) -> None:
+    """Append one line to the check log. Best-effort — never raises."""
+    try:
+        FACE_FILTER_CHECK_LOG.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).isoformat()
+        line = (
+            f"{ts}\toutcome={outcome}"
+            f"\tscore={score:.4f}"
+            f"\tidentity={identity or '-'}"
+            f"\tfaces={faces}"
+            f"\tfallback={fallback or 'none'}\n"
+        )
+        with open(FACE_FILTER_CHECK_LOG, "a") as f:
+            f.write(line)
+    except Exception:
+        pass  # never let logging break the filter
 
 
 # ─────────────────────────────────────────────

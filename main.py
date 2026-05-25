@@ -276,7 +276,32 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                   watermark_text: str | None = None,
                   watermark_image: bool = False,
                   audio_source_path: str | None = None,
-                  trim_first_half: bool = False):
+                  trim_first_half: bool = False,
+                  *,
+                  output_face_filter: bool = False,
+                  output_logo_filter: bool = False,
+                  output_endpoint: str = "/unknown"):
+    """Generic ComfyUI job runner.
+
+    ── output_face_filter / output_logo_filter ──
+    When true, the generated image (NOT video — videos skip output scan
+    for now) is run through face_safety.check_image / logo_safety.check_image
+    BEFORE watermarking / thumbnail / URL exposure. Catches blocked
+    identities or logos that ended up in the OUTPUT despite passing the
+    INPUT check — necessary for:
+      - /t2i: no input image at all, so input check is meaningless
+      - /flux/face-swap: face-swap can introduce a blocklist identity in
+        the OUTPUT even when neither input matched (e.g. prompt-only
+        identity adjustment in some workflows)
+      - /flux/i2i: same — i2i can morph an input face toward a blocked
+        identity if the prompt suggests it
+
+    `output_endpoint` is the originating endpoint path; logged for audit
+    so admins can see "X /t2i jobs blocked at output stage today".
+
+    A blocked output is deleted from disk and the job is marked failed
+    with status="blocked" so the client gets a clear error instead of
+    a generic completion."""
     jobs[job_id] = {**jobs.get(job_id, {}), "status": "processing", "started_at": datetime.now(timezone.utc).isoformat()}
     try:
         client_id = str(uuid.uuid4())
@@ -327,10 +352,96 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                     path = OUTPUT_DIR / subfolder / filename if subfolder else OUTPUT_DIR / filename
                     if path.exists():
                         ext = Path(filename).suffix.lower()
-                        if ext in [".png", ".jpg", ".jpeg", ".webp"]:
+                        is_image_output = ext in [".png", ".jpg", ".jpeg", ".webp"]
+                        if is_image_output:
                             url = f"{BASE_URL}/image/{filename}"
                         else:
                             url = f"{BASE_URL}/video/{filename}"
+
+                        # ── OUTPUT-SIDE FACE FILTER ──────────────────
+                        # Scan the generated image against the blocklist
+                        # BEFORE watermarking / thumbnail / URL exposure.
+                        # This is the last line of defense against:
+                        #   • /t2i prompts that produce a blocked identity
+                        #     (no input image, so no input check possible)
+                        #   • face-swap workflows that introduce a blocked
+                        #     identity in the output via prompt drift
+                        #   • i2i edits that morph an input face toward a
+                        #     blocked identity
+                        # On block: delete the file (so even a leaked URL
+                        # can't fetch it), then mark the job failed with
+                        # status="blocked" so the client sees the rejection.
+                        # Skipped for videos — output frame extraction +
+                        # per-frame scanning is a separate (future) effort.
+                        if output_face_filter and is_image_output and face_safety is not None:
+                            try:
+                                output_bytes = path.read_bytes()
+                                face_result = face_safety.check_image(output_bytes)
+                                if face_result.blocked:
+                                    print(f"[{job_id}] OUTPUT BLOCKED by face filter "
+                                          f"(endpoint={output_endpoint}, "
+                                          f"identity={face_result.matched_identity}, "
+                                          f"score={face_result.score:.4f})")
+                                    try:
+                                        path.unlink()
+                                    except Exception as del_err:
+                                        print(f"[{job_id}] could not delete blocked output {path}: {del_err}")
+                                    jobs[job_id] = {
+                                        **jobs[job_id],
+                                        "status": "failed",
+                                        "blocked": True,
+                                        "error": "blocked",
+                                        "filter": "face",
+                                        "reason": f"output image matches blocked face identity",
+                                        "matched_identity": face_result.matched_identity,
+                                        "score": round(face_result.score, 4),
+                                        "endpoint": output_endpoint,
+                                        "failed_at": datetime.now(timezone.utc).isoformat(),
+                                    }
+                                    return
+                            except RuntimeError as filter_err:
+                                # Filter unavailable — be loud about it but
+                                # don't block the job. Fail-open is correct
+                                # here because failing-closed would brick
+                                # ALL generation on a filter init bug.
+                                print(f"[{job_id}] WARN: output face filter unavailable: {filter_err}")
+                            except Exception as filter_err:
+                                print(f"[{job_id}] WARN: output face filter raised: {filter_err}")
+
+                        # ── OUTPUT-SIDE LOGO FILTER ──────────────────
+                        # Same idea for the logo/flag blocklist (CLIP-based).
+                        # Catches "draw the [forbidden] flag" prompts on /t2i.
+                        if output_logo_filter and is_image_output and logo_safety is not None:
+                            try:
+                                output_bytes = path.read_bytes()
+                                logo_result = logo_safety.check_image(output_bytes)
+                                if logo_result.blocked:
+                                    print(f"[{job_id}] OUTPUT BLOCKED by logo filter "
+                                          f"(endpoint={output_endpoint}, "
+                                          f"logo={logo_result.matched_logo}, "
+                                          f"score={logo_result.score:.4f})")
+                                    try:
+                                        path.unlink()
+                                    except Exception as del_err:
+                                        print(f"[{job_id}] could not delete blocked output {path}: {del_err}")
+                                    jobs[job_id] = {
+                                        **jobs[job_id],
+                                        "status": "failed",
+                                        "blocked": True,
+                                        "error": "blocked",
+                                        "filter": "logo",
+                                        "reason": f"output image matches blocked logo/flag",
+                                        "matched_logo": logo_result.matched_logo,
+                                        "score": round(logo_result.score, 4),
+                                        "endpoint": output_endpoint,
+                                        "failed_at": datetime.now(timezone.utc).isoformat(),
+                                    }
+                                    return
+                            except RuntimeError as filter_err:
+                                print(f"[{job_id}] WARN: output logo filter unavailable: {filter_err}")
+                            except Exception as filter_err:
+                                print(f"[{job_id}] WARN: output logo filter raised: {filter_err}")
+
                         # Optional reference-audio mux — only used by
                         # /ltx/motion right now. Runs BEFORE watermark so
                         # the (re-encoded) watermark video carries the
@@ -609,6 +720,15 @@ class T2IRequest(BaseModel):
     guidance: float = 4.0
     watermark: str | None = None  # e.g. "AI" — overlay at bottom-right; null/empty = off
     watermark_image: bool = False  # composite the GenReel logo at bottom-right
+    # Output-side face filter — applied AFTER generation. /t2i has no input
+    # image so this is the only way a Hun Sen / blocked-identity prompt can
+    # be caught. The proxy (runpod-image-proxy) forces this true for prod
+    # traffic; admin curl can pass false to test, which is logged to
+    # /workspace/face_filter_bypass.log.
+    face_filter: bool = False
+    # Output-side logo filter — same reasoning as face_filter but for
+    # blocked logos/flags. Catches "draw the [logo] flag" prompts.
+    logo_filter: bool = False
 
 @app.post("/t2i")
 async def text_to_image(req: T2IRequest, background_tasks: BackgroundTasks):
@@ -619,7 +739,18 @@ async def text_to_image(req: T2IRequest, background_tasks: BackgroundTasks):
     )
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    background_tasks.add_task(run_job, job_id, workflow, None, req.watermark, req.watermark_image)
+    # Pass face_filter / logo_filter down to run_job so it scans the OUTPUT
+    # before exposing the result URL. /t2i has no input image, so this is
+    # the ONLY safety check that runs for this endpoint.
+    if not req.face_filter and face_safety is not None:
+        face_safety.log_bypass(job_id, "/t2i", note="face_filter=false (output check skipped)")
+    if not req.logo_filter and face_safety is not None:
+        face_safety.log_bypass(job_id, "/t2i", note="logo_filter=false (output check skipped)")
+    background_tasks.add_task(
+        run_job, job_id, workflow, None, req.watermark, req.watermark_image,
+        output_face_filter=req.face_filter, output_logo_filter=req.logo_filter,
+        output_endpoint="/t2i",
+    )
     return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
 
@@ -1450,7 +1581,14 @@ async def flux_face_swap(
     workflow = get_flux_face_swap_workflow(target_filename, face_filename, seed, megapixels=megapixels, steps=steps, cfg=cfg, guidance=guidance, lora_strength=lora_strength)
 
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    background_tasks.add_task(run_job, job_id, workflow, [target_path, face_path], watermark, watermark_image)
+    # Output-side filter runs AFTER the swap completes — catches the case
+    # where neither input matched but the swapped output ended up looking
+    # like a blocked identity (e.g. LoRA drift in face-swap mode).
+    background_tasks.add_task(
+        run_job, job_id, workflow, [target_path, face_path], watermark, watermark_image,
+        output_face_filter=face_filter, output_logo_filter=logo_filter,
+        output_endpoint="/flux/face-swap",
+    )
     return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
 
@@ -1660,7 +1798,14 @@ async def flux_image_to_image(
     )
 
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    background_tasks.add_task(run_job, job_id, workflow, cleanup_paths, watermark, watermark_image)
+    # Output-side filter runs AFTER the edit completes — catches the case
+    # where the prompt morphs an input face toward a blocked identity even
+    # though the unedited input didn't match.
+    background_tasks.add_task(
+        run_job, job_id, workflow, cleanup_paths, watermark, watermark_image,
+        output_face_filter=face_filter, output_logo_filter=logo_filter,
+        output_endpoint="/flux/i2i",
+    )
     return {
         "job_id": job_id,
         "status": "queued",
@@ -2422,6 +2567,73 @@ async def admin_upload_blocklist(
         "blocklist_count": _blocklist_count(),
         "face_count": face_count,
         "warning": warning,
+    }
+
+
+@app.delete("/admin/blocklist")
+async def admin_clear_blocklist(
+    confirm: bool = False,
+    authorization: str = Header(default=None),
+):
+    """DESTRUCTIVE — delete every face image in /workspace/blocklist.
+
+    Used by the CMS "delete all blocked faces" flow when an admin wants
+    a clean slate to re-upload from scratch (e.g. after tuning the
+    detection chain and wanting to verify which photos load now).
+
+    Requires `?confirm=true` so a stray `curl -X DELETE` against the
+    admin URL doesn't nuke production. Returns the count of deleted
+    files plus the freshly-reloaded filter status so the caller can
+    confirm the wipe took effect.
+
+    Reloads the in-memory filter immediately so check_image() sees the
+    empty blocklist on the very next request (no waiting for the
+    mtime-based auto-reload).
+
+    Does NOT touch the logo blocklist (/workspace/blocklist_logos) —
+    that has its own DELETE endpoint family. Each blocklist is wiped
+    independently so admins can clean one without losing the other.
+    """
+    _require_admin(authorization)
+    if not confirm:
+        raise HTTPException(400, {
+            "error": "destructive operation",
+            "hint": "pass ?confirm=true to proceed — this deletes ALL files in /workspace/blocklist",
+            "current_count": _blocklist_count(),
+        })
+
+    BLOCKLIST_DIR.mkdir(parents=True, exist_ok=True)
+    deleted: list[str] = []
+    errors: list[dict] = []
+    for p in sorted(BLOCKLIST_DIR.iterdir()):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in ALLOWED_BLOCKLIST_EXTS:
+            continue
+        try:
+            p.unlink()
+            deleted.append(p.name)
+        except Exception as e:
+            errors.append({"file": p.name, "error": str(e)})
+            print(f"[admin_clear_blocklist] could not delete {p}: {e}")
+
+    # Reload the face filter so check_image() sees the wipe immediately.
+    # Best-effort — if the filter module is unavailable (insightface not
+    # installed) the directory wipe still succeeded and the next reload
+    # cycle will catch up.
+    reload_result: dict = {"ok": False, "reason": "face_safety module unavailable"}
+    if face_safety is not None:
+        try:
+            reload_result = face_safety.force_reload_filter()
+        except Exception as e:
+            reload_result = {"ok": False, "error": str(e)}
+
+    return {
+        "status": "cleared",
+        "deleted_count": len(deleted),
+        "deleted": deleted,
+        "errors": errors,
+        "filter_reload": reload_result,
     }
 
 
