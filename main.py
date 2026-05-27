@@ -719,11 +719,7 @@ class T2IRequest(BaseModel):
     cfg: float = 1.0
     guidance: float = 4.0
     watermark: str | None = None  # e.g. "AI" — overlay at bottom-right; null/empty = off
-    # ON by default — every generated image should carry the GenReel/Metfone
-    # logo so outputs are visibly branded. Clients can pass false explicitly
-    # (admin/test). All production clients (viralreel runpodImageService,
-    # genaivn runpodImageService) already send true on every /t2i submit.
-    watermark_image: bool = True  # composite the GenReel logo at bottom-right
+    watermark_image: bool = False  # composite the GenReel logo at bottom-right
     # Output-side face filter — applied AFTER generation. /t2i has no input
     # image so this is the only way a Hun Sen / blocked-identity prompt can
     # be caught. The proxy (runpod-image-proxy) forces this true for prod
@@ -1551,7 +1547,7 @@ async def flux_face_swap(
     face_filter: bool = Form(True, description="Reject the request if either input image matches a face in /workspace/blocklist/. ON by default — clients must explicitly pass face_filter=false to skip (and the proxies/edge functions always force True so this default only matters for direct pod callers)."),
     logo_filter: bool = Form(True, description="Reject the request if either input image matches a logo/flag in /workspace/blocklist_logos/. ON by default — same defense-in-depth rationale as face_filter."),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark."),
-    watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. OFF by default for face-swap — per product decision the AI-watermark logo only goes on pure image-generation outputs (/t2i, /flux/i2i). Face-swap output is the user's own face in a scene; a logo would conflict with the artwork. Stacks with `watermark` if both are set; clients can still pass true explicitly per request."),
+    watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
 ):
     seed = seed if seed != -1 else uuid.uuid4().int % 2**32
 
@@ -1737,7 +1733,7 @@ async def flux_image_to_image(
     face_filter: bool = Form(True, description="Reject if any input image matches a face in /workspace/blocklist/. ON by default — clients must explicitly pass false to skip. Proxies/edge functions always force True so this default only matters for direct pod callers."),
     logo_filter: bool = Form(True, description="Reject if any input image matches a logo/flag in /workspace/blocklist_logos/. ON by default — same defense-in-depth rationale as face_filter."),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark."),
-    watermark_image: bool = Form(True, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. ON by default — every i2i output is branded. Stacks with `watermark` if both are set. Clients can pass false explicitly (admin/test); all production clients (viralreel runpodImageService, genaivn runpodImageService) already send true."),
+    watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
 ):
     if not 1 <= len(images) <= 5:
         raise HTTPException(400, f"images must be 1–5 files, got {len(images)}")
