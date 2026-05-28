@@ -55,8 +55,11 @@ LOGO_URL = (
 # the GenReel mark less dominant. Both width and height scale together so
 # this also halves the rendered height.
 _LOGO_SCALE = 0.07
-# Padding from the edge, as a fraction of the shorter side.
+# Padding from the side edges, as a fraction of the shorter side.
 _EDGE_PAD = 0.03
+# Extra padding from the bottom edge — larger so the logo stays above the
+# app's download bar / player controls on mobile (roughly 8 % of shorter side).
+_BOTTOM_PAD = 0.08
 
 
 def apply(path, text: str = "AI") -> None:
@@ -314,8 +317,9 @@ def _apply_image_logo(p: Path) -> None:
     logo = logo.resize((target_w, target_h), Image.LANCZOS)
 
     pad = max(8, int(shorter * _EDGE_PAD))
+    bottom_pad = max(8, int(shorter * _BOTTOM_PAD))
     x = base.width - target_w - pad
-    y = base.height - target_h - pad
+    y = base.height - target_h - bottom_pad
     # Use the logo's own alpha as the paste mask so PNG transparency is honoured.
     base.alpha_composite(logo, dest=(x, y))
 
@@ -334,15 +338,17 @@ def _apply_image_logo(p: Path) -> None:
 def _apply_video_logo(p: Path) -> None:
     """Overlay LOGO_PATH onto the video at `p` via ffmpeg `overlay`.
 
-    The logo is sized to ~7 % of the video's shorter side, padded ~3 %
-    from the bottom-right. We probe the input first and bake concrete
-    integers into the filter string so ffmpeg's filtergraph parser (which
-    treats commas as filter separators) doesn't mistokenise `max(...,
-    ...)` expressions.
+    The logo is sized to ~7 % of the video's shorter side. Side padding is
+    ~3 % of the shorter side; bottom padding is ~8 % so the mark clears the
+    app's download bar / player controls on mobile. We probe the input first
+    and bake concrete integers into the filter string so ffmpeg's filtergraph
+    parser (which treats commas as filter separators) doesn't mistokenise
+    `max(..., ...)` expressions.
     """
     w, h = _probe_dimensions(p)
     shorter = min(w, h)
     pad = max(8, int(shorter * _EDGE_PAD))
+    bottom_pad = max(8, int(shorter * _BOTTOM_PAD))
     target_w = max(32, int(shorter * _LOGO_SCALE))
 
     tmp = p.with_name(f"{p.stem}.wm{p.suffix}")
@@ -351,7 +357,7 @@ def _apply_video_logo(p: Path) -> None:
     filter_complex = (
         f"[1:v]scale={target_w}:-1[wm];"
         f"[0:v][wm]overlay=x=main_w-overlay_w-{pad}:"
-        f"y=main_h-overlay_h-{pad}:format=auto"
+        f"y=main_h-overlay_h-{bottom_pad}:format=auto"
     )
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
