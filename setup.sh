@@ -361,6 +361,34 @@ else
   fi
 fi
 
+# Zodiac overlays (caption_icon option: gold sign glyph + gold divider)
+# ─────────────────────────────────────────────
+# 12 sign glyphs + one gold divider, kept on the volume for the horoscope
+# caption design. watermark.py loads them lazily for `caption_icon` and
+# silently degrades to text-only if any are missing, so a blip here is
+# non-fatal. Fetched from the repo (same source of truth as the API code).
+ZODIAC_DIR="$ASSETS_DIR/zodiac-overlays"
+mkdir -p "$ZODIAC_DIR/icons"
+if [ -s "$ZODIAC_DIR/divider-gold.png" ] && [ "$(ls -1 "$ZODIAC_DIR"/icons/*.png 2>/dev/null | wc -l)" -ge 12 ]; then
+  log "  Zodiac overlays already on volume ($(ls -1 "$ZODIAC_DIR"/icons/*.png 2>/dev/null | wc -l) glyphs + divider)"
+else
+  log "  Downloading zodiac overlays (12 glyphs + divider)..."
+  zod_ok=0
+  for sign in aries taurus gemini cancer leo virgo libra scorpio sagittarius capricorn aquarius pisces; do
+    if wget -qO "$ZODIAC_DIR/icons/$sign.png" "$API_REPO/assets/zodiac-overlays/icons/$sign.png" && [ -s "$ZODIAC_DIR/icons/$sign.png" ]; then
+      zod_ok=$((zod_ok + 1))
+    else
+      rm -f "$ZODIAC_DIR/icons/$sign.png"
+    fi
+  done
+  if wget -qO "$ZODIAC_DIR/divider-gold.png" "$API_REPO/assets/zodiac-overlays/divider-gold.png" && [ -s "$ZODIAC_DIR/divider-gold.png" ]; then
+    log "    Zodiac overlays: $zod_ok/12 glyphs + divider saved"
+  else
+    rm -f "$ZODIAC_DIR/divider-gold.png"
+    log "    WARN: divider download failed — caption_icon will show the glyph only ($zod_ok/12 glyphs)"
+  fi
+fi
+
 # ─────────────────────────────────────────────
 # 3. Custom nodes: LanPaint (FLUX face swap) + ComfyUI-KJNodes (ColorMatch for i2v)
 # KJNodes ships with runpod/comfyui:latest at the time of writing — this clone is
