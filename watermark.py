@@ -398,6 +398,29 @@ _CAPTION_LINE_SPACING = 1.25    # multiple of the font's line height
 _CAPTION_FADE_START = 1.0
 _CAPTION_FADE_DUR = 0.6
 
+# Optional zodiac icon + gold divider stacked above the caption text. Assets
+# live on the shared network volume (uploaded once; visible to every pod).
+ZODIAC_DIR = Path("/workspace/assets/zodiac-overlays")
+_VALID_SIGNS = {
+    "aries", "taurus", "gemini", "cancer", "leo", "virgo",
+    "libra", "scorpio", "sagittarius", "capricorn", "aquarius", "pisces",
+}
+_CAPTION_ICON_SCALE = 0.16      # zodiac glyph width as fraction of shorter side
+_CAPTION_DIVIDER_SCALE = 0.62   # gold divider width as fraction of frame width
+_CAPTION_ELEM_GAP = 0.012       # vertical gap between icon/divider/text
+
+
+def _resolve_zodiac_icon(icon_sign: str | None) -> Path | None:
+    """Map a sign name (e.g. 'taurus', 'Taurus ♉') to its icon path, or None.
+    Sanitised to the 12 known signs so the caller can't path-traverse."""
+    if not icon_sign:
+        return None
+    sign = "".join(c for c in icon_sign.lower() if c.isalpha())
+    if sign not in _VALID_SIGNS:
+        return None
+    p = ZODIAC_DIR / "icons" / f"{sign}.png"
+    return p if p.exists() else None
+
 
 def _wrap_text_to_width(text: str, font, draw, stroke: int, max_width: int) -> list[str]:
     """Greedy word-wrap so each rendered line fits within `max_width` px."""
@@ -421,9 +444,22 @@ def _wrap_text_to_width(text: str, font, draw, stroke: int, max_width: int) -> l
     return lines
 
 
-def _render_caption_overlay(text: str, width: int, height: int) -> Image.Image:
-    """Return a transparent RGBA image (width x height) with `text` rendered as
-    centered, stroked white lines in the lower third."""
+def _scaled_asset(path: Path, target_w: int) -> Image.Image | None:
+    """Load an RGBA asset and scale it to target_w preserving aspect ratio."""
+    try:
+        img = Image.open(path).convert("RGBA")
+        h = max(1, int(img.height * (target_w / img.width)))
+        return img.resize((max(1, target_w), h), Image.LANCZOS)
+    except Exception:
+        return None
+
+
+def _render_caption_overlay(text: str, width: int, height: int,
+                            icon_sign: str | None = None) -> Image.Image:
+    """Return a transparent RGBA image (width x height) with the caption stacked
+    in the lower third: optional zodiac glyph, optional gold divider, then the
+    centered, stroked white text. The icon/divider only appear when a valid
+    zodiac sign is given (horoscope use); otherwise it's plain body text."""
     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     shorter = min(width, height)
@@ -433,14 +469,39 @@ def _render_caption_overlay(text: str, width: int, height: int) -> Image.Image:
 
     max_width = max(1, int(width * (1 - 2 * _CAPTION_SIDE_PAD)))
     lines = _wrap_text_to_width(text, font, draw, stroke, max_width)
-    if not lines:
-        return overlay
 
     ascent, descent = font.getmetrics()
     line_h = int((ascent + descent) * _CAPTION_LINE_SPACING)
-    block_h = line_h * len(lines)
+    text_block_h = line_h * len(lines) if lines else 0
+    gap = max(6, int(shorter * _CAPTION_ELEM_GAP))
+
+    # Optional zodiac glyph + gold divider (only when a valid sign is given,
+    # and only the divider when the icon resolves — they're a horoscope pair).
+    icon_img = div_img = None
+    icon_path = _resolve_zodiac_icon(icon_sign)
+    if icon_path is not None:
+        icon_img = _scaled_asset(icon_path, max(32, int(shorter * _CAPTION_ICON_SCALE)))
+        div_path = ZODIAC_DIR / "divider-gold.png"
+        if icon_img is not None and div_path.exists():
+            div_img = _scaled_asset(div_path, max(32, int(width * _CAPTION_DIVIDER_SCALE)))
+
+    total_h = text_block_h
+    if icon_img is not None:
+        total_h += icon_img.height + gap
+    if div_img is not None:
+        total_h += div_img.height + gap
+    if total_h == 0:
+        return overlay
+
     bottom_pad = max(12, int(shorter * _CAPTION_BOTTOM_PAD))
-    y = height - bottom_pad - block_h
+    y = height - bottom_pad - total_h
+
+    if icon_img is not None:
+        overlay.alpha_composite(icon_img, dest=((width - icon_img.width) // 2, y))
+        y += icon_img.height + gap
+    if div_img is not None:
+        overlay.alpha_composite(div_img, dest=((width - div_img.width) // 2, y))
+        y += div_img.height + gap
 
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke)
@@ -455,10 +516,14 @@ def _render_caption_overlay(text: str, width: int, height: int) -> Image.Image:
     return overlay
 
 
-def apply_caption(path, text: str, fade_in: bool = True) -> None:
+def apply_caption(path, text: str, fade_in: bool = True,
+                  icon_sign: str | None = None) -> None:
     """Overlay `text` as a styled lower-third caption on the file at `path`,
-    in place. Images: static. Videos: fades in ~1s after start. No-op on
-    empty text or unknown extension; failures leave the original intact."""
+    in place. When `icon_sign` is a valid zodiac sign, a gold glyph + divider
+    are stacked above the text. Images: static. Videos: fades in ~1s after
+    start. No-op on empty text/unknown extension; failures leave the original
+    intact. NOTE: an empty/None `text` is still a no-op even if icon_sign is
+    set — pass at least a space if you want icon-only."""
     if text is None:
         return
     text = text.strip()
@@ -467,16 +532,16 @@ def apply_caption(path, text: str, fade_in: bool = True) -> None:
     p = Path(path)
     ext = p.suffix.lower()
     if ext in IMAGE_EXTS:
-        _apply_image_caption(p, text)
+        _apply_image_caption(p, text, icon_sign)
     elif ext in VIDEO_EXTS:
-        _apply_video_caption(p, text, fade_in)
+        _apply_video_caption(p, text, fade_in, icon_sign)
 
 
-def _apply_image_caption(p: Path, text: str) -> None:
+def _apply_image_caption(p: Path, text: str, icon_sign: str | None = None) -> None:
     base = Image.open(p)
     original_mode = base.mode
     base = base.convert("RGBA")
-    overlay = _render_caption_overlay(text, base.width, base.height)
+    overlay = _render_caption_overlay(text, base.width, base.height, icon_sign)
     base.alpha_composite(overlay)
 
     ext = p.suffix.lower()
@@ -490,9 +555,10 @@ def _apply_image_caption(p: Path, text: str) -> None:
         base.save(p)
 
 
-def _apply_video_caption(p: Path, text: str, fade_in: bool) -> None:
+def _apply_video_caption(p: Path, text: str, fade_in: bool,
+                         icon_sign: str | None = None) -> None:
     w, h = _probe_dimensions(p)
-    overlay = _render_caption_overlay(text, w, h)
+    overlay = _render_caption_overlay(text, w, h, icon_sign)
     cap_png = p.with_name(f"{p.stem}.caption.png")
     overlay.save(cap_png)
 

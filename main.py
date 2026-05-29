@@ -281,7 +281,8 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                   output_face_filter: bool = False,
                   output_logo_filter: bool = False,
                   output_endpoint: str = "/unknown",
-                  caption: str | None = None):
+                  caption: str | None = None,
+                  caption_icon: str | None = None):
     """Generic ComfyUI job runner.
 
     ── output_face_filter / output_logo_filter ──
@@ -500,7 +501,7 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                         # non-fatal — the un-captioned file is still valid.
                         if caption and watermark is not None:
                             try:
-                                watermark.apply_caption(path, caption)
+                                watermark.apply_caption(path, caption, icon_sign=caption_icon)
                             except Exception as wm_err:
                                 wm_warnings.append(f"caption: {wm_err}")
                         # For video outputs, snap a thumbnail (first frame).
@@ -743,6 +744,8 @@ class T2IRequest(BaseModel):
     logo_filter: bool = True
     # Optional styled lower-third caption (e.g. horoscope text). Null/empty = off.
     caption: str | None = None
+    # Optional zodiac sign — adds a gold glyph + divider above the caption.
+    caption_icon: str | None = None
 
 @app.post("/t2i")
 async def text_to_image(req: T2IRequest, background_tasks: BackgroundTasks):
@@ -763,7 +766,7 @@ async def text_to_image(req: T2IRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(
         run_job, job_id, workflow, None, req.watermark, req.watermark_image,
         output_face_filter=req.face_filter, output_logo_filter=req.logo_filter,
-        output_endpoint="/t2i", caption=req.caption,
+        output_endpoint="/t2i", caption=req.caption, caption_icon=req.caption_icon,
     )
     return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
@@ -872,6 +875,7 @@ async def ltx_image_to_video(
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark. Video re-encodes via ffmpeg (~1-3s for a 5s clip)."),
     watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
+    caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
 ):
     if preset not in LTX_PRESETS:
         raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
@@ -895,7 +899,7 @@ async def ltx_image_to_video(
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    background_tasks.add_task(run_job, job_id, workflow, [img_path], watermark, watermark_image, caption=caption)
+    background_tasks.add_task(run_job, job_id, workflow, [img_path], watermark, watermark_image, caption=caption, caption_icon=caption_icon)
     return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
 
@@ -919,6 +923,7 @@ async def ltx_text_to_video(
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark. Video re-encodes via ffmpeg (~1-3s for a 5s clip)."),
     watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
+    caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
 ):
     if preset not in LTX_PRESETS:
         raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
@@ -936,7 +941,7 @@ async def ltx_text_to_video(
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    background_tasks.add_task(run_job, job_id, workflow, None, watermark, watermark_image, caption=caption)
+    background_tasks.add_task(run_job, job_id, workflow, None, watermark, watermark_image, caption=caption, caption_icon=caption_icon)
     return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
 
@@ -1565,6 +1570,7 @@ async def flux_face_swap(
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark."),
     watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
+    caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
 ):
     seed = seed if seed != -1 else uuid.uuid4().int % 2**32
 
@@ -1604,7 +1610,7 @@ async def flux_face_swap(
     background_tasks.add_task(
         run_job, job_id, workflow, [target_path, face_path], watermark, watermark_image,
         output_face_filter=face_filter, output_logo_filter=logo_filter,
-        output_endpoint="/flux/face-swap", caption=caption,
+        output_endpoint="/flux/face-swap", caption=caption, caption_icon=caption_icon,
     )
     return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
@@ -1752,6 +1758,7 @@ async def flux_image_to_image(
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark."),
     watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
+    caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
 ):
     if not 1 <= len(images) <= 5:
         raise HTTPException(400, f"images must be 1–5 files, got {len(images)}")
@@ -1822,7 +1829,7 @@ async def flux_image_to_image(
     background_tasks.add_task(
         run_job, job_id, workflow, cleanup_paths, watermark, watermark_image,
         output_face_filter=face_filter, output_logo_filter=logo_filter,
-        output_endpoint="/flux/i2i", caption=caption,
+        output_endpoint="/flux/i2i", caption=caption, caption_icon=caption_icon,
     )
     return {
         "job_id": job_id,
