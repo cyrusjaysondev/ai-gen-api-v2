@@ -407,6 +407,24 @@ else
   fi
 fi
 
+# Background-music pool — one track is picked at random per video.
+BGM_DIR="$ASSETS_DIR/bgm"
+mkdir -p "$BGM_DIR"
+if [ "$(ls -1 "$BGM_DIR"/*.mp3 2>/dev/null | wc -l)" -ge 5 ]; then
+  log "  Background-music pool already on volume ($(ls -1 "$BGM_DIR"/* 2>/dev/null | wc -l) tracks)"
+else
+  log "  Downloading background-music pool..."
+  bgm_ok=0
+  for n in 1 2 3 4 5; do
+    if wget -qO "$BGM_DIR/audio-$n.mp3" "$API_REPO/assets/bgm/audio-$n.mp3" && [ -s "$BGM_DIR/audio-$n.mp3" ]; then
+      bgm_ok=$((bgm_ok + 1))
+    else
+      rm -f "$BGM_DIR/audio-$n.mp3"
+    fi
+  done
+  log "    Background-music pool: $bgm_ok/5 tracks saved"
+fi
+
 # ─────────────────────────────────────────────
 # 3. Custom nodes: LanPaint (FLUX face swap) + ComfyUI-KJNodes (ColorMatch for i2v)
 # KJNodes ships with runpod/comfyui:latest at the time of writing — this clone is

@@ -91,9 +91,26 @@ INPUT_DIR = COMFY_ROOT / "input"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 INPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Optional looping background-music bed muxed under videos when background_music=true.
-# Lives on the network volume (fetched by setup.sh, like the GenReel logo).
+# Optional background-music beds muxed under videos when background_music=true.
+# BGM_DIR holds a pool of tracks (one is picked at random per request); BGM_PATH
+# is a single-file fallback. Both live on the network volume (fetched by setup.sh).
+BGM_DIR = Path("/workspace/assets/bgm")
 BGM_PATH = Path("/workspace/assets/horoscope_bgm.m4a")
+_BGM_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus", ".flac"}
+
+
+def _pick_background_track():
+    """Pick a random track from BGM_DIR (falling back to the single BGM_PATH).
+    Returns a Path or None. Random per call → different clips get different beds."""
+    try:
+        import random
+        if BGM_DIR.is_dir():
+            tracks = sorted(p for p in BGM_DIR.iterdir() if p.suffix.lower() in _BGM_EXTS and p.is_file())
+            if tracks:
+                return random.choice(tracks)
+    except Exception:
+        pass
+    return BGM_PATH if BGM_PATH.exists() else None
 
 # In-memory job store
 jobs = {}
@@ -756,13 +773,17 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                                 watermark.apply_caption(path, caption, fade_in=caption_fade, icon_sign=caption_icon)
                             except Exception as wm_err:
                                 wm_warnings.append(f"caption: {wm_err}")
-                        # Optional looping background-music bed (video outputs only).
-                        # Stream-copies the video (no re-encode) + adds the audio track.
+                        # Optional background-music bed (video outputs only) — a
+                        # random track from the pool. Stream-copies the video
+                        # (no re-encode) + adds the looped/trimmed audio track.
                         if background_music and ext in _VIDEO_EXTS:
                             try:
-                                ok, bgm_msg = await asyncio.to_thread(_mux_background_music, path, BGM_PATH)
-                                if not ok:
-                                    print(f"[{job_id}] bgm skipped: {bgm_msg}")
+                                _bgm_track = _pick_background_track()
+                                if _bgm_track is None:
+                                    print(f"[{job_id}] bgm skipped: no track available")
+                                else:
+                                    ok, bgm_msg = await asyncio.to_thread(_mux_background_music, path, _bgm_track)
+                                    print(f"[{job_id}] bgm [{_bgm_track.name}]: {bgm_msg}")
                             except Exception as bgm_err:
                                 print(f"[{job_id}] bgm mux raised: {bgm_err}")
                         # For video outputs, snap a thumbnail (first frame).
