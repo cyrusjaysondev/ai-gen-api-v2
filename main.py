@@ -359,7 +359,7 @@ async def _refine_face_inplace(image_path, face_filename: str, *, job_id: str,
         refine_seed = uuid.uuid4().int % 2**32
         wf = get_flux_face_swap_workflow(
             crop_name, face_filename, refine_seed,
-            megapixels=max(1.5, float(megapixels)), steps=max(8, int(steps)),
+            megapixels=max(1.5, float(megapixels)), steps=max(4, int(steps)),
             cfg=cfg, guidance=guidance, lora_strength=lora_strength,
         )
         refined_path = await _comfy_run_get_image(wf)
