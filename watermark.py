@@ -378,3 +378,151 @@ def _apply_video_logo(p: Path) -> None:
             f"{proc.stderr.strip()[-500:] or '(no stderr)'}"
         )
     shutil.move(str(tmp), str(p))
+
+
+# ─── Caption overlay (styled lower-third body text, e.g. horoscope copy) ────
+#
+# Design (fixed server-side so every caption looks identical regardless of
+# caller): centered, word-wrapped white text with a heavy black stroke in the
+# lower third. No background panel ("body only") — the stroke keeps it legible
+# over busy scenes. The SAME renderer is used for stills and video so an image
+# and its animated version share pixel-identical styling. Videos fade the
+# caption in ~1s after the start; stills are static.
+
+# Caption sizing as fractions of the frame's shorter side.
+_CAPTION_FONT_SCALE = 0.052     # ~5.2% of the shorter side
+_CAPTION_BOTTOM_PAD = 0.07      # text block sits ~7% above the bottom edge
+_CAPTION_SIDE_PAD = 0.07        # wrap within (1 - 2*side_pad) of the width
+_CAPTION_LINE_SPACING = 1.25    # multiple of the font's line height
+# Fade-in timing for video captions (seconds).
+_CAPTION_FADE_START = 1.0
+_CAPTION_FADE_DUR = 0.6
+
+
+def _wrap_text_to_width(text: str, font, draw, stroke: int, max_width: int) -> list[str]:
+    """Greedy word-wrap so each rendered line fits within `max_width` px."""
+    lines: list[str] = []
+    for paragraph in text.splitlines() or [text]:
+        words = paragraph.split()
+        if not words:
+            lines.append("")
+            continue
+        cur = ""
+        for w in words:
+            trial = f"{cur} {w}".strip()
+            bbox = draw.textbbox((0, 0), trial, font=font, stroke_width=stroke)
+            if (bbox[2] - bbox[0]) <= max_width or not cur:
+                cur = trial
+            else:
+                lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+    return lines
+
+
+def _render_caption_overlay(text: str, width: int, height: int) -> Image.Image:
+    """Return a transparent RGBA image (width x height) with `text` rendered as
+    centered, stroked white lines in the lower third."""
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    shorter = min(width, height)
+    font_size = max(26, int(shorter * _CAPTION_FONT_SCALE))
+    stroke = max(2, font_size // 7)
+    font = _load_font(font_size)
+
+    max_width = max(1, int(width * (1 - 2 * _CAPTION_SIDE_PAD)))
+    lines = _wrap_text_to_width(text, font, draw, stroke, max_width)
+    if not lines:
+        return overlay
+
+    ascent, descent = font.getmetrics()
+    line_h = int((ascent + descent) * _CAPTION_LINE_SPACING)
+    block_h = line_h * len(lines)
+    bottom_pad = max(12, int(shorter * _CAPTION_BOTTOM_PAD))
+    y = height - bottom_pad - block_h
+
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke)
+        line_w = bbox[2] - bbox[0]
+        x = (width - line_w) // 2 - bbox[0]
+        draw.text(
+            (x, y - bbox[1]), line, font=font,
+            fill=(255, 255, 255, 255),
+            stroke_width=stroke, stroke_fill=(0, 0, 0, 235),
+        )
+        y += line_h
+    return overlay
+
+
+def apply_caption(path, text: str, fade_in: bool = True) -> None:
+    """Overlay `text` as a styled lower-third caption on the file at `path`,
+    in place. Images: static. Videos: fades in ~1s after start. No-op on
+    empty text or unknown extension; failures leave the original intact."""
+    if text is None:
+        return
+    text = text.strip()
+    if not text:
+        return
+    p = Path(path)
+    ext = p.suffix.lower()
+    if ext in IMAGE_EXTS:
+        _apply_image_caption(p, text)
+    elif ext in VIDEO_EXTS:
+        _apply_video_caption(p, text, fade_in)
+
+
+def _apply_image_caption(p: Path, text: str) -> None:
+    base = Image.open(p)
+    original_mode = base.mode
+    base = base.convert("RGBA")
+    overlay = _render_caption_overlay(text, base.width, base.height)
+    base.alpha_composite(overlay)
+
+    ext = p.suffix.lower()
+    if ext in (".jpg", ".jpeg"):
+        base.convert("RGB").save(p, quality=95)
+    elif ext == ".webp":
+        base.save(p, quality=95)
+    elif original_mode != "RGBA":
+        base.convert(original_mode if original_mode in ("RGB", "L", "P") else "RGB").save(p)
+    else:
+        base.save(p)
+
+
+def _apply_video_caption(p: Path, text: str, fade_in: bool) -> None:
+    w, h = _probe_dimensions(p)
+    overlay = _render_caption_overlay(text, w, h)
+    cap_png = p.with_name(f"{p.stem}.caption.png")
+    overlay.save(cap_png)
+
+    tmp = p.with_name(f"{p.stem}.cap{p.suffix}")
+    # The overlay PNG is full-frame (text in the lower third, transparent
+    # elsewhere). Fade its alpha in, then composite over the video.
+    if fade_in:
+        filter_complex = (
+            f"[1:v]fade=in:st={_CAPTION_FADE_START}:d={_CAPTION_FADE_DUR}:alpha=1[cap];"
+            f"[0:v][cap]overlay=0:0:format=auto"
+        )
+    else:
+        filter_complex = "[0:v][1:v]overlay=0:0:format=auto"
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", str(p),
+        "-i", str(cap_png),
+        "-filter_complex", filter_complex,
+        *_video_encode_args(),
+        "-pix_fmt", "yuv420p",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        str(tmp),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    cap_png.unlink(missing_ok=True)
+    if proc.returncode != 0:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"ffmpeg caption overlay failed (rc={proc.returncode}): "
+            f"{proc.stderr.strip()[-500:] or '(no stderr)'}"
+        )
+    shutil.move(str(tmp), str(p))
