@@ -101,13 +101,15 @@ _BGM_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus", ".flac"}
 
 def _pick_background_track():
     """Pick a random track from BGM_DIR (falling back to the single BGM_PATH).
-    Returns a Path or None. Random per call → different clips get different beds."""
+    Returns a Path or None. Uses `secrets` (OS entropy) NOT the global `random`
+    module — the generation pipeline seeds `random` for reproducible renders,
+    which would otherwise make this pick deterministic (always the same track)."""
     try:
-        import random
+        import secrets
         if BGM_DIR.is_dir():
             tracks = sorted(p for p in BGM_DIR.iterdir() if p.suffix.lower() in _BGM_EXTS and p.is_file())
             if tracks:
-                return random.choice(tracks)
+                return secrets.choice(tracks)
     except Exception:
         pass
     return BGM_PATH if BGM_PATH.exists() else None
