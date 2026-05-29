@@ -91,6 +91,10 @@ INPUT_DIR = COMFY_ROOT / "input"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 INPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Optional looping background-music bed muxed under videos when background_music=true.
+# Lives on the network volume (fetched by setup.sh, like the GenReel logo).
+BGM_PATH = Path("/workspace/assets/horoscope_bgm.m4a")
+
 # In-memory job store
 jobs = {}
 
@@ -149,6 +153,49 @@ def _extract_video_thumbnail(video_path: Path) -> Path | None:
 # ─────────────────────────────────────────────
 # Core job runner
 # ─────────────────────────────────────────────
+
+def _mux_background_music(video_path: Path, music_path: Path) -> tuple[bool, str]:
+    """Mux a looping background-music bed under `video_path` (which has no audio).
+    The track is looped to cover the clip, trimmed to its length, with a short
+    fade in/out so the video's loop seam isn't a hard click. Video is stream-copied
+    (no re-encode → fast). Returns (changed, message); never raises."""
+    import subprocess, json as _json
+    if not music_path.exists():
+        return False, "music track missing"
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "json", str(video_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        dur = float(_json.loads(probe.stdout)["format"]["duration"])
+    except Exception:
+        dur = 5.0
+    fade_st = max(0.0, dur - 0.6)
+    tmp = video_path.with_suffix(".bgm.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", str(video_path), "-stream_loop", "-1", "-i", str(music_path),
+        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+        "-af", f"afade=t=in:st=0:d=0.2,afade=t=out:st={fade_st:.2f}:d=0.6",
+        "-shortest", "-movflags", "+faststart", str(tmp),
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        return False, f"ffmpeg error: {e}"
+    if r.returncode != 0 or not tmp.exists():
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+        return False, (r.stderr or "ffmpeg failed")[:200]
+    try:
+        tmp.replace(video_path)
+    except Exception as e:
+        return False, f"replace failed: {e}"
+    return True, f"music muxed ({dur:.2f}s)"
+
 
 def _mux_reference_audio(video_path: Path, audio_source: Path) -> tuple[bool, str]:
     """Replace the audio track on `video_path` with the audio from
@@ -451,6 +498,7 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                   caption: str | None = None,
                   caption_icon: str | None = None,
                   caption_fade: bool = True,
+                  background_music: bool = False,
                   refine_face: bool = False,
                   refine_face_filename: str | None = None,
                   refine_megapixels: float = 2.0,
@@ -708,6 +756,15 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                                 watermark.apply_caption(path, caption, fade_in=caption_fade, icon_sign=caption_icon)
                             except Exception as wm_err:
                                 wm_warnings.append(f"caption: {wm_err}")
+                        # Optional looping background-music bed (video outputs only).
+                        # Stream-copies the video (no re-encode) + adds the audio track.
+                        if background_music and ext in _VIDEO_EXTS:
+                            try:
+                                ok, bgm_msg = await asyncio.to_thread(_mux_background_music, path, BGM_PATH)
+                                if not ok:
+                                    print(f"[{job_id}] bgm skipped: {bgm_msg}")
+                            except Exception as bgm_err:
+                                print(f"[{job_id}] bgm mux raised: {bgm_err}")
                         # For video outputs, snap a thumbnail (first frame).
                         # Runs AFTER watermarks so the thumbnail reflects the
                         # final, stamped video. Failure is non-fatal — the
@@ -1081,6 +1138,7 @@ async def ltx_image_to_video(
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
     caption_fade: bool = Form(True, description="Video only: when true (default) the caption fades in ~1s after the start; set false to show it from the very first frame. No effect on images (their caption is always immediate)."),
+    background_music: bool = Form(False, description="Video only: mux a looping royalty-free background-music bed (/workspace/assets/horoscope_bgm.m4a) under the clip, trimmed to length with a soft fade. No effect on images."),
 ):
     if preset not in LTX_PRESETS:
         raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
@@ -1104,7 +1162,7 @@ async def ltx_image_to_video(
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    background_tasks.add_task(run_job, job_id, workflow, [img_path], watermark, watermark_image, caption=caption, caption_icon=caption_icon, caption_fade=caption_fade)
+    background_tasks.add_task(run_job, job_id, workflow, [img_path], watermark, watermark_image, caption=caption, caption_icon=caption_icon, caption_fade=caption_fade, background_music=background_music)
     return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
 
@@ -1130,6 +1188,7 @@ async def ltx_text_to_video(
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
     caption_fade: bool = Form(True, description="Video only: when true (default) the caption fades in ~1s after the start; set false to show it from the very first frame. No effect on images (their caption is always immediate)."),
+    background_music: bool = Form(False, description="Video only: mux a looping royalty-free background-music bed (/workspace/assets/horoscope_bgm.m4a) under the clip, trimmed to length with a soft fade. No effect on images."),
 ):
     if preset not in LTX_PRESETS:
         raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
@@ -1147,7 +1206,7 @@ async def ltx_text_to_video(
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    background_tasks.add_task(run_job, job_id, workflow, None, watermark, watermark_image, caption=caption, caption_icon=caption_icon, caption_fade=caption_fade)
+    background_tasks.add_task(run_job, job_id, workflow, None, watermark, watermark_image, caption=caption, caption_icon=caption_icon, caption_fade=caption_fade, background_music=background_music)
     return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
 
@@ -1778,6 +1837,7 @@ async def flux_face_swap(
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
     caption_fade: bool = Form(True, description="Video only: when true (default) the caption fades in ~1s after the start; set false to show it from the very first frame. No effect on images (their caption is always immediate)."),
+    background_music: bool = Form(False, description="Video only: mux a looping royalty-free background-music bed (/workspace/assets/horoscope_bgm.m4a) under the clip, trimmed to length with a soft fade. No effect on images."),
     refine_face: bool = Form(False, description="Opt-in 2nd-pass face detailer. After the swap, detect the largest face, re-render it at high resolution, and composite it back — fixes soft/low-detail faces in full-body or wide templates where the face is small in frame. Adds ~30-50s. Default false (no behaviour change for existing callers)."),
     preserve_body: bool = Form(False, description="Opt-in head-only mode. Composite the swapped head onto the ORIGINAL template so the body, clothing, pose, lighting and background stay the template's EXACT pixels — only the head changes (the base swap regenerates the whole frame, which drifts). Default false."),
 ):
@@ -1819,7 +1879,7 @@ async def flux_face_swap(
     background_tasks.add_task(
         run_job, job_id, workflow, [target_path, face_path], watermark, watermark_image,
         output_face_filter=face_filter, output_logo_filter=logo_filter,
-        output_endpoint="/flux/face-swap", caption=caption, caption_icon=caption_icon, caption_fade=caption_fade,
+        output_endpoint="/flux/face-swap", caption=caption, caption_icon=caption_icon, caption_fade=caption_fade, background_music=background_music,
         refine_face=refine_face, refine_face_filename=face_filename,
         refine_megapixels=megapixels, refine_steps=steps, refine_cfg=cfg,
         refine_guidance=guidance, refine_lora=lora_strength,
@@ -1973,6 +2033,7 @@ async def flux_image_to_image(
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
     caption_fade: bool = Form(True, description="Video only: when true (default) the caption fades in ~1s after the start; set false to show it from the very first frame. No effect on images (their caption is always immediate)."),
+    background_music: bool = Form(False, description="Video only: mux a looping royalty-free background-music bed (/workspace/assets/horoscope_bgm.m4a) under the clip, trimmed to length with a soft fade. No effect on images."),
 ):
     if not 1 <= len(images) <= 5:
         raise HTTPException(400, f"images must be 1–5 files, got {len(images)}")
@@ -2043,7 +2104,7 @@ async def flux_image_to_image(
     background_tasks.add_task(
         run_job, job_id, workflow, cleanup_paths, watermark, watermark_image,
         output_face_filter=face_filter, output_logo_filter=logo_filter,
-        output_endpoint="/flux/i2i", caption=caption, caption_icon=caption_icon, caption_fade=caption_fade,
+        output_endpoint="/flux/i2i", caption=caption, caption_icon=caption_icon, caption_fade=caption_fade, background_music=background_music,
     )
     return {
         "job_id": job_id,

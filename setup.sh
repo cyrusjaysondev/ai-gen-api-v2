@@ -389,6 +389,24 @@ else
   fi
 fi
 
+# Background-music bed (background_music option on /ltx/i2v + /ltx/t2v)
+# ─────────────────────────────────────────────
+# A short royalty-free looping ambient track muxed under horoscope videos.
+# main.py muxes it lazily and silently no-ops if it's missing, so a blip here
+# is non-fatal. Fetched from the repo (same source of truth as the API code).
+BGM_FILE="$ASSETS_DIR/horoscope_bgm.m4a"
+if [ -s "$BGM_FILE" ]; then
+  log "  Background music already on volume ($(stat -c%s "$BGM_FILE" 2>/dev/null || stat -f%z "$BGM_FILE") bytes)"
+else
+  log "  Downloading background-music bed..."
+  if wget -qO "$BGM_FILE" "$API_REPO/assets/horoscope_bgm.m4a" && [ -s "$BGM_FILE" ]; then
+    log "    Background music saved to $BGM_FILE"
+  else
+    rm -f "$BGM_FILE"
+    log "    WARN: background-music download failed — background_music will be a no-op until present"
+  fi
+fi
+
 # ─────────────────────────────────────────────
 # 3. Custom nodes: LanPaint (FLUX face swap) + ComfyUI-KJNodes (ColorMatch for i2v)
 # KJNodes ships with runpod/comfyui:latest at the time of writing — this clone is
