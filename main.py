@@ -393,6 +393,52 @@ async def _refine_face_inplace(image_path, face_filename: str, *, job_id: str,
         return False
 
 
+async def _preserve_body_inplace(image_path, template_path: str, *, job_id: str) -> bool:
+    """Make the swap change ONLY the head: composite the swapped head onto the
+    ORIGINAL template, so the body, clothing, pose, lighting and background are
+    the template's exact pixels (the base swap regenerates the whole frame from
+    references, which drifts). Detect the head in the swap, mask it (head + hair,
+    feathered at the neck/hairline), and overlay it on the template.
+
+    Fail-open: any problem keeps the full swap output untouched."""
+    from pathlib import Path as _Path
+    image_path = _Path(image_path)
+    try:
+        from PIL import Image, ImageDraw, ImageFilter
+        if face_safety is None or not hasattr(face_safety, "get_largest_face_bbox"):
+            return False
+        swap = Image.open(image_path).convert("RGB")
+        W, H = swap.size
+        tmpl = Image.open(template_path).convert("RGB")
+        # The swap output is spatially aligned with the (scaled) template — same
+        # composition/pose — so scaling the template to the swap size lines them up.
+        if tmpl.size != (W, H):
+            tmpl = tmpl.resize((W, H), Image.LANCZOS)
+        bbox = face_safety.get_largest_face_bbox(image_path.read_bytes())
+        if not bbox:
+            print(f"[{job_id}] preserve-body: no face detected, keeping full swap")
+            return False
+        x1, y1, x2, y2 = bbox
+        fw, fh = max(1, x2 - x1), max(1, y2 - y1)
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        # Head ellipse: generous so it encloses hair + jaw (and the template's
+        # original head, since they're aligned) — up for hair, down to the neck.
+        hx1, hx2 = cx - fw * 1.25, cx + fw * 1.25
+        hy1, hy2 = cy - fh * 1.65, cy + fh * 1.35
+        mask = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(mask).ellipse([hx1, hy1, hx2, hy2], fill=255)
+        feather = max(8, int(max(fw, fh) * 0.18))
+        mask = mask.filter(ImageFilter.GaussianBlur(feather))
+        out = tmpl.copy()
+        out.paste(swap, (0, 0), mask)
+        out.save(image_path)
+        print(f"[{job_id}] preserve-body: head composited onto template (body/bg from template)")
+        return True
+    except Exception as e:
+        print(f"[{job_id}] preserve-body failed (keeping full swap): {e}")
+        return False
+
+
 async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                   watermark_text: str | None = None,
                   watermark_image: bool = False,
@@ -410,7 +456,9 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                   refine_steps: int = 8,
                   refine_cfg: float = 1.0,
                   refine_guidance: float = 4.0,
-                  refine_lora: float = 1.0):
+                  refine_lora: float = 1.0,
+                  preserve_body: bool = False,
+                  preserve_body_template: str | None = None):
     """Generic ComfyUI job runner.
 
     ── output_face_filter / output_logo_filter ──
@@ -503,6 +551,17 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                                 )
                             except Exception as _re:
                                 print(f"[{job_id}] face-refine call raised (ignored): {_re}")
+
+                        # ── OPTIONAL HEAD-ONLY: keep template body/bg ───
+                        # Composite the (refined) head onto the ORIGINAL template
+                        # so only the head changes — body, clothing, pose and
+                        # background stay the template's exact pixels. Runs after
+                        # refine so the composited head is already sharp.
+                        if preserve_body and is_image_output and preserve_body_template:
+                            try:
+                                await _preserve_body_inplace(path, preserve_body_template, job_id=job_id)
+                            except Exception as _pb:
+                                print(f"[{job_id}] preserve-body call raised (ignored): {_pb}")
 
                         # ── OUTPUT-SIDE FACE FILTER ──────────────────
                         # Scan the generated image against the blocklist
@@ -1716,6 +1775,7 @@ async def flux_face_swap(
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
     refine_face: bool = Form(False, description="Opt-in 2nd-pass face detailer. After the swap, detect the largest face, re-render it at high resolution, and composite it back — fixes soft/low-detail faces in full-body or wide templates where the face is small in frame. Adds ~30-50s. Default false (no behaviour change for existing callers)."),
+    preserve_body: bool = Form(False, description="Opt-in head-only mode. Composite the swapped head onto the ORIGINAL template so the body, clothing, pose, lighting and background stay the template's EXACT pixels — only the head changes (the base swap regenerates the whole frame, which drifts). Default false."),
 ):
     seed = seed if seed != -1 else uuid.uuid4().int % 2**32
 
@@ -1759,6 +1819,7 @@ async def flux_face_swap(
         refine_face=refine_face, refine_face_filename=face_filename,
         refine_megapixels=megapixels, refine_steps=steps, refine_cfg=cfg,
         refine_guidance=guidance, refine_lora=lora_strength,
+        preserve_body=preserve_body, preserve_body_template=target_path,
     )
     return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
