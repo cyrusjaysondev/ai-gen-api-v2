@@ -154,6 +154,36 @@ response.
 
 ---
 
+## Captions
+
+A styled **lower-third caption** for horoscope-style content (the "sign of the
+day" text). Same fixed design on images and videos, so a face-swap still and the
+animated video it feeds into stay visually consistent.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `caption` | string \| null | `null` | The caption text (e.g. the day's horoscope). Word-wrapped and centered in bold white with a heavy black outline, anchored in the lower third. `null` / empty = no caption. |
+| `caption_icon` | string \| null | `null` | A zodiac sign — one of `aries, taurus, gemini, cancer, leo, virgo, libra, scorpio, sagittarius, capricorn, aquarius, pisces`. When set alongside `caption`, a gold sign glyph + a gold divider are stacked **above** the text. Any unrecognised value is ignored (text renders without the glyph). |
+
+**Layout.** From top to bottom in the lower third: optional gold zodiac glyph →
+optional gold divider → the centered caption text. The glyph and divider only
+appear together, and only when `caption_icon` resolves to a known sign.
+
+**Images vs videos.** On images the caption is baked in-place. On videos it
+**fades in ~1 s after the start** (so the opening frame is clean) and stays for
+the rest of the clip; the video re-encodes once via ffmpeg.
+
+**Endpoints.** `caption` / `caption_icon` are accepted on `POST /t2i`,
+`POST /flux/face-swap`, `POST /flux/i2i`, `POST /ltx/i2v`, and `POST /ltx/t2v`.
+They stack with `watermark` / `watermark_image`.
+
+**Assets.** The 12 glyphs + the divider live on the network volume at
+`/workspace/assets/zodiac-overlays/` (`icons/<sign>.png` + `divider-gold.png`),
+fetched by `setup.sh` from the repo on boot. A missing glyph degrades gracefully
+to text-only — it never fails the job.
+
+---
+
 ## POST /t2i — Text to Image
 
 Generate an image from a text prompt using FLUX.2 Klein 9B.
