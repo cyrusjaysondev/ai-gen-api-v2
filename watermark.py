@@ -391,7 +391,7 @@ def _apply_video_logo(p: Path) -> None:
 
 # Caption sizing as fractions of the frame's shorter side.
 _CAPTION_FONT_SCALE = 0.052     # ~5.2% of the shorter side
-_CAPTION_BOTTOM_PAD = 0.07      # text block sits ~7% above the bottom edge
+_CAPTION_BOTTOM_PAD = 0.14      # text block sits ~14% above the bottom edge (clears the video player controls)
 _CAPTION_SIDE_PAD = 0.07        # wrap within (1 - 2*side_pad) of the width
 _CAPTION_LINE_SPACING = 1.25    # multiple of the font's line height
 # Fade-in timing for video captions (seconds).
