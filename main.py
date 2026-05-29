@@ -450,6 +450,7 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                   output_endpoint: str = "/unknown",
                   caption: str | None = None,
                   caption_icon: str | None = None,
+                  caption_fade: bool = True,
                   refine_face: bool = False,
                   refine_face_filename: str | None = None,
                   refine_megapixels: float = 2.0,
@@ -704,7 +705,7 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                         # non-fatal — the un-captioned file is still valid.
                         if caption and watermark is not None:
                             try:
-                                watermark.apply_caption(path, caption, icon_sign=caption_icon)
+                                watermark.apply_caption(path, caption, fade_in=caption_fade, icon_sign=caption_icon)
                             except Exception as wm_err:
                                 wm_warnings.append(f"caption: {wm_err}")
                         # For video outputs, snap a thumbnail (first frame).
@@ -1079,6 +1080,7 @@ async def ltx_image_to_video(
     watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
+    caption_fade: bool = Form(True, description="Video only: when true (default) the caption fades in ~1s after the start; set false to show it from the very first frame. No effect on images (their caption is always immediate)."),
 ):
     if preset not in LTX_PRESETS:
         raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
@@ -1102,7 +1104,7 @@ async def ltx_image_to_video(
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    background_tasks.add_task(run_job, job_id, workflow, [img_path], watermark, watermark_image, caption=caption, caption_icon=caption_icon)
+    background_tasks.add_task(run_job, job_id, workflow, [img_path], watermark, watermark_image, caption=caption, caption_icon=caption_icon, caption_fade=caption_fade)
     return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
 
@@ -1127,6 +1129,7 @@ async def ltx_text_to_video(
     watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
+    caption_fade: bool = Form(True, description="Video only: when true (default) the caption fades in ~1s after the start; set false to show it from the very first frame. No effect on images (their caption is always immediate)."),
 ):
     if preset not in LTX_PRESETS:
         raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
@@ -1144,7 +1147,7 @@ async def ltx_text_to_video(
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    background_tasks.add_task(run_job, job_id, workflow, None, watermark, watermark_image, caption=caption, caption_icon=caption_icon)
+    background_tasks.add_task(run_job, job_id, workflow, None, watermark, watermark_image, caption=caption, caption_icon=caption_icon, caption_fade=caption_fade)
     return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
 
@@ -1774,6 +1777,7 @@ async def flux_face_swap(
     watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
+    caption_fade: bool = Form(True, description="Video only: when true (default) the caption fades in ~1s after the start; set false to show it from the very first frame. No effect on images (their caption is always immediate)."),
     refine_face: bool = Form(False, description="Opt-in 2nd-pass face detailer. After the swap, detect the largest face, re-render it at high resolution, and composite it back — fixes soft/low-detail faces in full-body or wide templates where the face is small in frame. Adds ~30-50s. Default false (no behaviour change for existing callers)."),
     preserve_body: bool = Form(False, description="Opt-in head-only mode. Composite the swapped head onto the ORIGINAL template so the body, clothing, pose, lighting and background stay the template's EXACT pixels — only the head changes (the base swap regenerates the whole frame, which drifts). Default false."),
 ):
@@ -1815,7 +1819,7 @@ async def flux_face_swap(
     background_tasks.add_task(
         run_job, job_id, workflow, [target_path, face_path], watermark, watermark_image,
         output_face_filter=face_filter, output_logo_filter=logo_filter,
-        output_endpoint="/flux/face-swap", caption=caption, caption_icon=caption_icon,
+        output_endpoint="/flux/face-swap", caption=caption, caption_icon=caption_icon, caption_fade=caption_fade,
         refine_face=refine_face, refine_face_filename=face_filename,
         refine_megapixels=megapixels, refine_steps=steps, refine_cfg=cfg,
         refine_guidance=guidance, refine_lora=lora_strength,
@@ -1968,6 +1972,7 @@ async def flux_image_to_image(
     watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
+    caption_fade: bool = Form(True, description="Video only: when true (default) the caption fades in ~1s after the start; set false to show it from the very first frame. No effect on images (their caption is always immediate)."),
 ):
     if not 1 <= len(images) <= 5:
         raise HTTPException(400, f"images must be 1–5 files, got {len(images)}")
@@ -2038,7 +2043,7 @@ async def flux_image_to_image(
     background_tasks.add_task(
         run_job, job_id, workflow, cleanup_paths, watermark, watermark_image,
         output_face_filter=face_filter, output_logo_filter=logo_filter,
-        output_endpoint="/flux/i2i", caption=caption, caption_icon=caption_icon,
+        output_endpoint="/flux/i2i", caption=caption, caption_icon=caption_icon, caption_fade=caption_fade,
     )
     return {
         "job_id": job_id,
