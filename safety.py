@@ -473,6 +473,53 @@ def _count_significant_faces(faces, img_area: int) -> int:
     return n
 
 
+def _ensure_app():
+    """Build (or reuse) the InsightFace detector WITHOUT loading the blocklist.
+    Safe to call when face_filter is off — used by the optional face-refine pass.
+    Returns the FaceAnalysis app, or None if init fails."""
+    global _CACHED_APP
+    if _CACHED_APP is not None:
+        return _CACHED_APP
+    try:
+        from insightface.app import FaceAnalysis
+        model_root    = os.environ.get("INSIGHTFACE_MODEL_ROOT", "/workspace/insightface_models")
+        det_thresh    = float(os.environ.get("FACE_DETECTOR_THRESHOLD", "0.1"))
+        det_size_edge = int(os.environ.get("FACE_DETECTOR_SIZE", "1024"))
+        app = FaceAnalysis(name="buffalo_l", root=model_root,
+                           providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+        app.prepare(ctx_id=0, det_size=(det_size_edge, det_size_edge), det_thresh=det_thresh)
+        _CACHED_APP = app
+    except Exception as e:
+        print(f"[face-refine] InsightFace init failed: {e}")
+        return None
+    return _CACHED_APP
+
+
+def get_largest_face_bbox(image_bytes: bytes):
+    """Largest detected face as (x1, y1, x2, y2) integer pixel coords, or None.
+
+    Reuses the same detector + preprocessing-fallback chain as the blocklist
+    filter, but only returns geometry (no identity matching). Used by the
+    optional 2nd-pass face refiner. Never raises."""
+    try:
+        import io
+        import numpy as np
+        from PIL import Image
+        app = _ensure_app()
+        if app is None:
+            return None
+        pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        faces, _, _ = _detect_with_fallbacks(app, pil, np=np, label_for_log="refine")
+        if not faces:
+            return None
+        f = max(faces, key=lambda fc: (fc.bbox[2] - fc.bbox[0]) * (fc.bbox[3] - fc.bbox[1]))
+        x1, y1, x2, y2 = (int(round(float(v))) for v in f.bbox)
+        return (x1, y1, x2, y2)
+    except Exception as e:
+        print(f"[face-refine] bbox detection failed: {e}")
+        return None
+
+
 def get_status() -> dict:
     """Return the current filter state WITHOUT rebuilding.
 

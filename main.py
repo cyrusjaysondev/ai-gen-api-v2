@@ -272,6 +272,127 @@ def _trim_first_half(video_path: Path) -> tuple[bool, str]:
                   f"({_MOTION_CLEAN_FRACTION*100:.0f}% — IC-LoRA clean region)")
 
 
+async def _comfy_run_get_image(workflow: dict):
+    """Submit a workflow to ComfyUI, wait for completion, return the first output
+    image Path (or None). Self-contained + never raises — used by the optional
+    face-refine pass so a failure there can't break the base job."""
+    try:
+        client_id = str(uuid.uuid4())
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(f"{COMFYUI_URL}/prompt", json={"prompt": workflow, "client_id": client_id})
+            if resp.status_code != 200:
+                print(f"[face-refine] comfy submit failed: {resp.text[:200]}")
+                return None
+            prompt_id = resp.json()["prompt_id"]
+        ws_url = f"ws://127.0.0.1:8188/ws?clientId={client_id}"
+        async with websockets.connect(ws_url, ping_interval=None, close_timeout=None, max_size=None) as ws:
+            while True:
+                raw = await ws.recv()
+                if isinstance(raw, bytes):
+                    continue
+                msg = json.loads(raw)
+                if msg.get("type") == "executing":
+                    d = msg.get("data", {})
+                    if d.get("node") is None and d.get("prompt_id") == prompt_id:
+                        break
+        async with httpx.AsyncClient() as client:
+            history = await client.get(f"{COMFYUI_URL}/history/{prompt_id}")
+            job_data = history.json().get(prompt_id, {})
+            if job_data.get("status", {}).get("status_str") == "error":
+                print(f"[face-refine] comfy reported execution error")
+                return None
+            outputs = job_data.get("outputs", {})
+        for node_output in outputs.values():
+            if "images" in node_output and node_output["images"]:
+                item = node_output["images"][0]
+                sub = item.get("subfolder", "")
+                p = OUTPUT_DIR / sub / item["filename"] if sub else OUTPUT_DIR / item["filename"]
+                if p.exists():
+                    return p
+        return None
+    except Exception as e:
+        print(f"[face-refine] comfy run error: {e}")
+        return None
+
+
+async def _refine_face_inplace(image_path, face_filename: str, *, job_id: str,
+                               megapixels: float = 2.0, steps: int = 8, cfg: float = 1.0,
+                               guidance: float = 4.0, lora_strength: float = 1.0) -> bool:
+    """Second-pass face detailer. Detect the largest face in `image_path`, crop a
+    padded region around it, re-run the FLUX head-swap on JUST that crop at high
+    resolution (so the face is rendered with far more pixels than its small
+    in-frame size allowed), then composite the sharp face back with a feathered
+    mask. Overwrites `image_path` on success.
+
+    Fail-open by design: any problem (no face, comfy error, etc.) leaves the
+    original swap untouched and returns False — the base result still ships."""
+    from pathlib import Path as _Path
+    image_path = _Path(image_path)
+    try:
+        from PIL import Image, ImageDraw, ImageFilter
+        if face_safety is None or not hasattr(face_safety, "get_largest_face_bbox"):
+            print(f"[{job_id}] face-refine: detector unavailable, skipping")
+            return False
+        bbox = face_safety.get_largest_face_bbox(image_path.read_bytes())
+        if not bbox:
+            print(f"[{job_id}] face-refine: no face detected, skipping")
+            return False
+        img = Image.open(image_path).convert("RGB")
+        W, H = img.size
+        x1, y1, x2, y2 = bbox
+        fw, fh = max(1, x2 - x1), max(1, y2 - y1)
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        # Pad generously so the crop includes hair/jaw/neck context for a clean swap.
+        side = max(fw, fh) * 2.2
+        half = side / 2.0
+        cx1, cy1 = max(0, int(cx - half)), max(0, int(cy - half))
+        cx2, cy2 = min(W, int(cx + half)), min(H, int(cy + half))
+        crop = img.crop((cx1, cy1, cx2, cy2))
+        crop_w, crop_h = crop.size
+        if crop_w < 24 or crop_h < 24:
+            return False
+        crop_name = f"refine_crop_{uuid.uuid4().hex}.png"
+        crop_path = INPUT_DIR / crop_name
+        crop.save(crop_path)
+        # Re-swap the crop. megapixels>=1.5 means ImageScaleToTotalPixels renders the
+        # (now face-dominated) crop at ~1.5-2 MP → a high-detail face.
+        refine_seed = uuid.uuid4().int % 2**32
+        wf = get_flux_face_swap_workflow(
+            crop_name, face_filename, refine_seed,
+            megapixels=max(1.5, float(megapixels)), steps=max(8, int(steps)),
+            cfg=cfg, guidance=guidance, lora_strength=lora_strength,
+        )
+        refined_path = await _comfy_run_get_image(wf)
+        try:
+            crop_path.unlink()
+        except Exception:
+            pass
+        if not refined_path or not refined_path.exists():
+            print(f"[{job_id}] face-refine: re-swap produced no output, keeping original")
+            return False
+        refined = Image.open(refined_path).convert("RGB").resize((crop_w, crop_h), Image.LANCZOS)
+        # Feathered ellipse over the face region (crop coords) — blends only the
+        # face, leaving the original body/background/seam untouched.
+        mask = Image.new("L", (crop_w, crop_h), 0)
+        fx1, fy1 = (x1 - cx1), (y1 - cy1)
+        fx2, fy2 = (x2 - cx1), (y2 - cy1)
+        ex, ey = (fx2 - fx1) * 0.22, (fy2 - fy1) * 0.30
+        ImageDraw.Draw(mask).ellipse([fx1 - ex, fy1 - ey, fx2 + ex, fy2 + ey], fill=255)
+        feather = max(6, int(side * 0.06))
+        mask = mask.filter(ImageFilter.GaussianBlur(feather))
+        img.paste(refined, (cx1, cy1), mask)
+        img.save(image_path)
+        try:
+            refined_path.unlink()
+        except Exception:
+            pass
+        print(f"[{job_id}] face-refine: applied (face {fw}x{fh}px re-rendered at ~{max(1.5, float(megapixels))}MP)")
+        return True
+    except Exception as e:
+        print(f"[{job_id}] face-refine failed (keeping original): {e}")
+        return False
+
+
 async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                   watermark_text: str | None = None,
                   watermark_image: bool = False,
@@ -282,7 +403,14 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                   output_logo_filter: bool = False,
                   output_endpoint: str = "/unknown",
                   caption: str | None = None,
-                  caption_icon: str | None = None):
+                  caption_icon: str | None = None,
+                  refine_face: bool = False,
+                  refine_face_filename: str | None = None,
+                  refine_megapixels: float = 2.0,
+                  refine_steps: int = 8,
+                  refine_cfg: float = 1.0,
+                  refine_guidance: float = 4.0,
+                  refine_lora: float = 1.0):
     """Generic ComfyUI job runner.
 
     ── output_face_filter / output_logo_filter ──
@@ -359,6 +487,22 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                             url = f"{BASE_URL}/image/{filename}"
                         else:
                             url = f"{BASE_URL}/video/{filename}"
+
+                        # ── OPTIONAL 2nd-PASS FACE REFINE (opt-in) ───
+                        # Re-render the (small, soft) swapped face at high res
+                        # and composite it back — fixes soft faces in full-body
+                        # templates without reframing them. Runs BEFORE the
+                        # output filters + watermark/caption so they all act on
+                        # the refined image. Fail-open: errors keep the base swap.
+                        if refine_face and is_image_output and refine_face_filename:
+                            try:
+                                await _refine_face_inplace(
+                                    path, refine_face_filename, job_id=job_id,
+                                    megapixels=refine_megapixels, steps=refine_steps,
+                                    cfg=refine_cfg, guidance=refine_guidance, lora_strength=refine_lora,
+                                )
+                            except Exception as _re:
+                                print(f"[{job_id}] face-refine call raised (ignored): {_re}")
 
                         # ── OUTPUT-SIDE FACE FILTER ──────────────────
                         # Scan the generated image against the blocklist
@@ -1571,6 +1715,7 @@ async def flux_face_swap(
     watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
+    refine_face: bool = Form(False, description="Opt-in 2nd-pass face detailer. After the swap, detect the largest face, re-render it at high resolution, and composite it back — fixes soft/low-detail faces in full-body or wide templates where the face is small in frame. Adds ~30-50s. Default false (no behaviour change for existing callers)."),
 ):
     seed = seed if seed != -1 else uuid.uuid4().int % 2**32
 
@@ -1611,6 +1756,9 @@ async def flux_face_swap(
         run_job, job_id, workflow, [target_path, face_path], watermark, watermark_image,
         output_face_filter=face_filter, output_logo_filter=logo_filter,
         output_endpoint="/flux/face-swap", caption=caption, caption_icon=caption_icon,
+        refine_face=refine_face, refine_face_filename=face_filename,
+        refine_megapixels=megapixels, refine_steps=steps, refine_cfg=cfg,
+        refine_guidance=guidance, refine_lora=lora_strength,
     )
     return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", "poll_url": f"{BASE_URL}/status/{job_id}"}
 
