@@ -721,14 +721,16 @@ class T2IRequest(BaseModel):
     watermark: str | None = None  # e.g. "AI" — overlay at bottom-right; null/empty = off
     watermark_image: bool = False  # composite the GenReel logo at bottom-right
     # Output-side face filter — applied AFTER generation. /t2i has no input
-    # image so this is the only way a Hun Sen / blocked-identity prompt can
-    # be caught. The proxy (runpod-image-proxy) forces this true for prod
-    # traffic; admin curl can pass false to test, which is logged to
-    # /workspace/face_filter_bypass.log.
-    face_filter: bool = False
+    # image so this is the only way a blocked-identity prompt can be caught.
+    # Defaults ON (safe default, matching /flux/face-swap & /flux/i2i): callers
+    # may pass face_filter=false to skip (logged to
+    # /workspace/face_filter_bypass.log). The proxies now FORWARD the caller's
+    # value rather than forcing it, so this default is what protects callers
+    # that omit the flag.
+    face_filter: bool = True
     # Output-side logo filter — same reasoning as face_filter but for
-    # blocked logos/flags. Catches "draw the [logo] flag" prompts.
-    logo_filter: bool = False
+    # blocked logos/flags. Catches "draw the [logo] flag" prompts. Defaults ON.
+    logo_filter: bool = True
 
 @app.post("/t2i")
 async def text_to_image(req: T2IRequest, background_tasks: BackgroundTasks):
