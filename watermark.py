@@ -498,18 +498,20 @@ def _apply_video_caption(p: Path, text: str, fade_in: bool) -> None:
 
     tmp = p.with_name(f"{p.stem}.cap{p.suffix}")
     # The overlay PNG is full-frame (text in the lower third, transparent
-    # elsewhere). Fade its alpha in, then composite over the video.
+    # elsewhere). It's a single still, so `-loop 1` turns it into a continuous
+    # stream we can fade over time and overlay across every frame; `shortest=1`
+    # ends the output with the video (not the looping image).
     if fade_in:
         filter_complex = (
             f"[1:v]fade=in:st={_CAPTION_FADE_START}:d={_CAPTION_FADE_DUR}:alpha=1[cap];"
-            f"[0:v][cap]overlay=0:0:format=auto"
+            f"[0:v][cap]overlay=0:0:format=auto:shortest=1"
         )
     else:
-        filter_complex = "[0:v][1:v]overlay=0:0:format=auto"
+        filter_complex = "[0:v][1:v]overlay=0:0:format=auto:shortest=1"
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(p),
-        "-i", str(cap_png),
+        "-loop", "1", "-i", str(cap_png),
         "-filter_complex", filter_complex,
         *_video_encode_args(),
         "-pix_fmt", "yuv420p",
