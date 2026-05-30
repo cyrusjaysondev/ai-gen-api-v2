@@ -33,12 +33,15 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv"}
 
 _FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+# Elegant serif for the horoscope caption (vs the sans logo/watermark text) — an
+# upmarket "card" look instead of a heavy subtitle. Falls back to the sans font.
+_CAPTION_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"
 
 # The single fixed-asset brand mark. setup.sh fetches it to the network
 # volume so every pod / serverless worker sees it; the URL is duplicated
@@ -85,6 +88,15 @@ def _load_font(size: int) -> ImageFont.ImageFont:
         return ImageFont.truetype(_FONT_PATH, size)
     except OSError:
         return ImageFont.load_default()
+
+
+def _load_caption_font(size: int) -> ImageFont.ImageFont:
+    for path in (_CAPTION_FONT_PATH, _FONT_PATH):
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
 
 
 def _apply_image(p: Path, text: str) -> None:
@@ -464,8 +476,8 @@ def _render_caption_overlay(text: str, width: int, height: int,
     draw = ImageDraw.Draw(overlay)
     shorter = min(width, height)
     font_size = max(26, int(shorter * _CAPTION_FONT_SCALE))
-    stroke = max(2, font_size // 7)
-    font = _load_font(font_size)
+    stroke = max(1, font_size // 22)   # thin edge — readability without the heavy "subtitle" border
+    font = _load_caption_font(font_size)
 
     max_width = max(1, int(width * (1 - 2 * _CAPTION_SIDE_PAD)))
     lines = _wrap_text_to_width(text, font, draw, stroke, max_width)
@@ -503,16 +515,32 @@ def _render_caption_overlay(text: str, width: int, height: int,
         overlay.alpha_composite(div_img, dest=((width - div_img.width) // 2, y))
         y += div_img.height + gap
 
+    # Elegant "card" caption (not a heavy subtitle): a soft, blurred drop shadow
+    # for depth + readability on any backdrop, then warm cream-gold serif text
+    # with a thin dark edge — matching the gold glyph + divider.
+    CREAM = (245, 232, 198, 255)
+    STROKE_C = (38, 26, 10, 210)
+    SHADOW_C = (0, 0, 0, 165)
+    sh_off = max(2, int(font_size * 0.05))
+
+    placed = []
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke)
-        line_w = bbox[2] - bbox[0]
-        x = (width - line_w) // 2 - bbox[0]
-        draw.text(
-            (x, y - bbox[1]), line, font=font,
-            fill=(255, 255, 255, 255),
-            stroke_width=stroke, stroke_fill=(0, 0, 0, 235),
-        )
+        x = (width - (bbox[2] - bbox[0])) // 2 - bbox[0]
+        placed.append((x, y - bbox[1], line))
         y += line_h
+
+    shadow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    sdraw = ImageDraw.Draw(shadow)
+    for x, ty, line in placed:
+        sdraw.text((x + sh_off, ty + sh_off), line, font=font,
+                   fill=SHADOW_C, stroke_width=stroke, stroke_fill=SHADOW_C)
+    shadow = shadow.filter(ImageFilter.GaussianBlur(max(2, font_size // 10)))
+    overlay.alpha_composite(shadow)
+
+    for x, ty, line in placed:
+        draw.text((x, ty), line, font=font, fill=CREAM,
+                  stroke_width=stroke, stroke_fill=STROKE_C)
     return overlay
 
 
