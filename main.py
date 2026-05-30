@@ -2250,41 +2250,6 @@ def _detect_comfy_root() -> str:
     return "/workspace/ComfyUI"  # last-resort fallback so callers see a path
 
 
-@app.post("/palm/lines")
-def palm_lines(image: UploadFile = File(..., description="A hand photo (palm facing the camera, fingers up).")):
-    """Detect the four principal palmar lines (life, head, heart, fate) in a hand
-    photo and return them as normalized polylines + palm metrics — feng-shui's
-    `PalmAnalysis` contract (see src/services/palmVisionCore.ts), so the app's
-    existing overlay + reading code consume the response unchanged.
-
-    Pure CPU computer vision (YCrCb skin segmentation + scikit-image ridge
-    tracing) — it does NOT touch the GPU diffusion models, so it is always warm
-    on this persistent pod (no cold start). Always returns a valid PalmAnalysis:
-    a canonical fallback (fallback=true) when no palm can be read, mirroring the
-    in-browser worker's never-throw contract.
-
-    Declared as a sync `def` so FastAPI runs it in its threadpool — the ~0.2-0.4s
-    of OpenCV work never blocks the event loop or GPU job queue.
-
-    Response: { lines:[{key,points:[{x,y}…],relLength,curvature,breaks,detected}],
-                metrics:{creaseDensity,palmAspect,minorDensityPinky,brightness},
-                palmBox:{x,y,w,h}, fallback:bool }  (all coords normalized 0..1)
-    """
-    import numpy as np
-    import cv2
-    try:
-        import palm
-    except Exception as e:
-        raise HTTPException(503, f"palm module unavailable: {e}")
-    raw = image.file.read()
-    if not raw:
-        raise HTTPException(400, "image is empty")
-    bgr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
-    if bgr is None:
-        raise HTTPException(400, "could not decode image (expected jpg/png/webp)")
-    return palm.extract_palm(bgr)
-
-
 @app.get("/admin/comfy-status")
 async def admin_comfy_status(authorization: str = Header(default=None)):
     """Read-only introspection: which custom_nodes dirs are present, and
@@ -2509,7 +2474,7 @@ async def admin_refresh_api_code(authorization: str = Header(default=None)):
     api_dir.mkdir(parents=True, exist_ok=True)
 
     fetched: list[dict] = []
-    for filename in ("main.py", "workflows.py", "safety.py", "logo_safety.py", "watermark.py", "palm.py"):
+    for filename in ("main.py", "workflows.py", "safety.py", "logo_safety.py", "watermark.py"):
         url = f"{api_repo}/{filename}"
         target = api_dir / filename
         tmp = api_dir / f"{filename}.new"

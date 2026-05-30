@@ -460,35 +460,6 @@ else
   fi
 fi
 
-# Palm reader — MediaPipe Hands landmark model + GL runtime libs.
-# palm.py (/palm/lines) uses MediaPipe HandLandmarker to locate the palm by hand
-# shape (robust to busy/skin-toned backgrounds). The model lives on the volume;
-# the GL dispatch libs (libGLESv2/libEGL) are system packages the comfyui base
-# image lacks — MediaPipe's runtime dlopens them even for CPU inference, and apt
-# is reset on every boot, so reinstall here. If either is missing, palm.py
-# silently falls back to YCrCb skin segmentation, so this whole block is best-effort.
-MP_DIR="$ASSETS_DIR/mediapipe"
-mkdir -p "$MP_DIR"
-if [ ! -s "$MP_DIR/hand_landmarker.task" ]; then
-  log "  Downloading MediaPipe hand-landmark model..."
-  if wget -qO "$MP_DIR/hand_landmarker.task" "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task" && [ -s "$MP_DIR/hand_landmarker.task" ]; then
-    log "    hand_landmarker.task saved ($(stat -c%s "$MP_DIR/hand_landmarker.task" 2>/dev/null || stat -f%z "$MP_DIR/hand_landmarker.task") bytes)"
-  else
-    rm -f "$MP_DIR/hand_landmarker.task"
-    log "    WARN: hand-model download failed — palm falls back to skin segmentation"
-  fi
-else
-  log "  MediaPipe hand model already on volume"
-fi
-if ! ldconfig -p 2>/dev/null | grep -q "libGLESv2.so.2"; then
-  log "  Installing GL runtime libs for MediaPipe (libgles2/libegl1)..."
-  if apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq libgles2 libegl1 >/dev/null 2>&1; then
-    log "    GL libs installed"
-  else
-    log "    WARN: GL-lib install failed — palm falls back to skin segmentation"
-  fi
-fi
-
 # ─────────────────────────────────────────────
 # 3. Custom nodes: LanPaint (FLUX face swap) + ComfyUI-KJNodes (ColorMatch for i2v)
 # KJNodes ships with runpod/comfyui:latest at the time of writing — this clone is
@@ -607,11 +578,7 @@ wget -q -O /workspace/api/watermark.py "${API_REPO}/watermark.py"
 if [ ! -s "/workspace/api/watermark.py" ]; then
   log "  WARN: Failed to download watermark.py — watermark parameter will be a no-op"
 fi
-wget -q -O /workspace/api/palm.py "${API_REPO}/palm.py"
-if [ ! -s "/workspace/api/palm.py" ]; then
-  log "  WARN: Failed to download palm.py — /palm/lines will return 503 if used"
-fi
-log "  main.py + workflows.py + safety.py + logo_safety.py + watermark.py + palm.py downloaded (latest)"
+log "  main.py + workflows.py + safety.py + logo_safety.py + watermark.py downloaded (latest)"
 
 # Create blocklist dirs so admins know where files land
 mkdir -p /workspace/blocklist /workspace/blocklist_logos
