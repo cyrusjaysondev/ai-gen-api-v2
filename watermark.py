@@ -40,8 +40,15 @@ VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv"}
 
 _FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 # Elegant serif for the horoscope caption (vs the sans logo/watermark text) — an
-# upmarket "card" look instead of a heavy subtitle. Falls back to the sans font.
-_CAPTION_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"
+# upmarket "card" look instead of a heavy subtitle. EB Garamond (OFL, free for
+# commercial use) is fetched to the volume by setup.sh; if it's missing on a
+# fresh pod we fall back to the bundled DejaVu Serif, then the sans font.
+_CAPTION_FONT_PATH = "/workspace/assets/fonts/EBGaramond.ttf"
+_CAPTION_FONT_FALLBACKS = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+    _FONT_PATH,
+)
+_CAPTION_FONT_WEIGHT = 600  # EB Garamond is a variable font — pin SemiBold for readability
 
 # The single fixed-asset brand mark. setup.sh fetches it to the network
 # volume so every pod / serverless worker sees it; the URL is duplicated
@@ -91,11 +98,18 @@ def _load_font(size: int) -> ImageFont.ImageFont:
 
 
 def _load_caption_font(size: int) -> ImageFont.ImageFont:
-    for path in (_CAPTION_FONT_PATH, _FONT_PATH):
+    for path in (_CAPTION_FONT_PATH, *_CAPTION_FONT_FALLBACKS):
         try:
-            return ImageFont.truetype(path, size)
+            f = ImageFont.truetype(path, size)
         except OSError:
             continue
+        # Variable fonts (EB Garamond) ship multiple weights — pin a heavier,
+        # readable one. Harmless no-op (caught) for static fonts like DejaVu.
+        try:
+            f.set_variation_by_axes([_CAPTION_FONT_WEIGHT])
+        except Exception:
+            pass
+        return f
     return ImageFont.load_default()
 
 

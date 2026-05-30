@@ -425,6 +425,25 @@ else
   log "    Background-music pool: $bgm_ok/5 tracks saved"
 fi
 
+# Caption font — EB Garamond (OFL, free for commercial use).
+# ─────────────────────────────────────────────
+# watermark.py renders the horoscope caption in this serif; it falls back to the
+# bundled DejaVu Serif if this is missing, so a blip here is non-fatal.
+FONTS_DIR="$ASSETS_DIR/fonts"
+mkdir -p "$FONTS_DIR"
+if [ -s "$FONTS_DIR/EBGaramond.ttf" ]; then
+  log "  Caption font already on volume ($(stat -c%s "$FONTS_DIR/EBGaramond.ttf" 2>/dev/null || stat -f%z "$FONTS_DIR/EBGaramond.ttf") bytes)"
+else
+  log "  Downloading caption font (EB Garamond)..."
+  if wget -qO "$FONTS_DIR/EBGaramond.ttf" "$API_REPO/assets/fonts/EBGaramond.ttf" && [ -s "$FONTS_DIR/EBGaramond.ttf" ]; then
+    wget -qO "$FONTS_DIR/OFL.txt" "$API_REPO/assets/fonts/OFL.txt" 2>/dev/null || true
+    log "    Caption font saved to $FONTS_DIR/EBGaramond.ttf"
+  else
+    rm -f "$FONTS_DIR/EBGaramond.ttf"
+    log "    WARN: caption-font download failed — captions fall back to DejaVu Serif"
+  fi
+fi
+
 # ─────────────────────────────────────────────
 # 3. Custom nodes: LanPaint (FLUX face swap) + ComfyUI-KJNodes (ColorMatch for i2v)
 # KJNodes ships with runpod/comfyui:latest at the time of writing — this clone is
