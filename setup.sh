@@ -578,7 +578,11 @@ wget -q -O /workspace/api/watermark.py "${API_REPO}/watermark.py"
 if [ ! -s "/workspace/api/watermark.py" ]; then
   log "  WARN: Failed to download watermark.py — watermark parameter will be a no-op"
 fi
-log "  main.py + workflows.py + safety.py + logo_safety.py + watermark.py downloaded (latest)"
+wget -q -O /workspace/api/palm.py "${API_REPO}/palm.py"
+if [ ! -s "/workspace/api/palm.py" ]; then
+  log "  WARN: Failed to download palm.py — /palm/lines will return 503 if used"
+fi
+log "  main.py + workflows.py + safety.py + logo_safety.py + watermark.py + palm.py downloaded (latest)"
 
 # Create blocklist dirs so admins know where files land
 mkdir -p /workspace/blocklist /workspace/blocklist_logos
