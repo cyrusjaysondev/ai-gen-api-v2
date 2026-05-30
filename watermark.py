@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import unicodedata
 import urllib.request
 from pathlib import Path
 
@@ -44,6 +45,11 @@ _FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 # commercial use) is fetched to the volume by setup.sh; if it's missing on a
 # fresh pod we fall back to the bundled DejaVu Serif, then the sans font.
 _CAPTION_FONT_PATH = "/workspace/assets/fonts/EBGaramond.ttf"
+# EB Garamond covers Latin + Vietnamese but has NO Khmer glyphs (they'd render as
+# tofu boxes). Khmer captions use Noto Serif Khmer instead — same elegant serif
+# look, OFL-licensed, fetched to the volume by setup.sh. Its first variable axis
+# is also Weight, so the same SemiBold pin below applies.
+_CAPTION_FONT_KHMER = "/workspace/assets/fonts/NotoSerifKhmer.ttf"
 _CAPTION_FONT_FALLBACKS = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
     _FONT_PATH,
@@ -97,14 +103,25 @@ def _load_font(size: int) -> ImageFont.ImageFont:
         return ImageFont.load_default()
 
 
-def _load_caption_font(size: int) -> ImageFont.ImageFont:
-    for path in (_CAPTION_FONT_PATH, *_CAPTION_FONT_FALLBACKS):
+def _has_khmer(text: str) -> bool:
+    """True if any char is in the Khmer Unicode block (U+1780–U+17FF)."""
+    return any(0x1780 <= ord(c) <= 0x17FF for c in text)
+
+
+def _load_caption_font(size: int, text: str = "") -> ImageFont.ImageFont:
+    # Pick a font that actually has glyphs for the caption's script: Khmer text
+    # needs Noto Serif Khmer (EB Garamond / DejaVu render Khmer as tofu); Latin +
+    # Vietnamese stay on EB Garamond (Noto Serif Khmer lacks some Vietnamese
+    # diacritics, so it's NOT a universal substitute).
+    primary = (_CAPTION_FONT_KHMER,) if _has_khmer(text) else ()
+    for path in (*primary, _CAPTION_FONT_PATH, *_CAPTION_FONT_FALLBACKS):
         try:
             f = ImageFont.truetype(path, size)
         except OSError:
             continue
-        # Variable fonts (EB Garamond) ship multiple weights — pin a heavier,
-        # readable one. Harmless no-op (caught) for static fonts like DejaVu.
+        # Variable fonts (EB Garamond, Noto Serif Khmer) ship multiple weights and
+        # have Weight as their first axis — pin a heavier, readable one. Harmless
+        # no-op (caught) for static fonts like DejaVu.
         try:
             f.set_variation_by_axes([_CAPTION_FONT_WEIGHT])
         except Exception:
@@ -448,8 +465,58 @@ def _resolve_zodiac_icon(icon_sign: str | None) -> Path | None:
     return p if p.exists() else None
 
 
+def _grapheme_clusters(s: str) -> list[str]:
+    """Split a string into rendering clusters so we never break between a base
+    char and its combining marks. Handles Khmer COENG (U+17D2), which pulls the
+    following consonant into a subscript cluster — important because Khmer has no
+    spaces between words, so long captions must break mid-token at safe points."""
+    out: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        cl = s[i]
+        i += 1
+        while i < n:
+            c = s[i]
+            if c == "្":  # Khmer coeng: attach it AND the consonant it subscripts
+                cl += c
+                i += 1
+                if i < n:
+                    cl += s[i]
+                    i += 1
+            elif unicodedata.category(c) in ("Mn", "Mc", "Me"):  # combining marks
+                cl += c
+                i += 1
+            else:
+                break
+        out.append(cl)
+    return out
+
+
+def _break_long_token(token: str, fits, max_width: int) -> list[str]:
+    """Break one over-wide token into cluster-aligned chunks that each fit
+    `max_width`. Used for scripts without spaces (Khmer, CJK, Thai…)."""
+    chunks: list[str] = []
+    cur = ""
+    for cl in _grapheme_clusters(token):
+        trial = cur + cl
+        if not cur or fits(trial, max_width):
+            cur = trial
+        else:
+            chunks.append(cur)
+            cur = cl
+    if cur:
+        chunks.append(cur)
+    return chunks or [token]
+
+
 def _wrap_text_to_width(text: str, font, draw, stroke: int, max_width: int) -> list[str]:
-    """Greedy word-wrap so each rendered line fits within `max_width` px."""
+    """Greedy word-wrap so each rendered line fits within `max_width` px. Words
+    that are themselves wider than `max_width` (e.g. an un-spaced Khmer clause)
+    are broken at safe cluster boundaries instead of overflowing the frame."""
+    def fits(s: str, w: int) -> bool:
+        bbox = draw.textbbox((0, 0), s, font=font, stroke_width=stroke)
+        return (bbox[2] - bbox[0]) <= w
+
     lines: list[str] = []
     for paragraph in text.splitlines() or [text]:
         words = paragraph.split()
@@ -459,12 +526,23 @@ def _wrap_text_to_width(text: str, font, draw, stroke: int, max_width: int) -> l
         cur = ""
         for w in words:
             trial = f"{cur} {w}".strip()
-            bbox = draw.textbbox((0, 0), trial, font=font, stroke_width=stroke)
-            if (bbox[2] - bbox[0]) <= max_width or not cur:
-                cur = trial
+            if fits(trial, max_width) or not cur:
+                # The word may fit appended; but if it stands alone and is still
+                # too wide, break it at cluster boundaries.
+                if not cur and not fits(w, max_width):
+                    pieces = _break_long_token(w, fits, max_width)
+                    lines.extend(pieces[:-1])
+                    cur = pieces[-1]
+                else:
+                    cur = trial
             else:
                 lines.append(cur)
-                cur = w
+                if not fits(w, max_width):
+                    pieces = _break_long_token(w, fits, max_width)
+                    lines.extend(pieces[:-1])
+                    cur = pieces[-1]
+                else:
+                    cur = w
         if cur:
             lines.append(cur)
     return lines
@@ -491,7 +569,7 @@ def _render_caption_overlay(text: str, width: int, height: int,
     shorter = min(width, height)
     font_size = max(26, int(shorter * _CAPTION_FONT_SCALE))
     stroke = max(1, font_size // 22)   # thin edge — readability without the heavy "subtitle" border
-    font = _load_caption_font(font_size)
+    font = _load_caption_font(font_size, text)
 
     max_width = max(1, int(width * (1 - 2 * _CAPTION_SIDE_PAD)))
     lines = _wrap_text_to_width(text, font, draw, stroke, max_width)

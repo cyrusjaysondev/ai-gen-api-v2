@@ -444,6 +444,22 @@ else
   fi
 fi
 
+# Khmer caption font — Noto Serif Khmer (OFL). EB Garamond has no Khmer glyphs, so
+# watermark.py uses this for Khmer ('km') horoscope captions; Latin/Vietnamese
+# stay on EB Garamond. Missing it only affects Khmer captions (they'd tofu).
+if [ -s "$FONTS_DIR/NotoSerifKhmer.ttf" ]; then
+  log "  Khmer caption font already on volume ($(stat -c%s "$FONTS_DIR/NotoSerifKhmer.ttf" 2>/dev/null || stat -f%z "$FONTS_DIR/NotoSerifKhmer.ttf") bytes)"
+else
+  log "  Downloading Khmer caption font (Noto Serif Khmer)..."
+  if wget -qO "$FONTS_DIR/NotoSerifKhmer.ttf" "$API_REPO/assets/fonts/NotoSerifKhmer.ttf" && [ -s "$FONTS_DIR/NotoSerifKhmer.ttf" ]; then
+    wget -qO "$FONTS_DIR/NotoSerifKhmer-OFL.txt" "$API_REPO/assets/fonts/NotoSerifKhmer-OFL.txt" 2>/dev/null || true
+    log "    Khmer caption font saved to $FONTS_DIR/NotoSerifKhmer.ttf"
+  else
+    rm -f "$FONTS_DIR/NotoSerifKhmer.ttf"
+    log "    WARN: Khmer caption-font download failed — Khmer captions will tofu"
+  fi
+fi
+
 # ─────────────────────────────────────────────
 # 3. Custom nodes: LanPaint (FLUX face swap) + ComfyUI-KJNodes (ColorMatch for i2v)
 # KJNodes ships with runpod/comfyui:latest at the time of writing — this clone is
