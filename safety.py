@@ -368,9 +368,15 @@ def _build_filter():
     # ~5s on first call. The blocklist itself is cheap to rescan.
     if _CACHED_APP is None:
         try:
-            _CACHED_APP = FaceAnalysis(name="buffalo_l", root=model_root,
-                               providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-            _CACHED_APP.prepare(ctx_id=0, det_size=(det_size_edge, det_size_edge), det_thresh=det_thresh)
+            # Device: default GPU (CUDA→CPU fallback). On serverless the GPU is
+            # shared with a resident FLUX model, so InsightFace's cuBLAS calls
+            # fail mid-inference (cublasStatus_t / ONNXRuntimeError). Setting
+            # FACE_FILTER_DEVICE=cpu forces CPU detection there (~1s/image, no
+            # VRAM contention) — same models + blocklist from the volume.
+            _cpu = os.environ.get("FACE_FILTER_DEVICE", "").lower() == "cpu"
+            _providers = ["CPUExecutionProvider"] if _cpu else ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            _CACHED_APP = FaceAnalysis(name="buffalo_l", root=model_root, providers=_providers)
+            _CACHED_APP.prepare(ctx_id=-1 if _cpu else 0, det_size=(det_size_edge, det_size_edge), det_thresh=det_thresh)
         except Exception as e:
             _FILTER_INIT_ERROR = f"failed to initialize InsightFace: {e}"
             return
@@ -485,9 +491,10 @@ def _ensure_app():
         model_root    = os.environ.get("INSIGHTFACE_MODEL_ROOT", "/workspace/insightface_models")
         det_thresh    = float(os.environ.get("FACE_DETECTOR_THRESHOLD", "0.1"))
         det_size_edge = int(os.environ.get("FACE_DETECTOR_SIZE", "1024"))
-        app = FaceAnalysis(name="buffalo_l", root=model_root,
-                           providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-        app.prepare(ctx_id=0, det_size=(det_size_edge, det_size_edge), det_thresh=det_thresh)
+        _cpu = os.environ.get("FACE_FILTER_DEVICE", "").lower() == "cpu"
+        _providers = ["CPUExecutionProvider"] if _cpu else ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        app = FaceAnalysis(name="buffalo_l", root=model_root, providers=_providers)
+        app.prepare(ctx_id=-1 if _cpu else 0, det_size=(det_size_edge, det_size_edge), det_thresh=det_thresh)
         _CACHED_APP = app
     except Exception as e:
         print(f"[face-refine] InsightFace init failed: {e}")

@@ -95,7 +95,11 @@ def _build_filter():
     # Build the CLIP pipeline once and reuse across blocklist reloads.
     if _CACHED_MODEL is None:
         try:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            # LOGO_FILTER_DEVICE=cpu forces CPU — on serverless the GPU is busy
+            # with a resident FLUX model, so keep CLIP off it (avoids the same
+            # VRAM contention that breaks the InsightFace filter). Default auto.
+            device = "cpu" if os.environ.get("LOGO_FILTER_DEVICE", "").lower() == "cpu" \
+                else ("cuda" if torch.cuda.is_available() else "cpu")
             # Use the QuickGELU variant — open_clip's openai/ViT-B-32 weights
             # were trained with QuickGELU; the default config uses standard
             # GELU and emits a warning + small accuracy degradation.
