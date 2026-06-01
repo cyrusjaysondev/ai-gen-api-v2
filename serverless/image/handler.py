@@ -180,6 +180,30 @@ def _decode_image_b64(b64: str, field_name: str) -> bytes:
         raise ValueError(f"'{field_name}' is not valid base64: {e}") from e
 
 
+def _encode_result_b64(path: Path, max_edge: int = 2048, quality: int = 90) -> str:
+    """Read a rendered output image and return it base64-encoded as JPEG.
+
+    Used for INLINE delivery (the `return_b64` input flag). A serverless worker
+    has no persistent HTTP server to serve `/image/<file>` like the pod does, so
+    the load balancer asks for the pixels in the job result and hands the
+    browser a `data:` URL. We re-encode to JPEG (and downscale very large
+    renders) so the job output stays comfortably under RunPod's response-size
+    cap — a raw 2 MP PNG base64 would risk truncation."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        w, h = im.size
+        scale = min(1.0, max_edge / max(w, h))
+        if scale < 1.0:
+            im = im.resize((max(1, round(w * scale)), max(1, round(h * scale))))
+        buf = BytesIO()
+        im.save(buf, format="JPEG", quality=quality, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
 # ─────────────────────────────────────────────
 # ComfyUI readiness — workers cold-start with ComfyUI booting in parallel
 # (start.sh spawns it). Block on first invocation until it's serving.
@@ -436,7 +460,19 @@ async def handler(event):
 
     job_id = event.get("id") or str(uuid.uuid4())
     try:
-        return await ENDPOINTS[endpoint](inp, job_id)
+        result = await ENDPOINTS[endpoint](inp, job_id)
+        # Inline delivery: when the caller sets return_b64=true (the load
+        # balancer does — serverless has no persistent file server to fetch
+        # /image/<file> from), attach the rendered image as base64 so the proxy
+        # can hand the browser a data: URL directly. The image_path on the
+        # network volume is still returned for the reaper / S3 fetchers.
+        if isinstance(result, dict) and inp.get("return_b64") and result.get("image_path"):
+            try:
+                result["image_b64"] = _encode_result_b64(Path(result["image_path"]))
+                result["mime"] = "image/jpeg"
+            except Exception as e:
+                result["b64_error"] = f"{type(e).__name__}: {e}"
+        return result
     except FilterBlocked as e:
         resp = {
             "error": "blocked",
