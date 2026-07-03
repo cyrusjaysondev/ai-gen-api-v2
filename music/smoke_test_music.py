@@ -20,7 +20,10 @@ from typing import Any
 
 def request_json(base_url: str, path: str, payload: dict[str, Any] | None, api_key: str | None) -> dict[str, Any]:
     url = base_url.rstrip("/") + path
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "ai-gen-api-v2-music-smoke-test/1.0",
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
@@ -36,7 +39,7 @@ def request_json(base_url: str, path: str, payload: dict[str, Any] | None, api_k
 
 def download_file(base_url: str, relative_url: str, output: Path, api_key: str | None) -> None:
     file_url = relative_url if relative_url.startswith("http") else base_url.rstrip("/") + relative_url
-    headers = {}
+    headers = {"User-Agent": "ai-gen-api-v2-music-smoke-test/1.0"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(file_url, headers=headers, method="GET")
