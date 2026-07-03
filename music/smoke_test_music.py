@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import sys
 import time
 import urllib.error
@@ -98,7 +99,12 @@ def main() -> int:
     deadline = time.monotonic() + args.timeout
     last_status: dict[str, Any] | None = None
     while time.monotonic() < deadline:
-        queried = request_json(args.base_url, "/query_result", {"task_id_list": [task_id]}, args.api_key)
+        try:
+            queried = request_json(args.base_url, "/query_result", {"task_id_list": [task_id]}, args.api_key)
+        except (TimeoutError, socket.timeout) as exc:
+            print(json.dumps({"status": "poll_timeout", "message": str(exc)}, ensure_ascii=False))
+            time.sleep(args.poll_interval)
+            continue
         rows = queried.get("data") or []
         if rows:
             last_status = rows[0]
