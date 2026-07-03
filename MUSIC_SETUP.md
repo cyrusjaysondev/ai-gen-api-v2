@@ -60,7 +60,7 @@ Recommended pod for first build:
 | Setting | Value |
 |---------|-------|
 | GPU | RTX 5090, RTX 4090, A40, A100, or better |
-| Container image | `nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04` |
+| Container image | `runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04` |
 | Volume | `ai-music-models` mounted at `/workspace` |
 | HTTP port | `8001` |
 

@@ -105,10 +105,18 @@ sync_ace_step_repo() {
     git -C "$ACE_STEP_DIR" fetch origin "$repo_ref" --depth 1
     git -C "$ACE_STEP_DIR" checkout "$repo_ref" || git -C "$ACE_STEP_DIR" checkout FETCH_HEAD
     git -C "$ACE_STEP_DIR" pull --ff-only origin "$repo_ref" || true
+  elif [[ -f "$ACE_STEP_DIR/pyproject.toml" && -d "$ACE_STEP_DIR/acestep" ]]; then
+    log "Using existing ACE-Step source directory without git metadata"
   else
+    if [[ -e "$ACE_STEP_DIR" ]]; then
+      log "Removing incomplete ACE-Step directory at $ACE_STEP_DIR"
+      rm -rf "$ACE_STEP_DIR"
+    fi
+
     log "Cloning ACE-Step from $repo_url"
     git clone --depth 1 --branch "$repo_ref" "$repo_url" "$ACE_STEP_DIR" || {
       log "Branch/ref clone failed; cloning default branch and checking out $repo_ref"
+      rm -rf "$ACE_STEP_DIR"
       git clone --depth 1 "$repo_url" "$ACE_STEP_DIR"
       git -C "$ACE_STEP_DIR" fetch origin "$repo_ref" --depth 1 || true
       git -C "$ACE_STEP_DIR" checkout "$repo_ref" || true
