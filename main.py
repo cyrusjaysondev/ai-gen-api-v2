@@ -940,9 +940,25 @@ async def delete_all_jobs(completed_only: bool = True):
 # File serving
 # ─────────────────────────────────────────────
 
-@app.get("/image/{filename}")
-async def serve_image(filename: str):
-    for path in [OUTPUT_DIR / "images" / filename, OUTPUT_DIR / filename]:
+def _safe_output_relpath(file_path: str) -> Path:
+    rel = Path(file_path)
+    if rel.is_absolute() or any(part in ("", ".", "..") for part in rel.parts):
+        raise HTTPException(400, "Invalid file path")
+    return rel
+
+
+def _safe_output_candidate(root: Path, rel: Path) -> Path:
+    root_resolved = root.resolve()
+    candidate = (root / rel).resolve()
+    if not candidate.is_relative_to(root_resolved):
+        raise HTTPException(400, "Invalid file path")
+    return candidate
+
+
+@app.get("/image/{file_path:path}")
+async def serve_image(file_path: str):
+    rel = _safe_output_relpath(file_path)
+    for path in [_safe_output_candidate(OUTPUT_DIR / "images", rel), _safe_output_candidate(OUTPUT_DIR, rel)]:
         if path.exists():
             # Pick a sensible content-type from the extension so .jpg
             # thumbnails don't get served as image/png and broken in some
@@ -955,29 +971,31 @@ async def serve_image(filename: str):
                 ".webp": "image/webp",
                 ".gif": "image/gif",
             }.get(ext, "image/png")
-            return FileResponse(str(path), media_type=mt, filename=filename)
-    raise HTTPException(404, f"Image not found: {filename}")
+            return FileResponse(str(path), media_type=mt, filename=rel.name)
+    raise HTTPException(404, f"Image not found: {file_path}")
 
-@app.get("/video/{filename}")
-async def serve_video(filename: str):
-    for path in [OUTPUT_DIR / "video" / filename, OUTPUT_DIR / filename]:
+@app.get("/video/{file_path:path}")
+async def serve_video(file_path: str):
+    rel = _safe_output_relpath(file_path)
+    for path in [_safe_output_candidate(OUTPUT_DIR / "video", rel), _safe_output_candidate(OUTPUT_DIR, rel)]:
         if path.exists():
-            return FileResponse(str(path), media_type="video/mp4", filename=filename)
-    raise HTTPException(404, f"Not found: {filename}")
+            return FileResponse(str(path), media_type="video/mp4", filename=rel.name)
+    raise HTTPException(404, f"Not found: {file_path}")
 
-@app.delete("/video/{filename}")
-async def delete_video(filename: str):
-    for path in [OUTPUT_DIR / "video" / filename, OUTPUT_DIR / filename]:
+@app.delete("/video/{file_path:path}")
+async def delete_video(file_path: str):
+    rel = _safe_output_relpath(file_path)
+    for path in [_safe_output_candidate(OUTPUT_DIR / "video", rel), _safe_output_candidate(OUTPUT_DIR, rel)]:
         if path.exists():
             path.unlink()
             # Drop the thumbnail sibling too (best-effort).
-            thumb = OUTPUT_DIR / "images" / f"{Path(filename).stem}_thumb.jpg"
+            thumb = OUTPUT_DIR / "images" / f"{rel.stem}_thumb.jpg"
             thumb.unlink(missing_ok=True)
             for job_id, info in list(jobs.items()):
-                if info.get("filename") == filename:
+                if info.get("filename") in {file_path, rel.name}:
                     del jobs[job_id]
-            return {"status": "deleted", "filename": filename}
-    raise HTTPException(404, f"File not found: {filename}")
+            return {"status": "deleted", "filename": file_path}
+    raise HTTPException(404, f"File not found: {file_path}")
 
 @app.get("/videos")
 async def list_videos():

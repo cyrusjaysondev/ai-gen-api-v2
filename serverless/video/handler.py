@@ -8,9 +8,11 @@ Endpoints supported via `event["input"]["endpoint"]`:
 Models read from the network volume at /runpod-volume/runpod-slim/ComfyUI/models
 (linked into ComfyUI's models dir by start.sh before the handler boots).
 
-Output files are written to /runpod-volume/outputs/<job-id>/<filename> so the
-client (which also has the network volume mounted) can read them — base64 is
-not used here since LTX videos routinely exceed RunPod's ~10 MB response cap.
+Output files are written to VOLUME_OUTPUTS. By default the worker keeps the
+original /runpod-volume/outputs/<job-id>/<filename> layout. Set
+VOLUME_OUTPUTS_INCLUDE_JOB_ID=false when VOLUME_OUTPUTS points at the persistent
+pod's flat video folder (/runpod-volume/runpod-slim/ComfyUI/output/video), so
+the CMS load balancer can serve the result through /video/<filename>.
 
 Input (i2v):
   {
@@ -90,6 +92,10 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 VOLUME_OUTPUTS = Path(os.environ.get("VOLUME_OUTPUTS", "/runpod-volume/outputs"))
 VOLUME_OUTPUTS.mkdir(parents=True, exist_ok=True)
+VOLUME_OUTPUTS_INCLUDE_JOB_ID = (
+    os.environ.get("VOLUME_OUTPUTS_INCLUDE_JOB_ID", "true").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
 
 
 def _decode_image_b64(b64: str, field_name: str) -> bytes:
@@ -170,12 +176,16 @@ def _validate_preset_and_aspect(preset: str, aspect_ratio: str) -> None:
         raise ValueError(f"invalid aspect_ratio '{aspect_ratio}'; valid: original, {', '.join(LTX_ASPECT_RATIOS)}")
 
 
-def _stage_output_to_volume(filename: str, src: Path, job_id: str) -> Path:
-    dest_dir = VOLUME_OUTPUTS / job_id
+def _stage_output_to_volume(filename: str, src: Path, job_id: str) -> tuple[Path, str]:
+    dest_dir = VOLUME_OUTPUTS / job_id if VOLUME_OUTPUTS_INCLUDE_JOB_ID else VOLUME_OUTPUTS
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / filename
+    staged_filename = filename
+    dest = dest_dir / staged_filename
+    if not VOLUME_OUTPUTS_INCLUDE_JOB_ID and dest.exists():
+        staged_filename = f"{job_id}__{filename}"
+        dest = dest_dir / staged_filename
     shutil.copy2(src, dest)
-    return dest
+    return dest, staged_filename
 
 
 def _apply_watermark(path: Path, text):
@@ -224,11 +234,12 @@ async def run_ltx_i2v(inp: dict, job_id: str) -> dict:
     started = time.time()
     try:
         filename, src = await submit_and_wait(workflow)
-        dest = _stage_output_to_volume(filename, src, job_id)
+        dest, staged_filename = _stage_output_to_volume(filename, src, job_id)
         wm_err = _apply_watermark(dest, inp.get("watermark"))
         result = {
             "video_path": str(dest),
-            "filename": filename,
+            "filename": staged_filename,
+            "source_filename": filename,
             "size_bytes": dest.stat().st_size,
             "seed": seed,
             "duration_seconds": round(time.time() - started, 2),
@@ -268,11 +279,12 @@ async def run_ltx_t2v(inp: dict, job_id: str) -> dict:
 
     started = time.time()
     filename, src = await submit_and_wait(workflow)
-    dest = _stage_output_to_volume(filename, src, job_id)
+    dest, staged_filename = _stage_output_to_volume(filename, src, job_id)
     wm_err = _apply_watermark(dest, inp.get("watermark"))
     result = {
         "video_path": str(dest),
-        "filename": filename,
+        "filename": staged_filename,
+        "source_filename": filename,
         "size_bytes": dest.stat().st_size,
         "seed": seed,
         "duration_seconds": round(time.time() - started, 2),
