@@ -8,7 +8,10 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTa
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
-from image_output import optimize_image_file
+try:
+    from image_output import optimize_image_file
+except ImportError:
+    optimize_image_file = None
 
 from workflows import (
     ASPECT_RATIOS,
@@ -800,7 +803,7 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                                 print(f"[{job_id}] bgm mux raised: {bgm_err}")
 
                         image_delivery = None
-                        if is_image_output:
+                        if is_image_output and optimize_image_file is not None:
                             try:
                                 optimized = await asyncio.to_thread(optimize_image_file, path)
                                 path = optimized.path
