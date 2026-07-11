@@ -1,14 +1,14 @@
 import asyncio
 import re
 import subprocess
-import uuid, json, httpx, os
+import uuid, httpx, os
 from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
-import websockets
+from image_output import optimize_image_file
 
 from workflows import (
     ASPECT_RATIOS,
@@ -52,6 +52,8 @@ except ImportError:
 
 app = FastAPI(title="AI Gen API v2")
 
+API_VERSION = "2.2.0"
+
 # Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
 # can call /admin/blocklist directly across the multi-pod registry. We
 # previously routed everything through the face-swap-proxy edge function,
@@ -76,6 +78,7 @@ app.add_middleware(
 COMFYUI_URL = "http://127.0.0.1:8188"
 POD_ID = os.environ.get("RUNPOD_POD_ID", "RUNPOD_POD_ID_PLACEHOLDER")
 BASE_URL = f"https://{POD_ID}-7860.proxy.runpod.net"
+COMFY_JOB_TIMEOUT_SECONDS = int(os.environ.get("COMFY_JOB_TIMEOUT_SECONDS", "900"))
 
 # Auto-detect ComfyUI root
 COMFY_ROOT = None
@@ -338,6 +341,43 @@ def _trim_first_half(video_path: Path) -> tuple[bool, str]:
                   f"({_MOTION_CLEAN_FRACTION*100:.0f}% — IC-LoRA clean region)")
 
 
+class JobCancelled(Exception):
+    """Internal signal used when a user cancels an active API job."""
+
+
+async def _wait_for_comfy_prompt(
+    prompt_id: str,
+    *,
+    job_id: str | None = None,
+    timeout_seconds: int = COMFY_JOB_TIMEOUT_SECONDS,
+) -> dict:
+    """Poll ComfyUI history until a prompt completes or fails.
+
+    Polling avoids the websocket race where a very fast prompt can finish
+    before the listener connects, leaving the API waiting forever.
+    """
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while loop.time() < deadline:
+            if job_id and jobs.get(job_id, {}).get("status") == "cancelled":
+                raise JobCancelled(job_id)
+
+            response = await client.get(f"{COMFYUI_URL}/history/{prompt_id}")
+            response.raise_for_status()
+            job_data = response.json().get(prompt_id, {})
+            status = job_data.get("status", {})
+            if status.get("completed") or status.get("status_str") in {"success", "error"}:
+                return job_data
+            await asyncio.sleep(0.5)
+
+    raise TimeoutError(
+        f"ComfyUI prompt {prompt_id} did not finish within {timeout_seconds} seconds"
+    )
+
+
 async def _comfy_run_get_image(workflow: dict):
     """Submit a workflow to ComfyUI, wait for completion, return the first output
     image Path (or None). Self-contained + never raises — used by the optional
@@ -350,24 +390,11 @@ async def _comfy_run_get_image(workflow: dict):
                 print(f"[face-refine] comfy submit failed: {resp.text[:200]}")
                 return None
             prompt_id = resp.json()["prompt_id"]
-        ws_url = f"ws://127.0.0.1:8188/ws?clientId={client_id}"
-        async with websockets.connect(ws_url, ping_interval=None, close_timeout=None, max_size=None) as ws:
-            while True:
-                raw = await ws.recv()
-                if isinstance(raw, bytes):
-                    continue
-                msg = json.loads(raw)
-                if msg.get("type") == "executing":
-                    d = msg.get("data", {})
-                    if d.get("node") is None and d.get("prompt_id") == prompt_id:
-                        break
-        async with httpx.AsyncClient() as client:
-            history = await client.get(f"{COMFYUI_URL}/history/{prompt_id}")
-            job_data = history.json().get(prompt_id, {})
-            if job_data.get("status", {}).get("status_str") == "error":
-                print(f"[face-refine] comfy reported execution error")
-                return None
-            outputs = job_data.get("outputs", {})
+        job_data = await _wait_for_comfy_prompt(prompt_id)
+        if job_data.get("status", {}).get("status_str") == "error":
+            print(f"[face-refine] comfy reported execution error")
+            return None
+        outputs = job_data.get("outputs", {})
         for node_output in outputs.values():
             if "images" in node_output and node_output["images"]:
                 item = node_output["images"][0]
@@ -548,7 +575,12 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
     A blocked output is deleted from disk and the job is marked failed
     with status="blocked" so the client gets a clear error instead of
     a generic completion."""
-    jobs[job_id] = {**jobs.get(job_id, {}), "status": "processing", "started_at": datetime.now(timezone.utc).isoformat()}
+    jobs[job_id] = {
+        **jobs.get(job_id, {}),
+        "status": "processing",
+        "workflow": workflow,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
     try:
         client_id = str(uuid.uuid4())
         async with httpx.AsyncClient() as client:
@@ -557,37 +589,19 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                 jobs[job_id] = {**jobs[job_id], "status": "failed", "error": resp.text}
                 return
             prompt_id = resp.json()["prompt_id"]
+        jobs[job_id] = {**jobs[job_id], "prompt_id": prompt_id}
 
-        # Disable client-side pings + close timeout so very long generations
-        # (LTX i2v at 1280×2272 = ~3-5 min on RTX 5090) don't get killed by
-        # the websockets library's default 20 s ping timeout. ComfyUI sends
-        # progress messages frequently enough that the connection stays
-        # alive on its own.
-        ws_url = f"ws://127.0.0.1:8188/ws?clientId={client_id}"
-        async with websockets.connect(
-            ws_url, ping_interval=None, close_timeout=None, max_size=None
-        ) as ws:
-            while True:
-                raw = await ws.recv()
-                if isinstance(raw, bytes):
-                    continue  # Skip binary preview frames
-                msg = json.loads(raw)
-                if msg.get("type") == "executing":
-                    data = msg.get("data", {})
-                    if data.get("node") is None and data.get("prompt_id") == prompt_id:
-                        break
-
-        async with httpx.AsyncClient() as client:
-            history = await client.get(f"{COMFYUI_URL}/history/{prompt_id}")
-            job_data = history.json().get(prompt_id, {})
-            status = job_data.get("status", {}).get("status_str", "")
-            if status == "error":
-                messages = job_data.get("status", {}).get("messages", [])
-                for m in messages:
-                    if m[0] == "execution_error":
-                        jobs[job_id] = {**jobs[job_id], "status": "failed", "error": m[1].get("exception_message")}
-                        return
-            outputs = job_data.get("outputs", {})
+        job_data = await _wait_for_comfy_prompt(prompt_id, job_id=job_id)
+        status = job_data.get("status", {}).get("status_str", "")
+        if status == "error":
+            messages = job_data.get("status", {}).get("messages", [])
+            for m in messages:
+                if m[0] == "execution_error":
+                    jobs[job_id] = {**jobs[job_id], "status": "failed", "error": m[1].get("exception_message")}
+                    return
+            jobs[job_id] = {**jobs[job_id], "status": "failed", "error": "ComfyUI execution failed"}
+            return
+        outputs = job_data.get("outputs", {})
 
         for node_output in outputs.values():
             for key in ["videos", "gifs", "images"]:
@@ -599,10 +613,6 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                     if path.exists():
                         ext = Path(filename).suffix.lower()
                         is_image_output = ext in [".png", ".jpg", ".jpeg", ".webp"]
-                        if is_image_output:
-                            url = f"{BASE_URL}/image/{filename}"
-                        else:
-                            url = f"{BASE_URL}/video/{filename}"
 
                         # ── OPTIONAL 2nd-PASS FACE REFINE (opt-in) ───
                         # Re-render the (small, soft) swapped face at high res
@@ -788,6 +798,40 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                                     print(f"[{job_id}] bgm [{_bgm_track.name}]: {bgm_msg}")
                             except Exception as bgm_err:
                                 print(f"[{job_id}] bgm mux raised: {bgm_err}")
+
+                        image_delivery = None
+                        if is_image_output:
+                            try:
+                                optimized = await asyncio.to_thread(optimize_image_file, path)
+                                path = optimized.path
+                                filename = path.name
+                                ext = path.suffix.lower()
+                                image_delivery = {
+                                    "original_bytes": optimized.original_bytes,
+                                    "output_bytes": optimized.output_bytes,
+                                    "width": optimized.width,
+                                    "height": optimized.height,
+                                    "quality": optimized.quality,
+                                }
+                                print(
+                                    f"[{job_id}] image delivery: "
+                                    f"{optimized.original_bytes // 1024} KB -> "
+                                    f"{optimized.output_bytes // 1024} KB "
+                                    f"({optimized.width}x{optimized.height})"
+                                )
+                            except Exception as image_err:
+                                print(f"[{job_id}] image optimization skipped: {image_err}")
+
+                        if jobs.get(job_id, {}).get("status") == "cancelled":
+                            path.unlink(missing_ok=True)
+                            return
+
+                        url = (
+                            f"{BASE_URL}/image/{filename}"
+                            if is_image_output
+                            else f"{BASE_URL}/video/{filename}"
+                        )
+
                         # For video outputs, snap a thumbnail (first frame).
                         # Runs AFTER watermarks so the thumbnail reflects the
                         # final, stamped video. Failure is non-fatal — the
@@ -816,6 +860,8 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                         }
                         if thumbnail_url:
                             completed["thumbnail_url"] = thumbnail_url
+                        if image_delivery:
+                            completed["image_delivery"] = image_delivery
                         if wm_warnings:
                             completed["watermark_warning"] = " | ".join(wm_warnings)
                         if audio_mux_warning:
@@ -824,10 +870,13 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                             completed["trim_warning"] = trim_warning
                         elif trim_first_half:
                             completed["trimmed"] = "first_half_only"
-                        jobs[job_id] = completed
+                        if jobs.get(job_id, {}).get("status") != "cancelled":
+                            jobs[job_id] = completed
                         return
 
         jobs[job_id] = {**jobs[job_id], "status": "failed", "error": "No output found"}
+    except JobCancelled:
+        jobs[job_id] = {**jobs.get(job_id, {}), "status": "cancelled"}
     except Exception as e:
         jobs[job_id] = {**jobs[job_id], "status": "failed", "error": str(e), "failed_at": datetime.now(timezone.utc).isoformat()}
     finally:
@@ -840,9 +889,159 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
 # Health & job management
 # ─────────────────────────────────────────────
 
+
+def _job_links(job_id: str) -> dict:
+    return {
+        "poll_url": f"{BASE_URL}/status/{job_id}",
+        "cancel_url": f"{BASE_URL}/jobs/{job_id}/cancel",
+    }
+
+
+WORKFLOW_CATALOG = [
+    {
+        "id": "text-to-image",
+        "label": "FLUX text to image",
+        "endpoint": "/t2i",
+        "media": "image",
+        "inputs": [],
+    },
+    {
+        "id": "face-swap",
+        "label": "FLUX face swap",
+        "endpoint": "/flux/face-swap",
+        "media": "image",
+        "inputs": ["target.png", "face.png"],
+    },
+    {
+        "id": "image-to-image",
+        "label": "FLUX image editing",
+        "endpoint": "/flux/i2i",
+        "media": "image",
+        "inputs": ["reference.png"],
+    },
+    {
+        "id": "image-to-video",
+        "label": "LTX image to video",
+        "endpoint": "/ltx/i2v",
+        "media": "video",
+        "inputs": ["input.png"],
+    },
+    {
+        "id": "text-to-video",
+        "label": "LTX text to video",
+        "endpoint": "/ltx/t2v",
+        "media": "video",
+        "inputs": [],
+    },
+    {
+        "id": "personalized-video",
+        "label": "Face swap then animate",
+        "endpoint": "/face-animate",
+        "media": "video",
+        "inputs": ["target.png", "face.png"],
+        "stages": ["face-swap", "image-to-video"],
+    },
+]
+
+
+def _sample_workflow(workflow_id: str) -> dict:
+    seed = 12345
+    if workflow_id == "text-to-image":
+        return build_t2i_workflow(
+            "cinematic portrait, natural light", 1024, 1024, seed,
+            steps=4, cfg=1.0, guidance=4.0,
+        )
+    if workflow_id == "face-swap":
+        return get_flux_face_swap_workflow(
+            "target.png", "face.png", seed,
+            megapixels=1.0, steps=4, cfg=1.0, guidance=4.0,
+            lora_strength=1.0,
+        )
+    if workflow_id == "image-to-image":
+        return build_flux_i2i_workflow(
+            ["reference.png"], "cinematic photo edit", seed,
+            megapixels=1.0, steps=4, cfg=1.0, guidance=4.0,
+        )
+    if workflow_id == "image-to-video":
+        return build_ltx_i2v_workflow(
+            "input.png", "subtle natural movement", LTX_DEFAULT_NEGATIVE,
+            544, 960, 121, 24, seed,
+            preset="fast", audio=False, enhance_prompt=True,
+        )
+    if workflow_id == "text-to-video":
+        return build_ltx_t2v_workflow(
+            "cinematic scene with gentle camera movement", LTX_DEFAULT_NEGATIVE,
+            768, 432, 121, 24, seed, preset="fast", audio=False,
+        )
+    if workflow_id == "personalized-video":
+        return {
+            "stages": [
+                {
+                    "id": "face-swap",
+                    "workflow": _sample_workflow("face-swap"),
+                    "output": "personalized.png",
+                },
+                {
+                    "id": "image-to-video",
+                    "workflow": build_ltx_i2v_workflow(
+                        "personalized.png", "subtle natural movement",
+                        LTX_DEFAULT_NEGATIVE, 544, 960, 121, 24, seed,
+                        preset="fast", audio=False, enhance_prompt=True,
+                    ),
+                },
+            ]
+        }
+    raise KeyError(workflow_id)
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "pod_id": POD_ID}
+    active = sum(1 for job in jobs.values() if job.get("status") in {"queued", "processing"})
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.get(f"{COMFYUI_URL}/system_stats")
+            response.raise_for_status()
+        comfy_status = "ready"
+        status_code = 200
+    except Exception:
+        comfy_status = "unavailable"
+        status_code = 503
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "ready" if status_code == 200 else "degraded",
+            "version": API_VERSION,
+            "pod_id": POD_ID,
+            "comfyui": comfy_status,
+            "active_jobs": active,
+        },
+    )
+
+
+@app.get("/workflows")
+async def list_workflows():
+    return {
+        "format": "comfyui-api",
+        "items": WORKFLOW_CATALOG,
+        "hint": "Open /workflows/<id> and load the returned workflow in ComfyUI.",
+    }
+
+
+@app.get("/workflows/{workflow_id}")
+async def get_workflow_export(workflow_id: str, download: bool = False):
+    definition = next((item for item in WORKFLOW_CATALOG if item["id"] == workflow_id), None)
+    if definition is None:
+        raise HTTPException(404, f"Unknown workflow '{workflow_id}'")
+    body = {
+        "format": "comfyui-api",
+        "definition": definition,
+        "workflow": _sample_workflow(workflow_id),
+    }
+    headers = {}
+    if download:
+        headers["Content-Disposition"] = f'attachment; filename="{workflow_id}.json"'
+    return JSONResponse(content=body, headers=headers)
 
 @app.get("/status/{job_id}")
 async def get_status(job_id: str):
@@ -899,12 +1098,20 @@ async def cancel_job(job_id: str):
         raise HTTPException(400, "Job already completed")
     if job.get("status") == "failed":
         raise HTTPException(400, "Job already failed")
-    try:
-        async with httpx.AsyncClient() as client:
-            await client.post(f"{COMFYUI_URL}/queue", json={"delete": [job_id]})
-    except:
-        pass
-    jobs[job_id] = {"status": "cancelled"}
+    prompt_id = job.get("prompt_id")
+    if prompt_id:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(f"{COMFYUI_URL}/queue", json={"delete": [prompt_id]})
+                if job.get("status") == "processing":
+                    await client.post(f"{COMFYUI_URL}/interrupt")
+        except Exception as cancel_error:
+            print(f"[{job_id}] ComfyUI cancel warning: {cancel_error}")
+    jobs[job_id] = {
+        **job,
+        "status": "cancelled",
+        "cancelled_at": datetime.now(timezone.utc).isoformat(),
+    }
     return {"job_id": job_id, "status": "cancelled"}
 
 @app.post("/jobs/{job_id}/retry")
@@ -919,7 +1126,12 @@ async def retry_job(job_id: str, background_tasks: BackgroundTasks):
     new_job_id = str(uuid.uuid4())
     jobs[new_job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
     background_tasks.add_task(run_job, new_job_id, job["workflow"])
-    return {"new_job_id": new_job_id, "original_job_id": job_id, "status": "queued", "poll_url": f"{BASE_URL}/status/{new_job_id}"}
+    return {
+        "new_job_id": new_job_id,
+        "original_job_id": job_id,
+        "status": "queued",
+        **_job_links(new_job_id),
+    }
 
 @app.delete("/jobs")
 async def delete_all_jobs(completed_only: bool = True):
@@ -1070,7 +1282,7 @@ async def text_to_image(req: T2IRequest, background_tasks: BackgroundTasks):
         output_face_filter=req.face_filter, output_logo_filter=req.logo_filter,
         output_endpoint="/t2i", caption=req.caption, caption_icon=req.caption_icon,
     )
-    return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", "poll_url": f"{BASE_URL}/status/{job_id}"}
+    return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", **_job_links(job_id)}
 
 
 # ─────────────────────────────────────────────
@@ -1204,7 +1416,7 @@ async def ltx_image_to_video(
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
     background_tasks.add_task(run_job, job_id, workflow, [img_path], watermark, watermark_image, caption=caption, caption_icon=caption_icon, caption_fade=caption_fade, background_music=background_music)
-    return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", "poll_url": f"{BASE_URL}/status/{job_id}"}
+    return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", **_job_links(job_id)}
 
 
 # ─────────────────────────────────────────────
@@ -1248,7 +1460,7 @@ async def ltx_text_to_video(
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
     background_tasks.add_task(run_job, job_id, workflow, None, watermark, watermark_image, caption=caption, caption_icon=caption_icon, caption_fade=caption_fade, background_music=background_music)
-    return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", "poll_url": f"{BASE_URL}/status/{job_id}"}
+    return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", **_job_links(job_id)}
 
 
 # ─────────────────────────────────────────────
@@ -1526,7 +1738,7 @@ async def ltx_motion_control(
     )
     return {
         "job_id": job_id, "status": "queued", "model": "ltx-2.3-22b",
-        "poll_url": f"{BASE_URL}/status/{job_id}",
+        **_job_links(job_id),
         "workflow_path": "vhs" if use_vhs else "frame-extract",
         "ref_video_normalized_to": {"width": width, "height": height, "fps": fps, "max_frames": length},
         "audio_source": "reference" if audio else "none",
@@ -1603,7 +1815,7 @@ async def ltx_lipdub(
         "job_id": job_id,
         "status": "queued",
         "model": "ltx-2.3-22b + LipDub IC-LoRA",
-        "poll_url": f"{BASE_URL}/status/{job_id}",
+        **_job_links(job_id),
         "note": "Two-stage workflow (960×544 sample + 1920×1088 refine). Typical runtime ~2-4 min depending on source length.",
     }
 
@@ -1612,7 +1824,7 @@ async def ltx_lipdub(
 # Face Swap + Animate Pipeline
 # ─────────────────────────────────────────────
 
-async def _submit_and_wait_comfyui(workflow: dict) -> tuple[str, str]:
+async def _submit_and_wait_comfyui(workflow: dict, job_id: str | None = None) -> tuple[str, str]:
     """Submit a workflow to ComfyUI, wait for completion, return (filename, full_path)."""
     client_id = str(uuid.uuid4())
     async with httpx.AsyncClient() as client:
@@ -1620,25 +1832,10 @@ async def _submit_and_wait_comfyui(workflow: dict) -> tuple[str, str]:
         if resp.status_code != 200:
             raise RuntimeError(f"ComfyUI rejected workflow: {resp.text}")
         prompt_id = resp.json()["prompt_id"]
+    if job_id:
+        jobs[job_id] = {**jobs.get(job_id, {}), "prompt_id": prompt_id}
 
-    # Same long-job-tolerant settings as run_job — see the comment there.
-    ws_url = f"ws://127.0.0.1:8188/ws?clientId={client_id}"
-    async with websockets.connect(
-        ws_url, ping_interval=None, close_timeout=None, max_size=None
-    ) as ws:
-        while True:
-            raw = await ws.recv()
-            if isinstance(raw, bytes):
-                continue
-            msg = json.loads(raw)
-            if msg.get("type") == "executing":
-                data = msg.get("data", {})
-                if data.get("node") is None and data.get("prompt_id") == prompt_id:
-                    break
-
-    async with httpx.AsyncClient() as client:
-        history = await client.get(f"{COMFYUI_URL}/history/{prompt_id}")
-        job_data = history.json().get(prompt_id, {})
+    job_data = await _wait_for_comfy_prompt(prompt_id, job_id=job_id)
 
     status = job_data.get("status", {}).get("status_str", "")
     if status == "error":
@@ -1683,7 +1880,7 @@ async def run_face_animate_pipeline(
     try:
         # ── Step 1: Face swap ──
         jobs[job_id]["step"] = "face_swap"
-        swap_filename, swap_img_path = await _submit_and_wait_comfyui(face_swap_workflow)
+        swap_filename, swap_img_path = await _submit_and_wait_comfyui(face_swap_workflow, job_id)
 
         # ── Step 2: Animate the swapped image ──
         jobs[job_id]["step"] = "animating"
@@ -1732,7 +1929,7 @@ async def run_face_animate_pipeline(
         )
         ltx_workflow.update(img_nodes)
 
-        video_filename, video_full_path = await _submit_and_wait_comfyui(ltx_workflow)
+        video_filename, video_full_path = await _submit_and_wait_comfyui(ltx_workflow, job_id)
 
         ext = Path(video_filename).suffix.lower()
         url = f"{BASE_URL}/video/{video_filename}" if ext not in [".png", ".jpg", ".jpeg", ".webp"] else f"{BASE_URL}/image/{video_filename}"
@@ -1776,8 +1973,11 @@ async def run_face_animate_pipeline(
             result["thumbnail_url"] = thumbnail_url
         if watermark_warning:
             result["watermark_warning"] = watermark_warning
-        jobs[job_id] = result
+        if jobs.get(job_id, {}).get("status") != "cancelled":
+            jobs[job_id] = result
 
+    except JobCancelled:
+        jobs[job_id] = {**jobs.get(job_id, {}), "status": "cancelled"}
     except Exception as e:
         jobs[job_id] = {**jobs[job_id], "status": "failed", "error": str(e), "failed_at": datetime.now(timezone.utc).isoformat()}
     finally:
@@ -1855,7 +2055,7 @@ async def face_animate(
         "status": "queued",
         "model": "flux2-klein-9b + ltx-2.3-22b",
         "pipeline": ["face_swap", "image_to_video"],
-        "poll_url": f"{BASE_URL}/status/{job_id}",
+        **_job_links(job_id),
     }
 
 
@@ -1926,7 +2126,7 @@ async def flux_face_swap(
         refine_guidance=guidance, refine_lora=lora_strength,
         preserve_body=preserve_body, preserve_body_template=target_path,
     )
-    return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", "poll_url": f"{BASE_URL}/status/{job_id}"}
+    return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", **_job_links(job_id)}
 
 
 # ─────────────────────────────────────────────
@@ -2160,7 +2360,7 @@ async def flux_image_to_image(
             "lora_strength": final_lora,
             "steps": final_steps,
         },
-        "poll_url": f"{BASE_URL}/status/{job_id}",
+        **_job_links(job_id),
     }
 
 
@@ -2492,7 +2692,14 @@ async def admin_refresh_api_code(authorization: str = Header(default=None)):
     api_dir.mkdir(parents=True, exist_ok=True)
 
     fetched: list[dict] = []
-    for filename in ("main.py", "workflows.py", "safety.py", "logo_safety.py", "watermark.py"):
+    for filename in (
+        "main.py",
+        "workflows.py",
+        "image_output.py",
+        "safety.py",
+        "logo_safety.py",
+        "watermark.py",
+    ):
         url = f"{api_repo}/{filename}"
         target = api_dir / filename
         tmp = api_dir / f"{filename}.new"

@@ -67,6 +67,7 @@ from workflows import (
     crop_to_aspect,
     get_flux_face_swap_workflow,
 )
+from image_output import optimize_image_file
 try:
     import safety as face_safety
 except ImportError:
@@ -112,6 +113,17 @@ def _apply_watermark(path: Path, text):
         return None
     except Exception as e:
         return str(e)
+
+
+def _prepare_delivery_image(path: Path) -> tuple[Path, dict]:
+    optimized = optimize_image_file(path)
+    return optimized.path, {
+        "original_bytes": optimized.original_bytes,
+        "output_bytes": optimized.output_bytes,
+        "width": optimized.width,
+        "height": optimized.height,
+        "quality": optimized.quality,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -189,6 +201,9 @@ def _encode_result_b64(path: Path, max_edge: int = 2048, quality: int = 90) -> s
     browser a `data:` URL. We re-encode to JPEG (and downscale very large
     renders) so the job output stays comfortably under RunPod's response-size
     cap — a raw 2 MP PNG base64 would risk truncation."""
+    if path.suffix.lower() in {".jpg", ".jpeg"} and path.stat().st_size <= 200 * 1024:
+        return base64.b64encode(path.read_bytes()).decode("ascii")
+
     from io import BytesIO
 
     from PIL import Image
@@ -299,10 +314,12 @@ async def run_t2i(inp: dict, job_id: str) -> dict:
     filename, src = await submit_and_wait(workflow)
     dest = _stage_output_to_volume(filename, src, job_id)
     wm_err = _apply_watermark(dest, inp.get("watermark"))
+    dest, delivery = _prepare_delivery_image(dest)
     result = {
         "image_path": str(dest),
-        "filename": filename,
+        "filename": dest.name,
         "size_bytes": dest.stat().st_size,
+        "image_delivery": delivery,
         "seed": seed,
         "duration_seconds": round(time.time() - started, 2),
     }
@@ -358,10 +375,12 @@ async def run_flux_face_swap(inp: dict, job_id: str) -> dict:
         filename, src = await submit_and_wait(workflow)
         dest = _stage_output_to_volume(filename, src, job_id)
         wm_err = _apply_watermark(dest, inp.get("watermark"))
+        dest, delivery = _prepare_delivery_image(dest)
         result = {
             "image_path": str(dest),
-            "filename": filename,
+            "filename": dest.name,
             "size_bytes": dest.stat().st_size,
+            "image_delivery": delivery,
             "seed": seed,
             "duration_seconds": round(time.time() - started, 2),
         }
@@ -417,10 +436,12 @@ async def run_flux_i2i(inp: dict, job_id: str) -> dict:
         filename, src = await submit_and_wait(workflow)
         dest = _stage_output_to_volume(filename, src, job_id)
         wm_err = _apply_watermark(dest, inp.get("watermark"))
+        dest, delivery = _prepare_delivery_image(dest)
         result = {
             "image_path": str(dest),
-            "filename": filename,
+            "filename": dest.name,
             "size_bytes": dest.stat().st_size,
+            "image_delivery": delivery,
             "seed": seed,
             "ref_count": len(images_b64),
             "duration_seconds": round(time.time() - started, 2),
