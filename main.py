@@ -123,6 +123,46 @@ def _pick_background_track():
 # In-memory job store
 jobs = {}
 
+# Dedicated video pods should execute one heavyweight LTX workflow at a time.
+# Setting this to 0 keeps the historical unlimited-queue behavior. The CMS
+# load balancer normally diverts excess work before it reaches the pod, while
+# this pod-side guard closes the small race between simultaneous submissions.
+MAX_ACTIVE_VIDEO_JOBS = max(0, int(os.environ.get("MAX_ACTIVE_VIDEO_JOBS", "0")))
+AI_GEN_ROLE = os.environ.get("AI_GEN_ROLE", "general").strip().lower() or "general"
+
+
+def _active_video_job_count() -> int:
+    return sum(
+        1
+        for job in jobs.values()
+        if job.get("workload") == "video" and job.get("status") in {"queued", "processing"}
+    )
+
+
+def _reserve_video_job(job_id: str, cleanup_paths: list[str] | None = None) -> None:
+    active = _active_video_job_count()
+    if MAX_ACTIVE_VIDEO_JOBS and active >= MAX_ACTIVE_VIDEO_JOBS:
+        for path in cleanup_paths or []:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        raise HTTPException(
+            429,
+            detail={
+                "error": "video_capacity_reached",
+                "message": "Dedicated video pod is at its concurrency limit",
+                "active_jobs": active,
+                "max_concurrency": MAX_ACTIVE_VIDEO_JOBS,
+                "retry_backend": "serverless",
+            },
+        )
+    jobs[job_id] = {
+        "status": "queued",
+        "workload": "video",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
 
 # ─────────────────────────────────────────────
 # Helpers
@@ -1000,6 +1040,7 @@ def _sample_workflow(workflow_id: str) -> dict:
 @app.get("/health")
 async def health():
     active = sum(1 for job in jobs.values() if job.get("status") in {"queued", "processing"})
+    active_video = _active_video_job_count()
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
             response = await client.get(f"{COMFYUI_URL}/system_stats")
@@ -1016,8 +1057,12 @@ async def health():
             "status": "ready" if status_code == 200 else "degraded",
             "version": API_VERSION,
             "pod_id": POD_ID,
+            "role": AI_GEN_ROLE,
             "comfyui": comfy_status,
             "active_jobs": active,
+            "active_video_jobs": active_video,
+            "max_video_concurrency": MAX_ACTIVE_VIDEO_JOBS,
+            "video_capacity_available": MAX_ACTIVE_VIDEO_JOBS == 0 or active_video < MAX_ACTIVE_VIDEO_JOBS,
         },
     )
 
@@ -1417,7 +1462,7 @@ async def ltx_image_to_video(
     )
 
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
+    _reserve_video_job(job_id, [img_path])
     background_tasks.add_task(run_job, job_id, workflow, [img_path], watermark, watermark_image, caption=caption, caption_icon=caption_icon, caption_fade=caption_fade, background_music=background_music)
     return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", **_job_links(job_id)}
 
@@ -1461,7 +1506,7 @@ async def ltx_text_to_video(
     )
 
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
+    _reserve_video_job(job_id)
     background_tasks.add_task(run_job, job_id, workflow, None, watermark, watermark_image, caption=caption, caption_icon=caption_icon, caption_fade=caption_fade, background_music=background_music)
     return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", **_job_links(job_id)}
 
@@ -1724,7 +1769,7 @@ async def ltx_motion_control(
         )
 
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
+    _reserve_video_job(job_id, cleanup_paths)
     # audio_source_path is only set when audio=True — that triggers
     # _mux_reference_audio inside run_job to carry the reference's
     # original audio onto the silent video LTX produced.
@@ -1810,7 +1855,7 @@ async def ltx_lipdub(
     )
 
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
+    _reserve_video_job(job_id, [ref_video_path])
     background_tasks.add_task(
         run_job, job_id, workflow, [ref_video_path], None, False,
     )
@@ -2046,7 +2091,7 @@ async def face_animate(
     )
 
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
+    _reserve_video_job(job_id, [target_path, face_path])
     background_tasks.add_task(
         run_face_animate_pipeline,
         job_id, face_swap_workflow, animate_prompt, negative_prompt,
