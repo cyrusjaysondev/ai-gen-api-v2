@@ -1095,7 +1095,14 @@ async def get_workflow_export(workflow_id: str, download: bool = False):
 async def get_status(job_id: str):
     if job_id not in jobs:
         raise HTTPException(404, "Job not found")
-    return jobs[job_id]
+    # Workflow graphs and ComfyUI prompt IDs are internal implementation
+    # details. Keeping them out of every poll response cuts response size and
+    # avoids exposing the complete node graph to third-party applications.
+    return {
+        key: value
+        for key, value in jobs[job_id].items()
+        if key not in {"workflow", "prompt_id"}
+    }
 
 @app.get("/jobs")
 async def get_all_jobs():
