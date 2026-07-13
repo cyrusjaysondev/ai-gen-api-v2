@@ -251,8 +251,14 @@ LTX_ASPECT_RATIOS = {
 LTX_DEFAULT_NEGATIVE = "low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly"
 
 _LTX_DISTILLED_LOW_SIGMAS = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+_LTX_REALTIME_SIGMAS = "1.0, 0.975, 0.725, 0.421875, 0.0"
 
 LTX_PRESETS = {
+    "realtime": {
+        "sigmas": _LTX_REALTIME_SIGMAS,
+        "lora_strength": 0.5,
+        "two_pass": False,
+    },
     "fast": {
         "sigmas": _LTX_DISTILLED_LOW_SIGMAS,
         "lora_strength": 0.5,
@@ -282,7 +288,8 @@ def ltx_base_nodes(prompt, negative_prompt, width, height, length, fps, seed,
                    preset: str = "fast", audio: bool = False) -> dict:
     """Return the shared LTX workflow nodes.
 
-    fast preset: single pass at full resolution — fast, no upscale overhead.
+    realtime preset: four-step single pass for user-facing previews/templates.
+    fast preset: eight-step single pass at full resolution.
     quality preset: two-pass (half-res → upscale → refine at full-res) — slower, sharper.
     audio: if True, generate audio track with the video (adds ~5s overhead).
     """
