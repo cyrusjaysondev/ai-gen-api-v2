@@ -1447,6 +1447,7 @@ async def ltx_image_to_video(
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
     caption_fade: bool = Form(True, description="Video only: when true (default) the caption fades in ~1s after the start; set false to show it from the very first frame. No effect on images (their caption is always immediate)."),
     background_music: bool = Form(False, description="Video only: mux a looping royalty-free background-music bed (/workspace/assets/horoscope_bgm.m4a) under the clip, trimmed to length with a soft fade. No effect on images."),
+    face_filter: bool = Form(True, description="Reject the input image when it matches a blocked face identity. Enabled by default."),
 ):
     if preset not in LTX_PRESETS:
         raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
@@ -1457,6 +1458,8 @@ async def ltx_image_to_video(
     width, height = compute_ltx_dimensions(width, height, aspect_ratio)
 
     img_bytes = await image.read()
+    job_id = str(uuid.uuid4())
+    _apply_face_filter("/ltx/i2v", job_id, face_filter, [(img_bytes, "image")])
     img_filename = f"ltx_i2v_{uuid.uuid4().hex}.png"
     img_path = str(INPUT_DIR / img_filename)
     Path(img_path).write_bytes(img_bytes)
@@ -1468,7 +1471,6 @@ async def ltx_image_to_video(
         inplace_strength=inplace_strength,
     )
 
-    job_id = str(uuid.uuid4())
     _reserve_video_job(job_id, [img_path])
     background_tasks.add_task(run_job, job_id, workflow, [img_path], watermark, watermark_image, caption=caption, caption_icon=caption_icon, caption_fade=caption_fade, background_music=background_music)
     return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", **_job_links(job_id)}
@@ -1556,6 +1558,7 @@ async def ltx_motion_control(
     motion_strength: float = Form(1.0, ge=0.0, le=1.0, description="LTXVAddGuide strength for the reference video. 1.0 = full motion conditioning (recommended). <1.0 attenuates."),
     watermark: str | None = Form(None, description="Optional text overlay at bottom-right. Stripped by Supabase proxies in prod."),
     watermark_image: bool = Form(False, description="Composite the GenReel logo at the bottom-right."),
+    face_filter: bool = Form(True, description="Reject the character image when it matches a blocked face identity. Enabled by default."),
 ):
     """Kling-style motion control via LTX 2.3.
 
@@ -1588,6 +1591,8 @@ async def ltx_motion_control(
     # name — same pattern as /ltx/i2v. The cleanup list at the end ensures
     # both this and the normalized video get deleted after the job runs.
     img_bytes = await image.read()
+    job_id = str(uuid.uuid4())
+    _apply_face_filter("/ltx/motion", job_id, face_filter, [(img_bytes, "image")])
     img_filename = f"ltx_motion_img_{uuid.uuid4().hex}.png"
     img_path = str(INPUT_DIR / img_filename)
     Path(img_path).write_bytes(img_bytes)
@@ -1775,7 +1780,6 @@ async def ltx_motion_control(
             inplace_strength=inplace_strength, motion_strength=motion_strength,
         )
 
-    job_id = str(uuid.uuid4())
     _reserve_video_job(job_id, cleanup_paths)
     # audio_source_path is only set when audio=True — that triggers
     # _mux_reference_audio inside run_job to carry the reference's
