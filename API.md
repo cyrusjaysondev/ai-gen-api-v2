@@ -803,8 +803,10 @@ curl -X POST "$POD/flux/i2i" \
 }
 ```
 
-`score` is cosine similarity vs the closest blocklist entry; default threshold
-is `0.6` (override via `FACE_FILTER_THRESHOLD` env var on the pod).
+`score` is cosine similarity vs the closest Blocked Faces reference. The
+default threshold is `0.68`, deliberately precision-first so weak resemblance
+to a listed person is allowed. Override it via `FACE_FILTER_THRESHOLD` only
+after testing against labelled same-person and different-person examples.
 
 ### Logo / flag filter
 

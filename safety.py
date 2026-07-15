@@ -12,10 +12,13 @@ Layout on the network volume:
 Pod sees these at /workspace/; serverless workers see the same at
 /runpod-volume/. The BLOCKLIST_DIR / MODEL_ROOT env vars override defaults.
 
-Threshold (default 0.6): InsightFace embeddings are L2-normalized, so the
+Threshold (default 0.68): InsightFace embeddings are L2-normalized, so the
 similarity score is in [-1, 1]. Same-identity scores are typically > 0.5;
-different identities < 0.4. 0.6 is conservative (false-negative biased) —
-adjust via the FACE_FILTER_THRESHOLD env var if you tune later.
+different identities usually score lower, but demographic lookalikes can land
+in the high 0.5s or low 0.6s. 0.68 is intentionally precision-first: only a
+high-confidence match to an identity explicitly present in the Blocked Faces
+list is rejected. Adjust via FACE_FILTER_THRESHOLD if later calibration has a
+larger labelled test set.
 
 Imported lazily by the handlers so a worker that never runs face-filtered
 requests doesn't pay the import + model-load cost.
@@ -82,6 +85,17 @@ def _maybe_reload():
 
 
 _CACHED_APP = None  # InsightFace FaceAnalysis instance — survives blocklist reloads
+
+# Production is precision-first: a merely similar-looking person must not be
+# rejected. This default is deliberately above the observed 0.55-0.60
+# lookalike band while remaining below the usual score for a clear reference
+# photo of the same identity.
+DEFAULT_FACE_FILTER_THRESHOLD = 0.68
+
+
+def is_confident_face_match(score: float, threshold: float) -> bool:
+    """Return True only for a high-confidence Blocked Faces identity match."""
+    return score > threshold
 
 
 # ─────────────────────────────────────────────
@@ -344,15 +358,15 @@ def _build_filter():
     blocklist_dir = _blocklist_dir()
     model_root    = os.environ.get("INSIGHTFACE_MODEL_ROOT", "/workspace/insightface_models")
     # Cosine-similarity cutoff for "this detected face matches a blocked
-    # identity". History: 0.5 (original) → 0.6 → 0.7 (after a single
-    # confirmed false-positive of an unrelated woman scoring 0.666
-    # against Hun Sen) → 0.55 (current — the 0.7 jump caused many real
-    # blocked identities to slip past with scores in the 0.55-0.69
-    # range). Genuine same-person matches for buffalo_l/ArcFace land
-    # around 0.65-0.9; 0.55 catches real hits including borderline
-    # cases at the cost of occasional false positives on demographics-
-    # adjacent faces. Override via FACE_FILTER_THRESHOLD if needed.
-    threshold     = float(os.environ.get("FACE_FILTER_THRESHOLD", "0.55"))
+    # identity". The older 0.55 default rejected unrelated demographic
+    # lookalikes (a confirmed production false positive scored 0.5834 against
+    # one Le Duan reference). Blocking is now precision-first: only strong
+    # matches to the explicit Blocked Faces references are rejected. Multiple
+    # reference photos per person improve recall without lowering this global
+    # threshold. Override via FACE_FILTER_THRESHOLD only after calibration.
+    threshold     = float(os.environ.get(
+        "FACE_FILTER_THRESHOLD", str(DEFAULT_FACE_FILTER_THRESHOLD)
+    ))
     # InsightFace's default detection threshold (0.5) — and even our earlier
     # bump to 0.3 — kept rejecting clearly-visible elderly faces. SCRFD-10G
     # under-trains on older subjects and on photos with washed-out colour,
@@ -755,7 +769,7 @@ def check_image(image_bytes: bytes) -> FilterResult:
                 best_score = score
                 best_id = identity
 
-    blocked = best_score > threshold
+    blocked = is_confident_face_match(best_score, threshold)
     _log_check(
         outcome="blocked" if blocked else "no_match",
         score=best_score, identity=best_id, faces=len(faces), fallback=fallback_used,
