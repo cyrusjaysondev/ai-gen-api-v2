@@ -98,8 +98,12 @@ def _build_filter():
             # LOGO_FILTER_DEVICE=cpu forces CPU — on serverless the GPU is busy
             # with a resident FLUX model, so keep CLIP off it (avoids the same
             # VRAM contention that breaks the InsightFace filter). Default auto.
-            device = "cpu" if os.environ.get("LOGO_FILTER_DEVICE", "").lower() == "cpu" \
-                else ("cuda" if torch.cuda.is_available() else "cpu")
+            # FLUX owns the generation GPU. CLIP defaults to CPU so a safety
+            # check cannot fail merely because ComfyUI is holding model VRAM.
+            # Dedicated safety workers may opt back in with
+            # LOGO_FILTER_DEVICE=gpu.
+            requested_device = os.environ.get("LOGO_FILTER_DEVICE", "cpu").lower()
+            device = "cuda" if requested_device == "gpu" and torch.cuda.is_available() else "cpu"
             # Use the QuickGELU variant — open_clip's openai/ViT-B-32 weights
             # were trained with QuickGELU; the default config uses standard
             # GELU and emits a warning + small accuracy degradation.

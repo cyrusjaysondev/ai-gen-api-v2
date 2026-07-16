@@ -404,7 +404,12 @@ def _build_filter():
             # fail mid-inference (cublasStatus_t / ONNXRuntimeError). Setting
             # FACE_FILTER_DEVICE=cpu forces CPU detection there (~1s/image, no
             # VRAM contention) — same models + blocklist from the volume.
-            _cpu = os.environ.get("FACE_FILTER_DEVICE", "").lower() == "cpu"
+            # Keep safety inference off the generation GPU by default. ComfyUI
+            # keeps FLUX resident in VRAM; initializing InsightFace on the same
+            # 24 GB card intermittently fails with ONNX Runtime BFCArena OOM.
+            # Explicit FACE_FILTER_DEVICE=gpu remains available for dedicated
+            # safety workers that do not host a generation model.
+            _cpu = os.environ.get("FACE_FILTER_DEVICE", "cpu").lower() != "gpu"
             _providers = ["CPUExecutionProvider"] if _cpu else ["CUDAExecutionProvider", "CPUExecutionProvider"]
             _CACHED_APP = FaceAnalysis(name="buffalo_l", root=model_root, providers=_providers)
             _CACHED_APP.prepare(ctx_id=-1 if _cpu else 0, det_size=(det_size_edge, det_size_edge), det_thresh=det_thresh)
