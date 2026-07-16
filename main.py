@@ -133,6 +133,56 @@ VIDEO_PROGRESS_ESTIMATE_SECONDS = max(
     20,
     int(os.environ.get("VIDEO_PROGRESS_ESTIMATE_SECONDS", "55")),
 )
+SAFETY_WARMUP_ENABLED = os.environ.get("SAFETY_WARMUP_ENABLED", "true").lower() not in {
+    "0", "false", "no",
+}
+_SAFETY_READY = not SAFETY_WARMUP_ENABLED
+_SAFETY_WARMUP_ERROR: str | None = None
+
+
+@app.on_event("startup")
+async def warm_safety_models() -> None:
+    """Initialize safety before the pod is allowed to report ready.
+
+    ComfyUI keeps FLUX resident after a generation and can leave less than
+    2 GB free. InsightFace then intermittently fails during ONNX session
+    initialization. Unload ComfyUI's cache once at API startup, initialize
+    safety first, and let the next generation reload FLUX around the resident
+    safety session.
+    """
+    global _SAFETY_READY, _SAFETY_WARMUP_ERROR
+    if not SAFETY_WARMUP_ENABLED:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{COMFYUI_URL}/free",
+                json={"unload_models": True, "free_memory": True},
+            )
+            response.raise_for_status()
+
+        if face_safety is None:
+            raise RuntimeError("InsightFace safety module is unavailable")
+        face_status = await asyncio.to_thread(face_safety.force_reload_filter)
+        if not face_status.get("ok"):
+            raise RuntimeError(str(face_status.get("error") or "face safety warm-up failed"))
+
+        if logo_safety is None:
+            raise RuntimeError("logo safety module is unavailable")
+        await asyncio.to_thread(logo_safety._maybe_reload)
+        if logo_safety._FILTER is None:
+            raise RuntimeError(logo_safety._FILTER_INIT_ERROR or "logo safety warm-up failed")
+
+        _SAFETY_READY = True
+        _SAFETY_WARMUP_ERROR = None
+        print(
+            f"[startup] safety ready: {face_status.get('blocklist_count', 0)} faces, "
+            f"{len(logo_safety._FILTER.get('blocklist', {}))} logos"
+        )
+    except Exception as exc:
+        _SAFETY_READY = False
+        _SAFETY_WARMUP_ERROR = str(exc)
+        raise RuntimeError(f"safety warm-up failed: {exc}") from exc
 
 
 def _active_video_job_count() -> int:
@@ -1094,7 +1144,7 @@ async def health():
             response = await client.get(f"{COMFYUI_URL}/system_stats")
             response.raise_for_status()
         comfy_status = "ready"
-        status_code = 200
+        status_code = 200 if _SAFETY_READY else 503
     except Exception:
         comfy_status = "unavailable"
         status_code = 503
@@ -1107,6 +1157,8 @@ async def health():
             "pod_id": POD_ID,
             "role": AI_GEN_ROLE,
             "comfyui": comfy_status,
+            "safety": "ready" if _SAFETY_READY else "unavailable",
+            "safety_error": _SAFETY_WARMUP_ERROR,
             "active_jobs": active,
             "active_video_jobs": active_video,
             "max_video_concurrency": MAX_ACTIVE_VIDEO_JOBS,
