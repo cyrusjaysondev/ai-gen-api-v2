@@ -1475,6 +1475,46 @@ def _apply_face_filter(endpoint: str, job_id: str, face_filter: bool,
             })
 
 
+def _validate_face_upload(endpoint: str, job_id: str, image_bytes: bytes,
+                          label: str, require_human: bool,
+                          face_filter: bool) -> None:
+    """Validate one user face with a single InsightFace detector pass."""
+    if not require_human and not face_filter:
+        if face_safety is not None:
+            face_safety.log_bypass(job_id, endpoint, note="face_filter=false, upload validation disabled")
+        return
+    if face_safety is None:
+        raise HTTPException(503, detail={
+            "error": "server_busy",
+            "error_code": "server_overload",
+            "reason": "Face validation is temporarily unavailable.",
+        })
+    try:
+        result = face_safety.check_image(image_bytes)
+    except RuntimeError:
+        raise HTTPException(503, detail={
+            "error": "server_busy",
+            "error_code": "server_overload",
+            "reason": "Face validation is temporarily unavailable.",
+        })
+    if require_human and result.human_face_count < 1:
+        raise HTTPException(422, detail={
+            "error": "unsupported_subject",
+            "error_code": "no_human_subject",
+            "reason": f"{label} does not contain a valid human subject.",
+            "image_index": 0,
+        })
+    if face_filter and result.blocked:
+        raise HTTPException(400, detail={
+            "error": "blocked",
+            "filter": "face",
+            "reason": f"{label} matches blocked face identity",
+            "matched_identity": result.matched_identity,
+            "score": round(result.score, 4),
+            "image_index": 0,
+        })
+
+
 def _require_detectable_face(endpoint: str, enabled: bool,
                              images_with_names: list) -> None:
     """Reject opted-in user images when InsightFace finds no clear face."""
@@ -2291,15 +2331,14 @@ async def flux_face_swap(
 
     target_bytes = await target_image.read()
     face_bytes = await face_image.read()
-    _require_detectable_face(
-        "/flux/face-swap", require_detectable_face, [(face_bytes, "face_image")],
-    )
-
-    # Compliance filters — must run before any heavy work, before writing to disk
+    # Validate only the user-uploaded face. The target is a CMS-managed
+    # template and the generated output is checked again after inference.
     job_id = str(uuid.uuid4())
-    inputs = [(target_bytes, "target_image"), (face_bytes, "face_image")]
-    _apply_face_filter("flux/face-swap", job_id, face_filter, inputs)
-    _apply_logo_filter("flux/face-swap", job_id, logo_filter, inputs)
+    _validate_face_upload(
+        "/flux/face-swap", job_id, face_bytes, "face_image",
+        require_detectable_face, face_filter,
+    )
+    _apply_logo_filter("/flux/face-swap", job_id, logo_filter, [(face_bytes, "face_image")])
 
     # If aspect ratio is specified, crop target image to that ratio before sending to ComfyUI.
     # The workflow's ImageScaleToTotalPixels + GetImageSize will then produce output at that AR.

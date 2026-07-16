@@ -38,6 +38,7 @@ class FilterResult(NamedTuple):
     matched_identity: Optional[str]
     score: float
     face_count: int
+    human_face_count: int
 
 
 # ─────────────────────────────────────────────
@@ -747,7 +748,9 @@ def normalize_blocklist_image(image_bytes: bytes) -> tuple[bytes, str]:
 def check_image(image_bytes: bytes) -> FilterResult:
     """Detect faces in an image and compare against the blocklist.
 
-    Returns FilterResult(blocked, matched_identity, score, face_count).
+    Returns FilterResult(blocked, matched_identity, score, face_count,
+    human_face_count). The strict human count reuses this same detector pass,
+    avoiding a second upload-validation inference.
     If the filter can't initialize (missing deps, etc.) this raises
     RuntimeError — the caller should decide whether to fail closed or open.
 
@@ -780,13 +783,13 @@ def check_image(image_bytes: bytes) -> FilterResult:
     # but blocklist empty" from "filter never ran".
     if not blocklist:
         _log_check(outcome="no_blocklist", score=0.0, identity=None, faces=0, fallback=None)
-        return FilterResult(False, None, 0.0, 0)
+        return FilterResult(False, None, 0.0, 0, 0)
 
     try:
         pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception:
         _log_check(outcome="decode_error", score=0.0, identity=None, faces=0, fallback=None)
-        return FilterResult(False, None, 0.0, 0)
+        return FilterResult(False, None, 0.0, 0, 0)
 
     # Run detection with the FULL fallback chain (same as _build_filter).
     # This is the actual bypass fix — without the fallbacks, any input
@@ -800,7 +803,7 @@ def check_image(image_bytes: bytes) -> FilterResult:
         # the one bypass mode we CAN'T close without a second detector.
         _log_check(outcome="no_face_detected_even_with_fallbacks",
                    score=0.0, identity=None, faces=0, fallback=None)
-        return FilterResult(False, None, 0.0, 0)
+        return FilterResult(False, None, 0.0, 0, 0)
 
     # Filter detections by area before matching. CRITICAL: use the area
     # of the IMAGE WE ACTUALLY DETECTED ON (which may be a transformed
@@ -808,6 +811,13 @@ def check_image(image_bytes: bytes) -> FilterResult:
     # Using the original img_area would give wrong ratios when a fallback
     # variant succeeded after upscaling.
     img_area = max(1, detect_h * detect_w)
+    human_face_count = _count_significant_faces(
+        raw_faces,
+        img_area,
+        minimum_det_score=MIN_HUMAN_FACE_DETECTION_SCORE,
+        image_shape=(detect_h, detect_w),
+        minimum_bbox_inside_ratio=MIN_HUMAN_FACE_BBOX_INSIDE_RATIO,
+    )
 
     # MIN_FACE_AREA_RATIO_QUERY (0.5%) is permissive enough to catch
     # distant subjects in group shots while still filtering true noise
@@ -822,7 +832,7 @@ def check_image(image_bytes: bytes) -> FilterResult:
         # need tuning, or the input genuinely has no significant face.
         _log_check(outcome="only_noise_detections",
                    score=0.0, identity=None, faces=len(raw_faces), fallback=fallback_used)
-        return FilterResult(False, None, 0.0, 0)
+        return FilterResult(False, None, 0.0, 0, human_face_count)
 
     best_score = -1.0
     best_id: Optional[str] = None
@@ -840,7 +850,7 @@ def check_image(image_bytes: bytes) -> FilterResult:
         outcome="blocked" if blocked else "no_match",
         score=best_score, identity=best_id, faces=len(faces), fallback=fallback_used,
     )
-    return FilterResult(blocked, best_id, best_score, len(faces))
+    return FilterResult(blocked, best_id, best_score, len(faces), human_face_count)
 
 
 # ─────────────────────────────────────────────
