@@ -18,9 +18,9 @@ return a usable result.
 Style:
   * Text: bold white with a black outline at the bottom-right. Size scales
     to ~4% of image height (min 24 px), padded ~3% from the edges.
-  * Logo: PNG with transparency, placed at the bottom-right. Width scales
-    to ~12% of the image's shorter side (min 40 px) so the detailed wordmark is
-    readable without dominating the frame.
+  * Logo: PNG with transparency, placed at the bottom-right on a translucent
+    dark badge. Width scales to ~15% of the image's shorter side (min 48 px) so
+    the detailed wordmark stays readable over both bright and busy scenes.
 
 Video paths prefer NVENC and retry through libx264 when CUDA is unavailable.
 Audio, if present, is stream-copied so we don't degrade it.
@@ -68,7 +68,13 @@ LOGO_URL = (
 
 # Fraction of the image's shorter side used as the visible logo width. This
 # mark contains a small wordmark, so 7% was unreadable on 480p/544px outputs.
-_LOGO_SCALE = 0.12
+_LOGO_SCALE = 0.15
+# A dark backing gives the multicolour mark predictable contrast regardless of
+# the generated scene. Padding is relative to the visible logo width so the
+# badge scales naturally from mobile-sized outputs through 4K.
+_LOGO_PANEL_ALPHA = 158  # 62% opaque
+_LOGO_PANEL_PAD = 0.12
+_LOGO_PANEL_RADIUS = 0.10
 # Padding from the side edges, as a fraction of the shorter side.
 _EDGE_PAD = 0.03
 # Extra padding from the bottom edge — larger so the logo stays above the
@@ -387,17 +393,28 @@ def _apply_image_logo(p: Path) -> None:
     if content_bbox:
         logo = logo.crop(content_bbox)
     shorter = min(base.width, base.height)
-    target_w = max(40, int(shorter * _LOGO_SCALE))
+    target_w = max(48, int(shorter * _LOGO_SCALE))
     ratio = target_w / logo.width
     target_h = max(8, int(logo.height * ratio))
     logo = logo.resize((target_w, target_h), Image.LANCZOS)
 
+    panel_pad = max(6, int(target_w * _LOGO_PANEL_PAD))
+    panel_w = target_w + panel_pad * 2
+    panel_h = target_h + panel_pad * 2
+    badge = Image.new("RGBA", (panel_w, panel_h), (0, 0, 0, 0))
+    badge_draw = ImageDraw.Draw(badge)
+    badge_draw.rounded_rectangle(
+        (0, 0, panel_w - 1, panel_h - 1),
+        radius=max(4, int(target_w * _LOGO_PANEL_RADIUS)),
+        fill=(0, 0, 0, _LOGO_PANEL_ALPHA),
+    )
+    badge.alpha_composite(logo, dest=(panel_pad, panel_pad))
+
     pad = max(8, int(shorter * _EDGE_PAD))
     bottom_pad = max(8, int(shorter * _BOTTOM_PAD))
-    x = base.width - target_w - pad
-    y = base.height - target_h - bottom_pad
-    # Use the logo's own alpha as the paste mask so PNG transparency is honoured.
-    base.alpha_composite(logo, dest=(x, y))
+    x = base.width - panel_w - pad
+    y = base.height - panel_h - bottom_pad
+    base.alpha_composite(badge, dest=(x, y))
 
     ext = p.suffix.lower()
     if ext in (".jpg", ".jpeg"):
@@ -414,7 +431,7 @@ def _apply_image_logo(p: Path) -> None:
 def _apply_video_logo(p: Path) -> None:
     """Overlay LOGO_PATH onto the video at `p` via ffmpeg `overlay`.
 
-    The visible logo is sized to ~12 % of the video's shorter side. Side padding is
+    The visible logo is sized to ~15 % of the video's shorter side. Side padding is
     ~3 % of the shorter side; bottom padding is ~8 % so the mark clears the
     app's download bar / player controls on mobile. We probe the input first
     and bake concrete integers into the filter string so ffmpeg's filtergraph
@@ -425,7 +442,8 @@ def _apply_video_logo(p: Path) -> None:
     shorter = min(w, h)
     pad = max(8, int(shorter * _EDGE_PAD))
     bottom_pad = max(8, int(shorter * _BOTTOM_PAD))
-    target_w = max(40, int(shorter * _LOGO_SCALE))
+    target_w = max(48, int(shorter * _LOGO_SCALE))
+    panel_pad = max(6, int(target_w * _LOGO_PANEL_PAD))
 
     tmp = p.with_name(f"{p.stem}.wm{p.suffix}")
     content_bbox = _logo_content_bbox()
@@ -436,7 +454,9 @@ def _apply_video_logo(p: Path) -> None:
     # main_w / main_h / overlay_w / overlay_h are valid overlay-filter
     # variables and contain no commas; safe to leave as expressions.
     filter_complex = (
-        f"[1:v]{crop_filter}scale={target_w}:-1[wm];"
+        f"[1:v]{crop_filter}scale={target_w}:-1,format=rgba,"
+        f"pad=iw+{panel_pad * 2}:ih+{panel_pad * 2}:{panel_pad}:{panel_pad}:"
+        f"color=black@{_LOGO_PANEL_ALPHA / 255:.3f}[wm];"
         f"[0:v][wm]overlay=x=main_w-overlay_w-{pad}:"
         f"y=main_h-overlay_h-{bottom_pad}:format=auto"
     )
