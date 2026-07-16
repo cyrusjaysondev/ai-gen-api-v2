@@ -339,25 +339,25 @@ fi
 log "  All 9 models verified at expected sizes"
 
 # ─────────────────────────────────────────────
-# 2b. Brand assets (GenReel logo for the watermark_image option)
+# 2b. Brand assets (Metfone GenAI logo for the watermark_image option)
 # ─────────────────────────────────────────────
 # Tiny PNG kept on the volume so every pod + serverless worker can find it.
-# watermark.py loads /workspace/assets/genreel_logo.png lazily and silently
+# watermark.py loads /workspace/assets/metfone_genai_watermark.png lazily and silently
 # skips the image overlay if it's missing, so a network blip here is
 # non-fatal.
 ASSETS_DIR="/workspace/assets"
-GENREEL_LOGO="$ASSETS_DIR/genreel_logo.png"
-GENREEL_URL="https://pydizqejihfjbnitybtj.supabase.co/storage/v1/object/public/assets/uploads/1779271551302_GenReel_log.png"
+METFONE_LOGO="$ASSETS_DIR/metfone_genai_watermark.png"
+METFONE_LOGO_URL="$API_REPO/assets/metfone_genai_watermark.png"
 mkdir -p "$ASSETS_DIR"
-if [ -s "$GENREEL_LOGO" ]; then
-  log "  GenReel logo already on volume ($(stat -c%s "$GENREEL_LOGO" 2>/dev/null || stat -f%z "$GENREEL_LOGO") bytes)"
+if [ -s "$METFONE_LOGO" ]; then
+  log "  Metfone GenAI logo already on volume ($(stat -c%s "$METFONE_LOGO" 2>/dev/null || stat -f%z "$METFONE_LOGO") bytes)"
 else
-  log "  Downloading GenReel logo..."
-  if wget -qO "$GENREEL_LOGO" "$GENREEL_URL"; then
-    log "    Logo saved to $GENREEL_LOGO"
+  log "  Downloading Metfone GenAI logo..."
+  if wget -qO "$METFONE_LOGO" "$METFONE_LOGO_URL"; then
+    log "    Logo saved to $METFONE_LOGO"
   else
-    log "    WARN: GenReel logo download failed — watermark_image will be a no-op until present"
-    rm -f "$GENREEL_LOGO"
+    log "    WARN: Metfone GenAI logo download failed — watermark_image will be a no-op until present"
+    rm -f "$METFONE_LOGO"
   fi
 fi
 

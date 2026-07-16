@@ -129,6 +129,10 @@ jobs = {}
 # this pod-side guard closes the small race between simultaneous submissions.
 MAX_ACTIVE_VIDEO_JOBS = max(0, int(os.environ.get("MAX_ACTIVE_VIDEO_JOBS", "0")))
 AI_GEN_ROLE = os.environ.get("AI_GEN_ROLE", "general").strip().lower() or "general"
+VIDEO_PROGRESS_ESTIMATE_SECONDS = max(
+    20,
+    int(os.environ.get("VIDEO_PROGRESS_ESTIMATE_SECONDS", "55")),
+)
 
 
 def _active_video_job_count() -> int:
@@ -161,6 +165,10 @@ def _reserve_video_job(job_id: str, cleanup_paths: list[str] | None = None) -> N
         "status": "queued",
         "workload": "video",
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "progress": 5,
+        "stage": "queued",
+        "progress_message": "Waiting for the dedicated video GPU...",
+        "eta_seconds": VIDEO_PROGRESS_ESTIMATE_SECONDS,
     }
 
 
@@ -402,11 +410,35 @@ async def _wait_for_comfy_prompt(
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
+    started_monotonic = loop.time()
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         while loop.time() < deadline:
             if job_id and jobs.get(job_id, {}).get("status") == "cancelled":
                 raise JobCancelled(job_id)
+
+            if job_id and jobs.get(job_id, {}).get("workload") == "video":
+                elapsed = max(0, int(loop.time() - started_monotonic))
+                if elapsed < 10:
+                    stage = "loading_models"
+                    message = "Loading the video model..."
+                elif elapsed < max(35, VIDEO_PROGRESS_ESTIMATE_SECONDS - 12):
+                    stage = "sampling"
+                    message = "Rendering video frames..."
+                else:
+                    stage = "decoding"
+                    message = "Decoding the rendered frames..."
+                progress = min(
+                    90,
+                    15 + int((elapsed / VIDEO_PROGRESS_ESTIMATE_SECONDS) * 75),
+                )
+                jobs[job_id] = {
+                    **jobs[job_id],
+                    "progress": progress,
+                    "stage": stage,
+                    "progress_message": message,
+                    "eta_seconds": max(0, VIDEO_PROGRESS_ESTIMATE_SECONDS - elapsed),
+                }
 
             response = await client.get(f"{COMFYUI_URL}/history/{prompt_id}")
             response.raise_for_status()
@@ -623,6 +655,9 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
         "status": "processing",
         "workflow": workflow,
         "started_at": datetime.now(timezone.utc).isoformat(),
+        "progress": 15 if jobs.get(job_id, {}).get("workload") == "video" else 10,
+        "stage": "loading_models" if jobs.get(job_id, {}).get("workload") == "video" else "processing",
+        "progress_message": "Loading the video model..." if jobs.get(job_id, {}).get("workload") == "video" else "Processing...",
     }
     try:
         client_id = str(uuid.uuid4())
@@ -656,6 +691,15 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                     if path.exists():
                         ext = Path(filename).suffix.lower()
                         is_image_output = ext in [".png", ".jpg", ".jpeg", ".webp"]
+
+                        if ext in _VIDEO_EXTS:
+                            jobs[job_id] = {
+                                **jobs[job_id],
+                                "progress": 93,
+                                "stage": "encoding",
+                                "progress_message": "Encoding the final video...",
+                                "eta_seconds": 5,
+                            }
 
                         # ── OPTIONAL 2nd-PASS FACE REFINE (opt-in) ───
                         # Re-render the (small, soft) swapped face at high res
@@ -900,6 +944,10 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                             "filename": filename,
                             "completed_at": completed_at.isoformat(),
                             "duration_seconds": duration_seconds,
+                            "progress": 100,
+                            "stage": "completed",
+                            "progress_message": "Video ready" if ext in _VIDEO_EXTS else "Image ready",
+                            "eta_seconds": 0,
                         }
                         if thumbnail_url:
                             completed["thumbnail_url"] = thumbnail_url
@@ -1299,7 +1347,7 @@ class T2IRequest(BaseModel):
     cfg: float = 1.0
     guidance: float = 4.0
     watermark: str | None = None  # e.g. "AI" — overlay at bottom-right; null/empty = off
-    watermark_image: bool = False  # composite the GenReel logo at bottom-right
+    watermark_image: bool = False  # composite the Metfone GenAI logo at bottom-right
     # Output-side face filter — applied AFTER generation. /t2i has no input
     # image so this is the only way a blocked-identity prompt can be caught.
     # Defaults ON (safe default, matching /flux/face-swap & /flux/i2i): callers
@@ -1375,6 +1423,35 @@ def _apply_face_filter(endpoint: str, job_id: str, face_filter: bool,
             })
 
 
+def _require_detectable_face(endpoint: str, enabled: bool,
+                             images_with_names: list) -> None:
+    """Reject opted-in user images when InsightFace finds no clear face."""
+    if not enabled:
+        return
+    if face_safety is None:
+        raise HTTPException(503, detail={
+            "error": "server_busy",
+            "error_code": "server_overload",
+            "reason": "Face validation is temporarily unavailable.",
+        })
+    for image_index, (img_bytes, label) in enumerate(images_with_names):
+        try:
+            face_count = face_safety.detect_human_face_count(img_bytes)
+        except RuntimeError:
+            raise HTTPException(503, detail={
+                "error": "server_busy",
+                "error_code": "server_overload",
+                "reason": "Face validation is temporarily unavailable.",
+            })
+        if face_count < 1:
+            raise HTTPException(422, detail={
+                "error": "unsupported_subject",
+                "error_code": "no_human_subject",
+                "reason": f"{label} does not contain a valid human subject.",
+                "image_index": image_index,
+            })
+
+
 def _apply_logo_filter(endpoint: str, job_id: str, logo_filter: bool,
                        images_with_names: list) -> None:
     """Parallel to _apply_face_filter but for the logo/flag blocklist (CLIP-based)."""
@@ -1442,12 +1519,13 @@ async def ltx_image_to_video(
     enhance_prompt: bool = Form(True, description="Rewrite prompt via Gemma 12B using the input image as context (adds 2-5s + VRAM). Recommended ON for short prompts (e.g. 'make her run'); OFF when you've already written a detailed scene description."),
     inplace_strength: float = Form(0.7, ge=0.3, le=1.0, description="How tightly each frame is pinned to the input image. 0.7 = reference distilled value (good identity, weak motion). Lower it for action prompts: 0.5 ≈ moderate motion, 0.4 ≈ strong motion (some identity drift), 0.3 ≈ near-t2v. Two-pass refine tracks this (= min(1.0, x+0.3))."),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark. Video re-encodes via ffmpeg (~1-3s for a 5s clip)."),
-    watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
+    watermark_image: bool = Form(False, description="Composite the Metfone GenAI logo (loaded once from /workspace/assets/metfone_genai_watermark.png) at the bottom-right. Stacks with `watermark` if both are set."),
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
     caption_fade: bool = Form(True, description="Video only: when true (default) the caption fades in ~1s after the start; set false to show it from the very first frame. No effect on images (their caption is always immediate)."),
     background_music: bool = Form(False, description="Video only: mux a looping royalty-free background-music bed (/workspace/assets/horoscope_bgm.m4a) under the clip, trimmed to length with a soft fade. No effect on images."),
     face_filter: bool = Form(True, description="Reject the input image when it matches a blocked face identity. Enabled by default."),
+    require_detectable_face: bool = Form(False, description="Opt-in input validation. When true, reject the uploaded image unless at least one clear face is detectable. Default false."),
 ):
     if preset not in LTX_PRESETS:
         raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
@@ -1459,6 +1537,9 @@ async def ltx_image_to_video(
 
     img_bytes = await image.read()
     job_id = str(uuid.uuid4())
+    _require_detectable_face(
+        "/ltx/i2v", require_detectable_face, [(img_bytes, "image")],
+    )
     _apply_face_filter("/ltx/i2v", job_id, face_filter, [(img_bytes, "image")])
     img_filename = f"ltx_i2v_{uuid.uuid4().hex}.png"
     img_path = str(INPUT_DIR / img_filename)
@@ -1494,7 +1575,7 @@ async def ltx_text_to_video(
     seed: int = Form(-1),
     audio: bool = Form(False, description="Generate audio track with the video (adds overhead)"),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark. Video re-encodes via ffmpeg (~1-3s for a 5s clip)."),
-    watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
+    watermark_image: bool = Form(False, description="Composite the Metfone GenAI logo (loaded once from /workspace/assets/metfone_genai_watermark.png) at the bottom-right. Stacks with `watermark` if both are set."),
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
     caption_fade: bool = Form(True, description="Video only: when true (default) the caption fades in ~1s after the start; set false to show it from the very first frame. No effect on images (their caption is always immediate)."),
@@ -1557,8 +1638,9 @@ async def ltx_motion_control(
     inplace_strength: float = Form(0.5, ge=0.0, le=1.0, description="Identity-anchor strength for LTXVAddGuide on the character image. 1.0 = locks first frame to character image (identity dominates, motion fights it). 0.5 = balanced. 0.1-0.2 = motion dominates (best dance match, identity drift possible). 0.0 = no identity anchor."),
     motion_strength: float = Form(1.0, ge=0.0, le=1.0, description="LTXVAddGuide strength for the reference video. 1.0 = full motion conditioning (recommended). <1.0 attenuates."),
     watermark: str | None = Form(None, description="Optional text overlay at bottom-right. Stripped by Supabase proxies in prod."),
-    watermark_image: bool = Form(False, description="Composite the GenReel logo at the bottom-right."),
+    watermark_image: bool = Form(False, description="Composite the Metfone GenAI logo at the bottom-right."),
     face_filter: bool = Form(True, description="Reject the character image when it matches a blocked face identity. Enabled by default."),
+    require_detectable_face: bool = Form(False, description="Opt-in input validation. When true, reject the character image unless at least one clear face is detectable. Default false."),
 ):
     """Kling-style motion control via LTX 2.3.
 
@@ -1592,6 +1674,9 @@ async def ltx_motion_control(
     # both this and the normalized video get deleted after the job runs.
     img_bytes = await image.read()
     job_id = str(uuid.uuid4())
+    _require_detectable_face(
+        "/ltx/motion", require_detectable_face, [(img_bytes, "image")],
+    )
     _apply_face_filter("/ltx/motion", job_id, face_filter, [(img_bytes, "image")])
     img_filename = f"ltx_motion_img_{uuid.uuid4().hex}.png"
     img_path = str(INPUT_DIR / img_filename)
@@ -2067,7 +2152,8 @@ async def face_animate(
     swap_guidance: float = Form(4.0),
     audio: bool = Form(False, description="Generate audio track with the video (adds overhead)"),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the final video (e.g. 'AI'). Null/empty = no watermark. Re-encodes via ffmpeg (~1-3s for a 5s clip)."),
-    watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right of the final video. Stacks with `watermark` if both are set."),
+    watermark_image: bool = Form(False, description="Composite the Metfone GenAI logo (loaded once from /workspace/assets/metfone_genai_watermark.png) at the bottom-right of the final video. Stacks with `watermark` if both are set."),
+    require_detectable_face: bool = Form(False, description="Opt-in input validation. When true, reject the user's face image unless at least one clear face is detectable. Default false."),
 ):
     if preset not in LTX_PRESETS:
         raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
@@ -2080,6 +2166,9 @@ async def face_animate(
 
     target_bytes = await target_image.read()
     face_bytes = await face_image.read()
+    _require_detectable_face(
+        "/face-animate", require_detectable_face, [(face_bytes, "face_image")],
+    )
 
     # Pre-crop target image to match output aspect ratio for face swap
     if aspect_ratio != "original":
@@ -2133,13 +2222,14 @@ async def flux_face_swap(
     face_filter: bool = Form(True, description="Reject the request if either input image matches a face in /workspace/blocklist/. ON by default — clients must explicitly pass face_filter=false to skip (and the proxies/edge functions always force True so this default only matters for direct pod callers)."),
     logo_filter: bool = Form(True, description="Reject the request if either input image matches a logo/flag in /workspace/blocklist_logos/. ON by default — same defense-in-depth rationale as face_filter."),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark."),
-    watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
+    watermark_image: bool = Form(False, description="Composite the Metfone GenAI logo (loaded once from /workspace/assets/metfone_genai_watermark.png) at the bottom-right. Stacks with `watermark` if both are set."),
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
     caption_fade: bool = Form(True, description="Video only: when true (default) the caption fades in ~1s after the start; set false to show it from the very first frame. No effect on images (their caption is always immediate)."),
     background_music: bool = Form(False, description="Video only: mux a looping royalty-free background-music bed (/workspace/assets/horoscope_bgm.m4a) under the clip, trimmed to length with a soft fade. No effect on images."),
     refine_face: bool = Form(False, description="Opt-in 2nd-pass face detailer. After the swap, detect the largest face, re-render it at high resolution, and composite it back — fixes soft/low-detail faces in full-body or wide templates where the face is small in frame. Adds ~30-50s. Default false (no behaviour change for existing callers)."),
     preserve_body: bool = Form(False, description="Opt-in head-only mode. Composite the swapped head onto the ORIGINAL template so the body, clothing, pose, lighting and background stay the template's EXACT pixels — only the head changes (the base swap regenerates the whole frame, which drifts). Default false."),
+    require_detectable_face: bool = Form(False, description="Opt-in input validation. When true, reject the user's face image unless at least one clear face is detectable. Default false."),
 ):
     seed = seed if seed != -1 else uuid.uuid4().int % 2**32
 
@@ -2149,6 +2239,9 @@ async def flux_face_swap(
 
     target_bytes = await target_image.read()
     face_bytes = await face_image.read()
+    _require_detectable_face(
+        "/flux/face-swap", require_detectable_face, [(face_bytes, "face_image")],
+    )
 
     # Compliance filters — must run before any heavy work, before writing to disk
     job_id = str(uuid.uuid4())
@@ -2329,11 +2422,12 @@ async def flux_image_to_image(
     face_filter: bool = Form(True, description="Reject if any input image matches a face in /workspace/blocklist/. ON by default — clients must explicitly pass false to skip. Proxies/edge functions always force True so this default only matters for direct pod callers."),
     logo_filter: bool = Form(True, description="Reject if any input image matches a logo/flag in /workspace/blocklist_logos/. ON by default — same defense-in-depth rationale as face_filter."),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark."),
-    watermark_image: bool = Form(False, description="Composite the GenReel logo (loaded once from /workspace/assets/genreel_logo.png) at the bottom-right. Stacks with `watermark` if both are set."),
+    watermark_image: bool = Form(False, description="Composite the Metfone GenAI logo (loaded once from /workspace/assets/metfone_genai_watermark.png) at the bottom-right. Stacks with `watermark` if both are set."),
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
     caption_fade: bool = Form(True, description="Video only: when true (default) the caption fades in ~1s after the start; set false to show it from the very first frame. No effect on images (their caption is always immediate)."),
     background_music: bool = Form(False, description="Video only: mux a looping royalty-free background-music bed (/workspace/assets/horoscope_bgm.m4a) under the clip, trimmed to length with a soft fade. No effect on images."),
+    require_detectable_face: bool = Form(False, description="Opt-in input validation. For scene_blend, all non-scene input images must contain a clear face; for other modes, the first image must. Default false."),
 ):
     if not 1 <= len(images) <= 5:
         raise HTTPException(400, f"images must be 1–5 files, got {len(images)}")
@@ -2368,6 +2462,19 @@ async def flux_image_to_image(
     image_bytes_list: list[bytes] = []
     for up in images:
         image_bytes_list.append(await up.read())
+
+    # Validate against the original upload order. In scene_blend mode the
+    # scene image is a background/template and is intentionally excluded.
+    if composition_mode == "scene_blend":
+        scene_idx = len(image_bytes_list) - 1 if scene_image_index == -1 else scene_image_index
+        face_inputs = [
+            (img_bytes, f"images[{idx}]")
+            for idx, img_bytes in enumerate(image_bytes_list)
+            if idx != scene_idx
+        ]
+    else:
+        face_inputs = [(image_bytes_list[0], "images[0]")]
+    _require_detectable_face("/flux/i2i", require_detectable_face, face_inputs)
 
     # Apply the mode-driven image reorder (scene_blend only; identity
     # otherwise). The blocklist filters and the workflow both see the

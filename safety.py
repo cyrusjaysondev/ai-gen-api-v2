@@ -120,7 +120,20 @@ def is_confident_face_match(score: float, threshold: float) -> bool:
 # stays fast (~50ms) and only stubborn images pay the full price (~400ms).
 # ─────────────────────────────────────────────
 
-def _detect_with_fallbacks(app, pil_image, *, np, label_for_log: str = ""):
+def _bbox_inside_ratio(bbox, image_h: int, image_w: int) -> float:
+    """Fraction of a detection box that lies inside the image bounds."""
+    x1, y1, x2, y2 = [float(value) for value in bbox]
+    total_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    if total_area <= 0.0:
+        return 0.0
+    clipped_width = max(0.0, min(x2, image_w) - max(x1, 0.0))
+    clipped_height = max(0.0, min(y2, image_h) - max(y1, 0.0))
+    return (clipped_width * clipped_height) / total_area
+
+
+def _detect_with_fallbacks(app, pil_image, *, np, label_for_log: str = "",
+                           minimum_det_score: float = 0.0,
+                           minimum_bbox_inside_ratio: float = 0.0):
     """Run face detection with progressive preprocessing fallbacks.
 
     Returns (faces, fallback_used, detect_img_shape):
@@ -174,6 +187,10 @@ def _detect_with_fallbacks(app, pil_image, *, np, label_for_log: str = ""):
     def _is_significant(face_list, h: int, w: int) -> bool:
         img_area = max(1, h * w)
         for f in face_list:
+            if float(getattr(f, "det_score", 0.0)) < minimum_det_score:
+                continue
+            if _bbox_inside_ratio(f.bbox, h, w) < minimum_bbox_inside_ratio:
+                continue
             x1, y1, x2, y2 = f.bbox
             area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
             if (area / img_area) >= SIGNIFICANT_AREA_RATIO:
@@ -478,14 +495,35 @@ MIN_FACE_AREA_RATIO = float(os.environ.get("FACE_MIN_AREA_RATIO", "0.03"))
 # filter, so loosening here is safe.
 MIN_FACE_AREA_RATIO_QUERY = float(os.environ.get("FACE_MIN_AREA_RATIO_QUERY", "0.0005"))
 
+# User-facing "human subject required" validation needs a higher detector
+# confidence than blocked-face matching. The matching path deliberately uses a
+# permissive 0.10 detector threshold for recall, but animal faces can score at
+# that floor (the production regression image of a dog scored 0.100153). Keep
+# this separate so stricter upload validation cannot weaken blocklist recall.
+MIN_HUMAN_FACE_DETECTION_SCORE = float(os.environ.get(
+    "FACE_VALIDATION_MIN_DET_SCORE", "0.20"
+))
+MIN_HUMAN_FACE_BBOX_INSIDE_RATIO = float(os.environ.get(
+    "FACE_VALIDATION_MIN_BBOX_INSIDE_RATIO", "0.80"
+))
 
-def _count_significant_faces(faces, img_area: int) -> int:
+
+def _count_significant_faces(faces, img_area: int,
+                             minimum_det_score: float = 0.0,
+                             image_shape: Optional[tuple[int, int]] = None,
+                             minimum_bbox_inside_ratio: float = 0.0) -> int:
     """Count faces whose bbox covers at least MIN_FACE_AREA_RATIO of the
     image. Filters out background noise that the permissive detector
     sometimes catches. Returns 0 if `faces` is empty.
     """
     n = 0
     for f in faces:
+        if float(getattr(f, "det_score", 0.0)) < minimum_det_score:
+            continue
+        if image_shape is not None and _bbox_inside_ratio(
+            f.bbox, image_shape[0], image_shape[1]
+        ) < minimum_bbox_inside_ratio:
+            continue
         x1, y1, x2, y2 = f.bbox
         area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
         if img_area > 0 and (area / img_area) >= MIN_FACE_AREA_RATIO:
@@ -605,8 +643,10 @@ def force_reload_filter() -> dict:
     }
 
 
-def detect_face_count(image_bytes: bytes) -> int:
-    """Count significant faces in the image.
+def _detect_face_count(image_bytes: bytes,
+                       minimum_det_score: float = 0.0,
+                       minimum_bbox_inside_ratio: float = 0.0) -> int:
+    """Count significant faces at or above a detector-confidence floor.
 
     Used by the admin upload endpoint to validate a blocklist entry.
     Uses the SAME `_detect_with_fallbacks` chain as `_build_filter` and
@@ -638,10 +678,32 @@ def detect_face_count(image_bytes: bytes) -> int:
 
     faces, fallback_used, (detect_h, detect_w) = _detect_with_fallbacks(
         app, pil, np=np, label_for_log="upload",
+        minimum_det_score=minimum_det_score,
+        minimum_bbox_inside_ratio=minimum_bbox_inside_ratio,
     )
     if not faces:
         return 0
-    return _count_significant_faces(faces, max(1, detect_h * detect_w))
+    return _count_significant_faces(
+        faces,
+        max(1, detect_h * detect_w),
+        minimum_det_score=minimum_det_score,
+        image_shape=(detect_h, detect_w),
+        minimum_bbox_inside_ratio=minimum_bbox_inside_ratio,
+    )
+
+
+def detect_face_count(image_bytes: bytes) -> int:
+    """Count significant faces using the permissive blocklist detector."""
+    return _detect_face_count(image_bytes)
+
+
+def detect_human_face_count(image_bytes: bytes) -> int:
+    """Count confidently detected human faces for opted-in user validation."""
+    return _detect_face_count(
+        image_bytes,
+        minimum_det_score=MIN_HUMAN_FACE_DETECTION_SCORE,
+        minimum_bbox_inside_ratio=MIN_HUMAN_FACE_BBOX_INSIDE_RATIO,
+    )
 
 
 # Max edge length we store for a blocklist entry. Embeddings are computed by

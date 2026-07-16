@@ -81,6 +81,10 @@ try:
     import watermark
 except ImportError:
     watermark = None
+try:
+    import safety as face_safety
+except ImportError:
+    face_safety = None
 
 
 COMFYUI_URL = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")
@@ -109,6 +113,33 @@ def _decode_image_b64(b64: str, field_name: str) -> bytes:
         return base64.b64decode(b64, validate=False)
     except Exception as e:
         raise ValueError(f"'{field_name}' is not valid base64: {e}") from e
+
+
+class DetectableFaceRequired(Exception):
+    pass
+
+
+class FaceValidationUnavailable(Exception):
+    pass
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _require_detectable_face(enabled: bool, image_bytes: bytes) -> None:
+    if not enabled:
+        return
+    if face_safety is None:
+        raise FaceValidationUnavailable("face validation module is unavailable")
+    try:
+        face_count = face_safety.detect_human_face_count(image_bytes)
+    except RuntimeError as exc:
+        raise FaceValidationUnavailable(str(exc)) from exc
+    if face_count < 1:
+        raise DetectableFaceRequired("image does not contain a clearly detectable face")
 
 
 def wait_for_comfyui(timeout_s: int = 300) -> None:
@@ -188,15 +219,22 @@ def _stage_output_to_volume(filename: str, src: Path, job_id: str) -> tuple[Path
     return dest, staged_filename
 
 
-def _apply_watermark(path: Path, text):
-    """Apply watermark in-place; never let watermark failure kill the job."""
-    if not text or watermark is None:
+def _apply_watermark(path: Path, text, logo=False):
+    """Apply requested text/logo marks without letting either fail the job."""
+    if watermark is None:
         return None
-    try:
-        watermark.apply(path, text)
-        return None
-    except Exception as e:
-        return str(e)
+    warnings = []
+    if text:
+        try:
+            watermark.apply(path, text)
+        except Exception as exc:
+            warnings.append(f"text: {exc}")
+    if logo:
+        try:
+            watermark.apply_logo(path)
+        except Exception as exc:
+            warnings.append(f"image: {exc}")
+    return " | ".join(warnings) or None
 
 
 async def run_ltx_i2v(inp: dict, job_id: str) -> dict:
@@ -214,6 +252,9 @@ async def run_ltx_i2v(inp: dict, job_id: str) -> dict:
     )
 
     img_bytes = _decode_image_b64(inp["image_b64"], "image_b64")
+    _require_detectable_face(
+        _as_bool(inp.get("require_detectable_face", False)), img_bytes,
+    )
     img_filename = f"ltx_i2v_{uuid.uuid4().hex}.png"
     img_path = INPUT_DIR / img_filename
     img_path.write_bytes(img_bytes)
@@ -229,13 +270,14 @@ async def run_ltx_i2v(inp: dict, job_id: str) -> dict:
         preset=preset,
         audio=bool(inp.get("audio", False)),
         enhance_prompt=bool(inp.get("enhance_prompt", True)),
+        inplace_strength=float(inp.get("inplace_strength", 0.7)),
     )
 
     started = time.time()
     try:
         filename, src = await submit_and_wait(workflow)
         dest, staged_filename = _stage_output_to_volume(filename, src, job_id)
-        wm_err = _apply_watermark(dest, inp.get("watermark"))
+        wm_err = _apply_watermark(dest, inp.get("watermark"), inp.get("watermark_image", False))
         result = {
             "video_path": str(dest),
             "filename": staged_filename,
@@ -280,7 +322,7 @@ async def run_ltx_t2v(inp: dict, job_id: str) -> dict:
     started = time.time()
     filename, src = await submit_and_wait(workflow)
     dest, staged_filename = _stage_output_to_volume(filename, src, job_id)
-    wm_err = _apply_watermark(dest, inp.get("watermark"))
+    wm_err = _apply_watermark(dest, inp.get("watermark"), inp.get("watermark_image", False))
     result = {
         "video_path": str(dest),
         "filename": staged_filename,
@@ -317,6 +359,19 @@ async def handler(event):
     job_id = event.get("id") or str(uuid.uuid4())
     try:
         return await ENDPOINTS[endpoint](inp, job_id)
+    except DetectableFaceRequired:
+        return {
+            "error": "unsupported_subject",
+            "error_code": "no_human_subject",
+            "reason": "image does not contain a valid human subject.",
+            "image_index": 0,
+        }
+    except FaceValidationUnavailable:
+        return {
+            "error": "server_busy",
+            "error_code": "server_overload",
+            "reason": "Face validation is temporarily unavailable.",
+        }
     except ValueError as e:
         return {"error": str(e)}
     except Exception as e:

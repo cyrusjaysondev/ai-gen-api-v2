@@ -104,15 +104,22 @@ def _stage_output_to_volume(filename: str, src: Path, job_id: str) -> Path:
     return dest
 
 
-def _apply_watermark(path: Path, text):
-    """Apply watermark in-place; never let watermark failure kill the job."""
-    if not text or watermark is None:
+def _apply_watermark(path: Path, text, logo=False):
+    """Apply requested text/logo marks without letting either fail the job."""
+    if watermark is None:
         return None
-    try:
-        watermark.apply(path, text)
-        return None
-    except Exception as e:
-        return str(e)
+    warnings = []
+    if text:
+        try:
+            watermark.apply(path, text)
+        except Exception as exc:
+            warnings.append(f"text: {exc}")
+    if logo:
+        try:
+            watermark.apply_logo(path)
+        except Exception as exc:
+            warnings.append(f"image: {exc}")
+    return " | ".join(warnings) or None
 
 
 def _prepare_delivery_image(path: Path) -> tuple[Path, dict]:
@@ -143,6 +150,38 @@ class FilterBlocked(Exception):
         self.image_index = image_index
         self.label = label
         super().__init__(f"{label} matches blocked {filter_name} '{matched}'")
+
+
+class DetectableFaceRequired(Exception):
+    """An opted-in user image did not contain a significant face."""
+    def __init__(self, label: str, image_index: int):
+        self.label = label
+        self.image_index = image_index
+        super().__init__(f"{label} does not contain a clearly detectable face")
+
+
+class FaceValidationUnavailable(Exception):
+    """InsightFace could not initialize for an opted-in validation."""
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _require_detectable_face(enabled: bool, images_with_names: list) -> None:
+    if not enabled:
+        return
+    if face_safety is None:
+        raise FaceValidationUnavailable("face validation module is unavailable")
+    for image_index, (img_bytes, label) in enumerate(images_with_names):
+        try:
+            face_count = face_safety.detect_human_face_count(img_bytes)
+        except RuntimeError as exc:
+            raise FaceValidationUnavailable(str(exc)) from exc
+        if face_count < 1:
+            raise DetectableFaceRequired(label, image_index)
 
 
 def _apply_face_filter(endpoint: str, job_id: str, face_filter: bool,
@@ -313,7 +352,7 @@ async def run_t2i(inp: dict, job_id: str) -> dict:
     started = time.time()
     filename, src = await submit_and_wait(workflow)
     dest = _stage_output_to_volume(filename, src, job_id)
-    wm_err = _apply_watermark(dest, inp.get("watermark"))
+    wm_err = _apply_watermark(dest, inp.get("watermark"), inp.get("watermark_image", False))
     dest, delivery = _prepare_delivery_image(dest)
     result = {
         "image_path": str(dest),
@@ -347,6 +386,10 @@ async def run_flux_face_swap(inp: dict, job_id: str) -> dict:
         (target_bytes, "target_image_b64"),
         (face_bytes,   "face_image_b64"),
     ]
+    _require_detectable_face(
+        _as_bool(inp.get("require_detectable_face", False)),
+        [(face_bytes, "face_image_b64")],
+    )
     _apply_face_filter("flux/face-swap", job_id, bool(inp.get("face_filter", False)), inputs_for_filter)
     _apply_logo_filter("flux/face-swap", job_id, bool(inp.get("logo_filter", False)), inputs_for_filter)
 
@@ -374,7 +417,7 @@ async def run_flux_face_swap(inp: dict, job_id: str) -> dict:
     try:
         filename, src = await submit_and_wait(workflow)
         dest = _stage_output_to_volume(filename, src, job_id)
-        wm_err = _apply_watermark(dest, inp.get("watermark"))
+        wm_err = _apply_watermark(dest, inp.get("watermark"), inp.get("watermark_image", False))
         dest, delivery = _prepare_delivery_image(dest)
         result = {
             "image_path": str(dest),
@@ -407,6 +450,16 @@ async def run_flux_i2i(inp: dict, job_id: str) -> dict:
     for idx, b64 in enumerate(images_b64):
         decoded.append((_decode_image_b64(b64, f"images_b64[{idx}]"), f"images_b64[{idx}]"))
 
+    if inp.get("composition_mode") == "scene_blend" and len(decoded) > 1:
+        raw_scene_idx = int(inp.get("scene_image_index", -1))
+        scene_idx = len(decoded) - 1 if raw_scene_idx == -1 else max(0, min(raw_scene_idx, len(decoded) - 1))
+        face_inputs = [item for idx, item in enumerate(decoded) if idx != scene_idx]
+    else:
+        face_inputs = decoded[:1]
+    _require_detectable_face(
+        _as_bool(inp.get("require_detectable_face", False)), face_inputs,
+    )
+
     _apply_face_filter("flux/i2i", job_id, bool(inp.get("face_filter", False)), decoded)
     _apply_logo_filter("flux/i2i", job_id, bool(inp.get("logo_filter", False)), decoded)
 
@@ -435,7 +488,7 @@ async def run_flux_i2i(inp: dict, job_id: str) -> dict:
         started = time.time()
         filename, src = await submit_and_wait(workflow)
         dest = _stage_output_to_volume(filename, src, job_id)
-        wm_err = _apply_watermark(dest, inp.get("watermark"))
+        wm_err = _apply_watermark(dest, inp.get("watermark"), inp.get("watermark_image", False))
         dest, delivery = _prepare_delivery_image(dest)
         result = {
             "image_path": str(dest),
@@ -507,6 +560,19 @@ async def handler(event):
         else:
             resp["matched_logo"] = e.matched
         return resp
+    except DetectableFaceRequired as e:
+        return {
+            "error": "unsupported_subject",
+            "error_code": "no_human_subject",
+            "reason": f"{e.label} does not contain a valid human subject.",
+            "image_index": e.image_index,
+        }
+    except FaceValidationUnavailable:
+        return {
+            "error": "server_busy",
+            "error_code": "server_overload",
+            "reason": "Face validation is temporarily unavailable.",
+        }
     except ValueError as e:
         return {"error": str(e)}
     except Exception as e:

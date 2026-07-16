@@ -1,5 +1,5 @@
 """
-watermark.py — overlay a short text label or the GenReel logo onto generated
+watermark.py — overlay a short text label or the Metfone GenAI logo onto generated
 images and videos.
 
 Public API:
@@ -7,7 +7,7 @@ Public API:
         Text overlay. No-op when `text` is None or empty after stripping.
 
     apply_logo(path) -> None
-        Composite the GenReel logo onto the file. No-op when the logo asset
+        Composite the Metfone GenAI logo onto the file. No-op when the logo asset
         is missing (setup.sh fetches it on every pod boot — see LOGO_PATH).
 
 Both modify the file at `path` in place. Callers can chain them to stack
@@ -19,11 +19,11 @@ Style:
   * Text: bold white with a black outline at the bottom-right. Size scales
     to ~4% of image height (min 24 px), padded ~3% from the edges.
   * Logo: PNG with transparency, placed at the bottom-right. Width scales
-    to ~7% of the image's shorter side (min 32 px) so it's visible without
-    dominating the frame.
+    to ~12% of the image's shorter side (min 40 px) so the detailed wordmark is
+    readable without dominating the frame.
 
-Video paths re-encode through libx264 (CRF 18, veryfast). Audio, if present,
-is stream-copied so we don't degrade it.
+Video paths prefer NVENC and retry through libx264 when CUDA is unavailable.
+Audio, if present, is stream-copied so we don't degrade it.
 """
 from __future__ import annotations
 
@@ -60,17 +60,15 @@ _CAPTION_FONT_WEIGHT = 600  # EB Garamond is a variable font — pin SemiBold fo
 # volume so every pod / serverless worker sees it; the URL is duplicated
 # here so apply_logo() can self-heal (lazy-download) when called on a pod
 # where setup.sh hasn't run the asset step yet.
-LOGO_PATH = Path("/workspace/assets/genreel_logo.png")
+LOGO_PATH = Path("/workspace/assets/metfone_genai_watermark.png")
 LOGO_URL = (
-    "https://pydizqejihfjbnitybtj.supabase.co/storage/v1/object/public/"
-    "assets/uploads/1779271551302_GenReel_log.png"
+    "https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/"
+    "main/assets/metfone_genai_watermark.png"
 )
 
-# Fraction of the image's shorter side used as the logo's width.
-# 0.07 = ~7% of the shorter side; halved from the original 0.14 to make
-# the GenReel mark less dominant. Both width and height scale together so
-# this also halves the rendered height.
-_LOGO_SCALE = 0.07
+# Fraction of the image's shorter side used as the visible logo width. This
+# mark contains a small wordmark, so 7% was unreadable on 480p/544px outputs.
+_LOGO_SCALE = 0.12
 # Padding from the side edges, as a fraction of the shorter side.
 _EDGE_PAD = 0.03
 # Extra padding from the bottom edge — larger so the logo stays above the
@@ -197,14 +195,14 @@ def _detect_nvenc() -> bool:
 _HAS_NVENC = _detect_nvenc()
 
 
-def _video_encode_args() -> list[str]:
+def _video_encode_args(*, prefer_gpu: bool = True) -> list[str]:
     """Return ffmpeg `-c:v ...` + preset args.
 
     GPU re-encode of a 2-5 s clip lands in well under a second on a 5090,
     vs. 30-80 s with software libx264. Fall back to the latter only if
     NVENC isn't available (CPU-only pods, or stripped ffmpeg builds).
     """
-    if _HAS_NVENC:
+    if prefer_gpu and _HAS_NVENC:
         # `-cq` controls quality (lower = better). 22 is visually
         # indistinguishable from the source for a watermark pass.
         # `p4` is the balanced NVENC preset; p1 is fastest, p7 is best.
@@ -219,6 +217,27 @@ def _video_encode_args() -> list[str]:
         "-preset", "veryfast",
         "-crf", "22",
     ]
+
+
+def _run_video_ffmpeg(prefix: list[str], suffix: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run an encode, retrying with libx264 when NVENC cannot initialize."""
+    proc = subprocess.run(
+        [*prefix, *_video_encode_args(), *suffix],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0 or not _HAS_NVENC:
+        return proc
+
+    # Some ffmpeg builds advertise NVENC even when the CUDA driver is not
+    # currently reachable. A CPU retry keeps post-processing from failing.
+    Path(suffix[-1]).unlink(missing_ok=True)
+    print("[watermark] NVENC encode failed; retrying with libx264")
+    return subprocess.run(
+        [*prefix, *_video_encode_args(prefer_gpu=False), *suffix],
+        capture_output=True,
+        text=True,
+    )
 
 
 def _probe_dimensions(p: Path) -> tuple[int, int]:
@@ -272,17 +291,18 @@ def _apply_video(p: Path, text: str) -> None:
         f"borderw={borderw}:bordercolor=black:"
         f"x=w-tw-h/30:y=h-th-h/30"
     )
-    cmd = [
+    prefix = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(p),
         "-vf", drawtext,
-        *_video_encode_args(),
+    ]
+    suffix = [
         "-pix_fmt", "yuv420p",
         "-c:a", "copy",
         "-movflags", "+faststart",
         str(tmp),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = _run_video_ffmpeg(prefix, suffix)
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)
         raise RuntimeError(
@@ -296,7 +316,7 @@ def _apply_video(p: Path, text: str) -> None:
 
 
 def apply_logo(path) -> None:
-    """Composite the GenReel logo onto the file at `path` in place.
+    """Composite the Metfone GenAI logo onto the file at `path` in place.
 
     Self-healing: if LOGO_PATH doesn't exist (e.g. setup.sh's asset step
     didn't run on this pod), we lazy-download it once from LOGO_URL and
@@ -347,14 +367,27 @@ def _try_download_logo() -> bool:
         return False
 
 
+def _logo_content_bbox() -> tuple[int, int, int, int] | None:
+    """Return the non-transparent logo bounds, excluding canvas padding."""
+    try:
+        with Image.open(LOGO_PATH) as logo:
+            rgba = logo.convert("RGBA")
+            return rgba.getchannel("A").getbbox()
+    except Exception:
+        return None
+
+
 def _apply_image_logo(p: Path) -> None:
     base = Image.open(p)
     original_mode = base.mode
     base = base.convert("RGBA")
 
     logo = Image.open(LOGO_PATH).convert("RGBA")
+    content_bbox = logo.getchannel("A").getbbox()
+    if content_bbox:
+        logo = logo.crop(content_bbox)
     shorter = min(base.width, base.height)
-    target_w = max(32, int(shorter * _LOGO_SCALE))
+    target_w = max(40, int(shorter * _LOGO_SCALE))
     ratio = target_w / logo.width
     target_h = max(8, int(logo.height * ratio))
     logo = logo.resize((target_w, target_h), Image.LANCZOS)
@@ -381,7 +414,7 @@ def _apply_image_logo(p: Path) -> None:
 def _apply_video_logo(p: Path) -> None:
     """Overlay LOGO_PATH onto the video at `p` via ffmpeg `overlay`.
 
-    The logo is sized to ~7 % of the video's shorter side. Side padding is
+    The visible logo is sized to ~12 % of the video's shorter side. Side padding is
     ~3 % of the shorter side; bottom padding is ~8 % so the mark clears the
     app's download bar / player controls on mobile. We probe the input first
     and bake concrete integers into the filter string so ffmpeg's filtergraph
@@ -392,28 +425,34 @@ def _apply_video_logo(p: Path) -> None:
     shorter = min(w, h)
     pad = max(8, int(shorter * _EDGE_PAD))
     bottom_pad = max(8, int(shorter * _BOTTOM_PAD))
-    target_w = max(32, int(shorter * _LOGO_SCALE))
+    target_w = max(40, int(shorter * _LOGO_SCALE))
 
     tmp = p.with_name(f"{p.stem}.wm{p.suffix}")
+    content_bbox = _logo_content_bbox()
+    crop_filter = ""
+    if content_bbox:
+        left, top, right, bottom = content_bbox
+        crop_filter = f"crop={right - left}:{bottom - top}:{left}:{top},"
     # main_w / main_h / overlay_w / overlay_h are valid overlay-filter
     # variables and contain no commas; safe to leave as expressions.
     filter_complex = (
-        f"[1:v]scale={target_w}:-1[wm];"
+        f"[1:v]{crop_filter}scale={target_w}:-1[wm];"
         f"[0:v][wm]overlay=x=main_w-overlay_w-{pad}:"
         f"y=main_h-overlay_h-{bottom_pad}:format=auto"
     )
-    cmd = [
+    prefix = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(p),
         "-i", str(LOGO_PATH),
         "-filter_complex", filter_complex,
-        *_video_encode_args(),
+    ]
+    suffix = [
         "-pix_fmt", "yuv420p",
         "-c:a", "copy",
         "-movflags", "+faststart",
         str(tmp),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = _run_video_ffmpeg(prefix, suffix)
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)
         raise RuntimeError(
@@ -694,18 +733,19 @@ def _apply_video_caption(p: Path, text: str, fade_in: bool,
         )
     else:
         filter_complex = "[0:v][1:v]overlay=0:0:format=auto:shortest=1"
-    cmd = [
+    prefix = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(p),
         "-loop", "1", "-i", str(cap_png),
         "-filter_complex", filter_complex,
-        *_video_encode_args(),
+    ]
+    suffix = [
         "-pix_fmt", "yuv420p",
         "-c:a", "copy",
         "-movflags", "+faststart",
         str(tmp),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = _run_video_ffmpeg(prefix, suffix)
     cap_png.unlink(missing_ok=True)
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)

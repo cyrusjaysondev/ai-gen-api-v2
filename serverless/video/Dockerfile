@@ -37,9 +37,15 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 RUN command -v ffmpeg >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*)
 
 COPY workflows.py /app/workflows.py
-# Optional output watermarking — invoked only when the request includes
-# the `watermark` field. Uses ffmpeg drawtext.
+# Optional input-face validation. InsightFace weights stay on the network
+# volume and are initialized only when require_detectable_face=true.
+COPY safety.py /app/safety.py
+# Optional text/logo output watermarking.
 COPY watermark.py /app/watermark.py
+COPY assets/metfone_genai_watermark.png /workspace/assets/metfone_genai_watermark.png
+ENV INSIGHTFACE_MODEL_ROOT=/runpod-volume/insightface_models \
+    BLOCKLIST_DIR=/runpod-volume/blocklist \
+    BYPASS_LOG=/runpod-volume/face_filter_bypass.log
 
 COPY serverless/video/handler.py /app/handler.py
 COPY serverless/video/start.sh   /start_serverless.sh

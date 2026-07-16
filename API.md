@@ -141,7 +141,7 @@ beside it.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `watermark` | string \| null | `null` | Short text drawn at the bottom-right in bold white with a black outline. `null` / empty = off. Example: `"AI"`. |
-| `watermark_image` | bool | `false` | Composite the **GenReel logo** at the bottom-right. The PNG lives on the network volume at `/workspace/assets/genreel_logo.png` (fetched by `setup.sh`). |
+| `watermark_image` | bool | `false` | Composite the **Metfone GenAI logo** at the bottom-right. The PNG lives on the network volume at `/workspace/assets/metfone_genai_watermark.png` (fetched by `setup.sh`). |
 
 Images stamp in-place via Pillow. Videos re-encode through `libx264` /
 `drawtext` / `overlay` filters with the audio stream-copied — typically
@@ -247,6 +247,7 @@ Replace the head in a target image with a face from a source image using FLUX.2 
 | `cfg` | float | `1.0` | CFG scale |
 | `guidance` | float | `4.0` | FLUX guidance strength (2.0 – 6.0) |
 | `lora_strength` | float | `1.0` | BFS LoRA strength (0.5 – 1.0) |
+| `require_detectable_face` | bool | `false` | When true, reject `face_image` with `422 no_human_subject` unless InsightFace detects a clear face. |
 | `watermark` | string \| null | `null` | See [Watermarks](#watermarks). |
 | `watermark_image` | bool | `false` | See [Watermarks](#watermarks). |
 
@@ -307,6 +308,7 @@ Override explicitly with `width` and `height` if you want a fixed canvas.
 | `cfg` | 1.0 | CFG scale |
 | `guidance` | 4.0 | FLUX guidance strength (2.0–6.0) |
 | `lora_strength` | `-1` (= mode default) | `-1` (default) → server picks based on `composition_mode` (0 for none/auto, 0.5 for scene_blend, 0.7 for outfit_swap). Pass `0`–`1.5` to override. |
+| `require_detectable_face` | false | When true, validate the first image. In `scene_blend`, validate every non-scene image and exclude the scene/template image. |
 | `watermark` | null | See [Watermarks](#watermarks). |
 | `watermark_image` | false | See [Watermarks](#watermarks). |
 
@@ -400,6 +402,7 @@ Generate a video from an input image using LTX 2.3 (22B).
 | `seed` | int | `-1` (random) | Set for reproducible results |
 | `enhance_prompt` | bool | `true` | Rewrite the prompt via Gemma 12B using the input image as context (adds 2-5s + VRAM). Recommended ON for short prompts (`"make her run"`); OFF when you've already written a detailed scene description. |
 | `inplace_strength` | float | `0.7` | How tightly each frame's latent is pinned to the input image. `0.7` is the reference distilled value (best identity, weakest motion). **Lower it for action prompts:** `0.5` ≈ moderate motion, `0.4` ≈ strong motion (some identity drift), `0.3` ≈ near-t2v. Range `0.3`–`1.0`. Two-pass refine tracks this. |
+| `require_detectable_face` | bool | `false` | When true, reject `image` with `422 no_human_subject` unless InsightFace detects a clear face. |
 | `watermark` | string \| null | `null` | See [Watermarks](#watermarks). Video re-encodes via ffmpeg (~1-3s for a 5s clip). |
 | `watermark_image` | bool | `false` | See [Watermarks](#watermarks). |
 
@@ -760,6 +763,11 @@ done
 ---
 
 ## Compliance Filters
+
+Face-presence validation is opt-in and separate from identity blocking. Set
+`require_detectable_face=true` on `/flux/face-swap`, `/flux/i2i`, `/ltx/i2v`,
+`/ltx/motion`, or `/face-animate` to reject user images that contain no
+significant detectable face. It defaults to `false` for backward compatibility.
 
 `/flux/face-swap` and `/flux/i2i` accept two **independent** compliance toggles:
 
