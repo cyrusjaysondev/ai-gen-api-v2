@@ -1346,8 +1346,8 @@ class T2IRequest(BaseModel):
     steps: int = 4
     cfg: float = 1.0
     guidance: float = 4.0
-    watermark: str | None = None  # e.g. "AI" — overlay at bottom-right; null/empty = off
-    watermark_image: bool = False  # composite the Metfone GenAI logo at bottom-right
+    watermark: str | None = None  # legacy input; ignored for production image outputs
+    watermark_image: bool = True  # production image outputs always use the Metfone GenAI logo
     # Output-side face filter — applied AFTER generation. /t2i has no input
     # image so this is the only way a blocked-identity prompt can be caught.
     # Defaults ON (safe default, matching /flux/face-swap & /flux/i2i): callers
@@ -1381,7 +1381,7 @@ async def text_to_image(req: T2IRequest, background_tasks: BackgroundTasks):
     if not req.logo_filter and face_safety is not None:
         face_safety.log_bypass(job_id, "/t2i", note="logo_filter=false (output check skipped)")
     background_tasks.add_task(
-        run_job, job_id, workflow, None, req.watermark, req.watermark_image,
+        run_job, job_id, workflow, None, None, True,
         output_face_filter=req.face_filter, output_logo_filter=req.logo_filter,
         output_endpoint="/t2i", caption=req.caption, caption_icon=req.caption_icon,
     )
@@ -2221,8 +2221,8 @@ async def flux_face_swap(
     lora_strength: float = Form(1.0),
     face_filter: bool = Form(True, description="Reject the request if either input image matches a face in /workspace/blocklist/. ON by default — clients must explicitly pass face_filter=false to skip (and the proxies/edge functions always force True so this default only matters for direct pod callers)."),
     logo_filter: bool = Form(True, description="Reject the request if either input image matches a logo/flag in /workspace/blocklist_logos/. ON by default — same defense-in-depth rationale as face_filter."),
-    watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark."),
-    watermark_image: bool = Form(False, description="Composite the Metfone GenAI logo (loaded once from /workspace/assets/metfone_genai_watermark_500.png) at the bottom-right. Stacks with `watermark` if both are set."),
+    watermark: str | None = Form(None, description="Deprecated for image outputs. Legacy text watermarks are ignored."),
+    watermark_image: bool = Form(True, description="Compatibility input. Production image outputs always use the Metfone GenAI 500px logo at the bottom-right."),
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
     caption_fade: bool = Form(True, description="Video only: when true (default) the caption fades in ~1s after the start; set false to show it from the very first frame. No effect on images (their caption is always immediate)."),
@@ -2270,7 +2270,7 @@ async def flux_face_swap(
     # where neither input matched but the swapped output ended up looking
     # like a blocked identity (e.g. LoRA drift in face-swap mode).
     background_tasks.add_task(
-        run_job, job_id, workflow, [target_path, face_path], watermark, watermark_image,
+        run_job, job_id, workflow, [target_path, face_path], None, True,
         output_face_filter=face_filter, output_logo_filter=logo_filter,
         output_endpoint="/flux/face-swap", caption=caption, caption_icon=caption_icon, caption_fade=caption_fade, background_music=background_music,
         refine_face=refine_face, refine_face_filename=face_filename,
@@ -2421,8 +2421,8 @@ async def flux_image_to_image(
     scene_image_index: int = Form(-1, description="For `composition_mode=scene_blend` only: which input image is the scene/canvas. -1 (default) = last image, which matches the typical 'user uploads first, library scene last' UI flow. Ignored for other modes.", ge=-1, le=4),
     face_filter: bool = Form(True, description="Reject if any input image matches a face in /workspace/blocklist/. ON by default — clients must explicitly pass false to skip. Proxies/edge functions always force True so this default only matters for direct pod callers."),
     logo_filter: bool = Form(True, description="Reject if any input image matches a logo/flag in /workspace/blocklist_logos/. ON by default — same defense-in-depth rationale as face_filter."),
-    watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark."),
-    watermark_image: bool = Form(False, description="Composite the Metfone GenAI logo (loaded once from /workspace/assets/metfone_genai_watermark_500.png) at the bottom-right. Stacks with `watermark` if both are set."),
+    watermark: str | None = Form(None, description="Deprecated for image outputs. Legacy text watermarks are ignored."),
+    watermark_image: bool = Form(True, description="Compatibility input. Production image outputs always use the Metfone GenAI 500px logo at the bottom-right."),
     caption: str | None = Form(None, description="Optional styled lower-third caption (e.g. the horoscope of the day). Word-wrapped, centered white text with a heavy black outline; videos fade it in ~1s after the start. Same fixed design on images and videos. Null/empty = no caption."),
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
     caption_fade: bool = Form(True, description="Video only: when true (default) the caption fades in ~1s after the start; set false to show it from the very first frame. No effect on images (their caption is always immediate)."),
@@ -2509,7 +2509,7 @@ async def flux_image_to_image(
     # where the prompt morphs an input face toward a blocked identity even
     # though the unedited input didn't match.
     background_tasks.add_task(
-        run_job, job_id, workflow, cleanup_paths, watermark, watermark_image,
+        run_job, job_id, workflow, cleanup_paths, None, True,
         output_face_filter=face_filter, output_logo_filter=logo_filter,
         output_endpoint="/flux/i2i", caption=caption, caption_icon=caption_icon, caption_fade=caption_fade, background_music=background_music,
     )

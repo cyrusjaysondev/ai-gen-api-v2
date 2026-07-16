@@ -134,14 +134,14 @@ curl https://YOUR_POD_ID-7860.proxy.runpod.net/ltx/presets
 
 ## Watermarks
 
-Every generation endpoint accepts two optional watermark parameters. They
-are independent and can stack — set both and you get a logo with text
-beside it.
+Video endpoints accept both optional watermark parameters. Production image
+endpoints (`/t2i`, `/flux/face-swap`, and `/flux/i2i`) always ignore legacy
+text watermarks and apply the Metfone GenAI image watermark.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `watermark` | string \| null | `null` | Short text drawn at the bottom-right in bold white with a black outline. `null` / empty = off. Example: `"AI"`. |
-| `watermark_image` | bool | `false` | Composite the **Metfone GenAI logo** at the bottom-right. The 500px PNG lives on the network volume at `/workspace/assets/metfone_genai_watermark_500.png` (fetched by `setup.sh`). |
+| `watermark` | string \| null | `null` | Video only: short text drawn at the bottom-right. Ignored by production image endpoints. |
+| `watermark_image` | bool | `false` (video), forced `true` (image) | Composite the **Metfone GenAI logo** at the bottom-right. The 500px PNG lives on the network volume at `/workspace/assets/metfone_genai_watermark_500.png` (fetched by `setup.sh`). |
 
 Images stamp in-place via Pillow. Videos re-encode through `libx264` /
 `drawtext` / `overlay` filters with the audio stream-copied — typically
@@ -199,8 +199,8 @@ Generate an image from a text prompt using FLUX.2 Klein 9B.
 | `steps` | int | `4` | Inference steps (4 is ideal for FLUX Klein) |
 | `cfg` | float | `1.0` | CFG scale |
 | `guidance` | float | `4.0` | FLUX guidance strength (2.0 – 6.0) |
-| `watermark` | string \| null | `null` | See [Watermarks](#watermarks). |
-| `watermark_image` | bool | `false` | See [Watermarks](#watermarks). |
+| `watermark` | string \| null | ignored | Legacy text input; production image output never renders it. |
+| `watermark_image` | bool | forced `true` | Production image output always uses the Metfone GenAI logo. |
 
 ### Example
 
@@ -309,8 +309,8 @@ Override explicitly with `width` and `height` if you want a fixed canvas.
 | `guidance` | 4.0 | FLUX guidance strength (2.0–6.0) |
 | `lora_strength` | `-1` (= mode default) | `-1` (default) → server picks based on `composition_mode` (0 for none/auto, 0.5 for scene_blend, 0.7 for outfit_swap). Pass `0`–`1.5` to override. |
 | `require_detectable_face` | false | When true, validate the first image. In `scene_blend`, validate every non-scene image and exclude the scene/template image. |
-| `watermark` | null | See [Watermarks](#watermarks). |
-| `watermark_image` | false | See [Watermarks](#watermarks). |
+| `watermark` | ignored | Legacy text input; production image output never renders it. |
+| `watermark_image` | forced `true` | Production image output always uses the Metfone GenAI logo. |
 
 ### Composition modes
 
