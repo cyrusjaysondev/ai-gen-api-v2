@@ -141,7 +141,7 @@ beside it.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `watermark` | string \| null | `null` | Short text drawn at the bottom-right in bold white with a black outline. `null` / empty = off. Example: `"AI"`. |
-| `watermark_image` | bool | `false` | Composite the **Metfone GenAI logo** at the bottom-right. The PNG lives on the network volume at `/workspace/assets/metfone_genai_watermark.png` (fetched by `setup.sh`). |
+| `watermark_image` | bool | `false` | Composite the **Metfone GenAI logo** at the bottom-right. The 500px PNG lives on the network volume at `/workspace/assets/metfone_genai_watermark_500.png` (fetched by `setup.sh`). |
 
 Images stamp in-place via Pillow. Videos re-encode through `libx264` /
 `drawtext` / `overlay` filters with the audio stream-copied — typically

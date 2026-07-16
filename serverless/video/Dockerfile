@@ -42,7 +42,7 @@ COPY workflows.py /app/workflows.py
 COPY safety.py /app/safety.py
 # Optional text/logo output watermarking.
 COPY watermark.py /app/watermark.py
-COPY assets/metfone_genai_watermark.png /workspace/assets/metfone_genai_watermark.png
+COPY assets/metfone_genai_watermark_500.png /workspace/assets/metfone_genai_watermark_500.png
 ENV INSIGHTFACE_MODEL_ROOT=/runpod-volume/insightface_models \
     BLOCKLIST_DIR=/runpod-volume/blocklist \
     BYPASS_LOG=/runpod-volume/face_filter_bypass.log

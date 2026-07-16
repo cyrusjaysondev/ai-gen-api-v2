@@ -342,12 +342,12 @@ log "  All 9 models verified at expected sizes"
 # 2b. Brand assets (Metfone GenAI logo for the watermark_image option)
 # ─────────────────────────────────────────────
 # Tiny PNG kept on the volume so every pod + serverless worker can find it.
-# watermark.py loads /workspace/assets/metfone_genai_watermark.png lazily and silently
+# watermark.py loads /workspace/assets/metfone_genai_watermark_500.png lazily and silently
 # skips the image overlay if it's missing, so a network blip here is
 # non-fatal.
 ASSETS_DIR="/workspace/assets"
-METFONE_LOGO="$ASSETS_DIR/metfone_genai_watermark.png"
-METFONE_LOGO_URL="$API_REPO/assets/metfone_genai_watermark.png"
+METFONE_LOGO="$ASSETS_DIR/metfone_genai_watermark_500.png"
+METFONE_LOGO_URL="$API_REPO/assets/metfone_genai_watermark_500.png"
 mkdir -p "$ASSETS_DIR"
 if [ -s "$METFONE_LOGO" ]; then
   log "  Metfone GenAI logo already on volume ($(stat -c%s "$METFONE_LOGO" 2>/dev/null || stat -f%z "$METFONE_LOGO") bytes)"

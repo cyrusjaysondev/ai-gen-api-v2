@@ -41,7 +41,7 @@ COPY safety.py /app/safety.py
 COPY logo_safety.py /app/logo_safety.py
 # Optional text/logo output watermarking. Uses Pillow from the base image.
 COPY watermark.py /app/watermark.py
-COPY assets/metfone_genai_watermark.png /workspace/assets/metfone_genai_watermark.png
+COPY assets/metfone_genai_watermark_500.png /workspace/assets/metfone_genai_watermark_500.png
 ENV INSIGHTFACE_MODEL_ROOT=/runpod-volume/insightface_models \
     CLIP_MODEL_ROOT=/runpod-volume/clip_models \
     BLOCKLIST_DIR=/runpod-volume/blocklist \

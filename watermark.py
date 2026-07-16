@@ -60,10 +60,10 @@ _CAPTION_FONT_WEIGHT = 600  # EB Garamond is a variable font — pin SemiBold fo
 # volume so every pod / serverless worker sees it; the URL is duplicated
 # here so apply_logo() can self-heal (lazy-download) when called on a pod
 # where setup.sh hasn't run the asset step yet.
-LOGO_PATH = Path("/workspace/assets/metfone_genai_watermark.png")
+LOGO_PATH = Path("/workspace/assets/metfone_genai_watermark_500.png")
 LOGO_URL = (
     "https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/"
-    "main/assets/metfone_genai_watermark.png"
+    "main/assets/metfone_genai_watermark_500.png"
 )
 
 # Fraction of the image's shorter side used as the visible logo width. This
