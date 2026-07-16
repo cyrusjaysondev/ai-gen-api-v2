@@ -514,12 +514,16 @@ MIN_HUMAN_FACE_DETECTION_SCORE = float(os.environ.get(
 MIN_HUMAN_FACE_BBOX_INSIDE_RATIO = float(os.environ.get(
     "FACE_VALIDATION_MIN_BBOX_INSIDE_RATIO", "0.80"
 ))
+MIN_HUMAN_FACE_AREA_RATIO = float(os.environ.get(
+    "FACE_VALIDATION_MIN_AREA_RATIO", "0.01"
+))
 
 
 def _count_significant_faces(faces, img_area: int,
                              minimum_det_score: float = 0.0,
                              image_shape: Optional[tuple[int, int]] = None,
-                             minimum_bbox_inside_ratio: float = 0.0) -> int:
+                             minimum_bbox_inside_ratio: float = 0.0,
+                             minimum_area_ratio: float = MIN_FACE_AREA_RATIO) -> int:
     """Count faces whose bbox covers at least MIN_FACE_AREA_RATIO of the
     image. Filters out background noise that the permissive detector
     sometimes catches. Returns 0 if `faces` is empty.
@@ -534,7 +538,7 @@ def _count_significant_faces(faces, img_area: int,
             continue
         x1, y1, x2, y2 = f.bbox
         area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-        if img_area > 0 and (area / img_area) >= MIN_FACE_AREA_RATIO:
+        if img_area > 0 and (area / img_area) >= minimum_area_ratio:
             n += 1
     return n
 
@@ -653,7 +657,8 @@ def force_reload_filter() -> dict:
 
 def _detect_face_count(image_bytes: bytes,
                        minimum_det_score: float = 0.0,
-                       minimum_bbox_inside_ratio: float = 0.0) -> int:
+                       minimum_bbox_inside_ratio: float = 0.0,
+                       minimum_area_ratio: float = MIN_FACE_AREA_RATIO) -> int:
     """Count significant faces at or above a detector-confidence floor.
 
     Used by the admin upload endpoint to validate a blocklist entry.
@@ -697,6 +702,7 @@ def _detect_face_count(image_bytes: bytes,
         minimum_det_score=minimum_det_score,
         image_shape=(detect_h, detect_w),
         minimum_bbox_inside_ratio=minimum_bbox_inside_ratio,
+        minimum_area_ratio=minimum_area_ratio,
     )
 
 
@@ -711,6 +717,7 @@ def detect_human_face_count(image_bytes: bytes) -> int:
         image_bytes,
         minimum_det_score=MIN_HUMAN_FACE_DETECTION_SCORE,
         minimum_bbox_inside_ratio=MIN_HUMAN_FACE_BBOX_INSIDE_RATIO,
+        minimum_area_ratio=MIN_HUMAN_FACE_AREA_RATIO,
     )
 
 
@@ -820,6 +827,7 @@ def check_image(image_bytes: bytes) -> FilterResult:
         minimum_det_score=MIN_HUMAN_FACE_DETECTION_SCORE,
         image_shape=(detect_h, detect_w),
         minimum_bbox_inside_ratio=MIN_HUMAN_FACE_BBOX_INSIDE_RATIO,
+        minimum_area_ratio=MIN_HUMAN_FACE_AREA_RATIO,
     )
 
     # MIN_FACE_AREA_RATIO_QUERY (0.5%) is permissive enough to catch

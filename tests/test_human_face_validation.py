@@ -46,6 +46,24 @@ class HumanFaceValidationTests(unittest.TestCase):
             1,
         )
 
+    def test_accepts_clear_face_in_full_body_portrait(self):
+        full_body_human = _Face(
+            0.841419,
+            bbox=(622.08, 204.75, 781.35, 438.16),
+        )
+
+        self.assertEqual(
+            safety._count_significant_faces(
+                [full_body_human],
+                1130 * 1600,
+                minimum_det_score=safety.MIN_HUMAN_FACE_DETECTION_SCORE,
+                image_shape=(1600, 1130),
+                minimum_bbox_inside_ratio=safety.MIN_HUMAN_FACE_BBOX_INSIDE_RATIO,
+                minimum_area_ratio=safety.MIN_HUMAN_FACE_AREA_RATIO,
+            ),
+            1,
+        )
+
     def test_rejects_out_of_frame_animal_fallback(self):
         dog_crop_false_positive = _Face(
             0.402965,

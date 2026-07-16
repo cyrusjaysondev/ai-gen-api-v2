@@ -3246,6 +3246,7 @@ async def admin_test_face_filter(
         minimum_det_score=face_safety.MIN_HUMAN_FACE_DETECTION_SCORE,
         image_shape=(detect_h, detect_w),
         minimum_bbox_inside_ratio=face_safety.MIN_HUMAN_FACE_BBOX_INSIDE_RATIO,
+        minimum_area_ratio=face_safety.MIN_HUMAN_FACE_AREA_RATIO,
     )
 
     # For each detected face, compute scores against ALL blocklist
@@ -3279,7 +3280,7 @@ async def admin_test_face_filter(
             "bbox_inside_ratio": round(bbox_inside_ratio, 4),
             "passes_human_validation": (
                 det_score >= face_safety.MIN_HUMAN_FACE_DETECTION_SCORE
-                and area_ratio >= face_safety.MIN_FACE_AREA_RATIO
+                and area_ratio >= face_safety.MIN_HUMAN_FACE_AREA_RATIO
                 and bbox_inside_ratio >= face_safety.MIN_HUMAN_FACE_BBOX_INSIDE_RATIO
             ),
             "top_scores": [{"identity": i, "score": round(s, 4)} for i, s in scored[:top_n]],
@@ -3293,7 +3294,7 @@ async def admin_test_face_filter(
         "significant_face_count": len(significant_faces),
         "human_face_count": human_face_count,
         "human_validation_min_det_score": face_safety.MIN_HUMAN_FACE_DETECTION_SCORE,
-        "human_validation_min_area_ratio": face_safety.MIN_FACE_AREA_RATIO,
+        "human_validation_min_area_ratio": face_safety.MIN_HUMAN_FACE_AREA_RATIO,
         "human_validation_min_bbox_inside_ratio": face_safety.MIN_HUMAN_FACE_BBOX_INSIDE_RATIO,
         "min_face_area_ratio_query": face_safety.MIN_FACE_AREA_RATIO_QUERY,
         "match_threshold": threshold,
