@@ -2338,7 +2338,9 @@ async def flux_face_swap(
         "/flux/face-swap", job_id, face_bytes, "face_image",
         require_detectable_face, face_filter,
     )
-    _apply_logo_filter("/flux/face-swap", job_id, logo_filter, [(face_bytes, "face_image")])
+    # Logo/trademark policy is enforced on the generated output. Running CLIP
+    # on an ordinary portrait before generation adds substantial CPU latency
+    # and does not improve the face-upload safety decision.
 
     # If aspect ratio is specified, crop target image to that ratio before sending to ComfyUI.
     # The workflow's ImageScaleToTotalPixels + GetImageSize will then produce output at that AR.
