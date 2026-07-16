@@ -503,10 +503,13 @@ MIN_FACE_AREA_RATIO_QUERY = float(os.environ.get("FACE_MIN_AREA_RATIO_QUERY", "0
 # User-facing "human subject required" validation needs a higher detector
 # confidence than blocked-face matching. The matching path deliberately uses a
 # permissive 0.10 detector threshold for recall, but animal faces can score at
-# that floor (the production regression image of a dog scored 0.100153). Keep
-# this separate so stricter upload validation cannot weaken blocklist recall.
+# that floor (the production regression image of a dog scored 0.100153). A
+# valid bright/stylized portrait scored between 0.10 and 0.20 in production, so
+# keep a narrow margin above the known animal score and rely on the existing
+# face-area and in-frame checks for the remaining false-positive protection.
+# Keep this separate so upload validation cannot weaken blocklist recall.
 MIN_HUMAN_FACE_DETECTION_SCORE = float(os.environ.get(
-    "FACE_VALIDATION_MIN_DET_SCORE", "0.20"
+    "FACE_VALIDATION_MIN_DET_SCORE", "0.12"
 ))
 MIN_HUMAN_FACE_BBOX_INSIDE_RATIO = float(os.environ.get(
     "FACE_VALIDATION_MIN_BBOX_INSIDE_RATIO", "0.80"

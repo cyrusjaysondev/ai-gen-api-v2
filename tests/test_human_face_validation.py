@@ -34,6 +34,18 @@ class HumanFaceValidationTests(unittest.TestCase):
             1,
         )
 
+    def test_accepts_bright_stylized_human_face(self):
+        bright_stylized_human = _Face(0.13)
+
+        self.assertEqual(
+            safety._count_significant_faces(
+                [bright_stylized_human],
+                10_000,
+                minimum_det_score=safety.MIN_HUMAN_FACE_DETECTION_SCORE,
+            ),
+            1,
+        )
+
     def test_rejects_out_of_frame_animal_fallback(self):
         dog_crop_false_positive = _Face(
             0.402965,

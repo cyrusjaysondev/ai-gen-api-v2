@@ -3240,6 +3240,13 @@ async def admin_test_face_filter(
         if (max(0.0, f.bbox[2] - f.bbox[0]) * max(0.0, f.bbox[3] - f.bbox[1])
             / detect_area) >= face_safety.MIN_FACE_AREA_RATIO_QUERY
     ]
+    human_face_count = face_safety._count_significant_faces(
+        recovered_faces,
+        detect_area,
+        minimum_det_score=face_safety.MIN_HUMAN_FACE_DETECTION_SCORE,
+        image_shape=(detect_h, detect_w),
+        minimum_bbox_inside_ratio=face_safety.MIN_HUMAN_FACE_BBOX_INSIDE_RATIO,
+    )
 
     # For each detected face, compute scores against ALL blocklist
     # identities and pick the best per-face score. Then aggregate the
@@ -3255,11 +3262,25 @@ async def admin_test_face_filter(
         if scored and scored[0][1] > overall_best[0]:
             overall_best = (scored[0][1], scored[0][0])
         bbox = face.bbox
+        area_ratio = float(
+            max(0.0, bbox[2] - bbox[0])
+            * max(0.0, bbox[3] - bbox[1])
+            / max(1, detect_area)
+        )
+        det_score = float(getattr(face, "det_score", 0.0))
+        bbox_inside_ratio = float(
+            face_safety._bbox_inside_ratio(bbox, detect_h, detect_w)
+        )
         per_face.append({
             "face_index": fi,
             "bbox": [float(x) for x in bbox],
-            "area_ratio": round(
-                (max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1]) / max(1, img_area)), 4
+            "area_ratio": round(area_ratio, 4),
+            "det_score": round(det_score, 6),
+            "bbox_inside_ratio": round(bbox_inside_ratio, 4),
+            "passes_human_validation": (
+                det_score >= face_safety.MIN_HUMAN_FACE_DETECTION_SCORE
+                and area_ratio >= face_safety.MIN_FACE_AREA_RATIO
+                and bbox_inside_ratio >= face_safety.MIN_HUMAN_FACE_BBOX_INSIDE_RATIO
             ),
             "top_scores": [{"identity": i, "score": round(s, 4)} for i, s in scored[:top_n]],
         })
@@ -3270,6 +3291,10 @@ async def admin_test_face_filter(
         "recovered_face_count": len(recovered_faces),
         "fallback_used": fallback_used or "none (raw detection passed)",
         "significant_face_count": len(significant_faces),
+        "human_face_count": human_face_count,
+        "human_validation_min_det_score": face_safety.MIN_HUMAN_FACE_DETECTION_SCORE,
+        "human_validation_min_area_ratio": face_safety.MIN_FACE_AREA_RATIO,
+        "human_validation_min_bbox_inside_ratio": face_safety.MIN_HUMAN_FACE_BBOX_INSIDE_RATIO,
         "min_face_area_ratio_query": face_safety.MIN_FACE_AREA_RATIO_QUERY,
         "match_threshold": threshold,
         "blocked": overall_best[0] > threshold,
