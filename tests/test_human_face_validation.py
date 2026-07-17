@@ -100,7 +100,6 @@ class HumanFaceValidationTests(unittest.TestCase):
 
     def test_semantic_gate_accepts_human_face(self):
         image = Image.new("RGB", (200, 200), "white")
-        face = _Face(0.9, bbox=(50, 40, 150, 160))
         classified_images = []
 
         def classify(candidate):
@@ -108,55 +107,18 @@ class HumanFaceValidationTests(unittest.TestCase):
             return _SubjectResult(True, 0.93, 0.07)
 
         self.assertTrue(safety._passes_human_subject_semantic_check(
-            image, [face], 200, 200, None, classifier=classify,
+            image, classifier=classify,
         ))
         self.assertEqual(len(classified_images), 1)
-        self.assertLess(classified_images[0].width, image.width)
+        self.assertIs(classified_images[0], image)
 
     def test_semantic_gate_rejects_animal_face(self):
         image = Image.new("RGB", (200, 200), "white")
-        face = _Face(0.9, bbox=(50, 40, 150, 160))
 
         self.assertFalse(safety._passes_human_subject_semantic_check(
             image,
-            [face],
-            200,
-            200,
-            None,
             classifier=lambda _: _SubjectResult(False, 0.03, 0.97),
         ))
-
-    def test_semantic_gate_uses_full_image_for_padded_fallback(self):
-        image = Image.new("RGB", (200, 200), "white")
-        face = _Face(0.9, bbox=(125, 125, 275, 275))
-        classified_images = []
-
-        def classify(candidate):
-            classified_images.append(candidate)
-            return _SubjectResult(True, 0.90, 0.10)
-
-        self.assertTrue(safety._passes_human_subject_semantic_check(
-            image, [face], 400, 400, "pad_white_2x", classifier=classify,
-        ))
-        self.assertIs(classified_images[0], image)
-
-    def test_semantic_gate_skips_classifier_without_candidate_face(self):
-        called = False
-
-        def classify(_):
-            nonlocal called
-            called = True
-            return _SubjectResult(True, 1.0, 0.0)
-
-        self.assertFalse(safety._passes_human_subject_semantic_check(
-            Image.new("RGB", (100, 100)),
-            [],
-            100,
-            100,
-            None,
-            classifier=classify,
-        ))
-        self.assertFalse(called)
 
 
 if __name__ == "__main__":
