@@ -43,10 +43,9 @@ class FilterResult(NamedTuple):
 
 
 # ─────────────────────────────────────────────
-# Lazy module-level singleton — built on first check_image() call.
-# Hot-reloads when the blocklist directory's mtime changes so admin
-# uploads/deletes take effect on the next request without restarting
-# uvicorn or the serverless worker.
+# Lazy module-level singleton. Startup warms it before the pod reports ready;
+# CMS mutations explicitly reload it through /admin/reload-filter. Generation
+# requests never poll the network volume or rebuild embeddings.
 # ─────────────────────────────────────────────
 
 _FILTER = None
@@ -76,8 +75,11 @@ def _blocklist_signature() -> tuple:
 
 
 def _maybe_reload():
-    """If the blocklist on disk has changed since we built _FILTER, rebuild it.
-    Cheap: one stat() per directory entry — negligible vs face-detection cost."""
+    """Check the blocklist manifest and rebuild it for explicit admin flows.
+
+    This function must stay off generation request paths: even directory
+    metadata reads can be slow on RunPod network volumes.
+    """
     global _FILTER, _FILTER_BLOCKLIST_SIGNATURE, _FILTER_BLOCKLIST_LAST_CHECK
     now = time.monotonic()
     check_interval = max(1.0, float(os.environ.get(
@@ -642,7 +644,11 @@ def get_status() -> dict:
     a build on first call if the filter hasn't been initialized yet,
     so a fresh pod that's never run a generation can still answer.
     """
-    _maybe_reload()
+    # Status reads must never trigger a network-volume rescan/rebuild. Startup
+    # initializes the filter, while CMS mutations call force_reload_filter()
+    # through /admin/reload-filter after their file operation completes.
+    if _FILTER is None:
+        _build_filter()
     if _FILTER is None:
         return {"initialized": False, "error": _FILTER_INIT_ERROR}
     skipped = _FILTER.get("skipped_files", [])
@@ -671,8 +677,7 @@ def force_reload_filter() -> dict:
     new threshold + identity count and knows the reload actually took.
     """
     global _FILTER, _FILTER_BLOCKLIST_SIGNATURE, _FILTER_BLOCKLIST_LAST_CHECK
-    # Force the next _maybe_reload to fall through to _build_filter even if
-    # the blocklist dir mtime hasn't moved.
+    # Force a full embedding rebuild regardless of the cached manifest.
     _FILTER = None
     _FILTER_BLOCKLIST_SIGNATURE = ()
     _FILTER_BLOCKLIST_LAST_CHECK = 0.0
@@ -724,7 +729,10 @@ def _detect_face_count(image_bytes: bytes,
     recovery via 2x upscale doesn't inflate area ratios against the
     smaller original.
     """
-    _maybe_reload()
+    # Keep volume I/O and blocklist embedding extraction off user requests.
+    # CMS blocklist changes are event-driven through /admin/reload-filter.
+    if _FILTER is None:
+        _build_filter()
     if _FILTER is None:
         raise RuntimeError(_FILTER_INIT_ERROR or "face filter unavailable")
     app   = _FILTER["app"]
@@ -824,8 +832,11 @@ def check_image(image_bytes: bytes,
     call writes one line to /workspace/face_filter_check.log with the
     outcome so a future bypass is auditable instead of invisible.
     """
-    # Self-heal: pick up any blocklist additions/removals since last call.
-    _maybe_reload()
+    # Never poll or rebuild the network-volume blocklist on a generation
+    # request. Startup warms it once, and CMS mutations explicitly invoke
+    # /admin/reload-filter after syncing files.
+    if _FILTER is None:
+        _build_filter()
     if _FILTER is None:
         raise RuntimeError(_FILTER_INIT_ERROR or "face filter unavailable")
 

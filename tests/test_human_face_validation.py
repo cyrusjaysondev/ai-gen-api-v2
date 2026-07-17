@@ -1,5 +1,7 @@
+import io
 import unittest
 from typing import NamedTuple
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -119,6 +121,34 @@ class HumanFaceValidationTests(unittest.TestCase):
             image,
             classifier=lambda _: _SubjectResult(False, 0.03, 0.97),
         ))
+
+    def test_animal_validation_does_not_touch_network_volume(self):
+        image = Image.new("RGB", (200, 200), "white")
+        encoded = io.BytesIO()
+        image.save(encoded, format="PNG")
+        existing_filter = {
+            "app": object(),
+            "blocklist": {},
+            "threshold": 0.68,
+            "np": object(),
+            "Image": Image,
+        }
+
+        with (
+            patch.object(safety, "_FILTER", existing_filter),
+            patch.object(safety, "_build_filter", side_effect=AssertionError(
+                "request must not rebuild the blocklist"
+            )),
+            patch.object(safety, "_passes_human_subject_semantic_check", return_value=False),
+            patch.object(safety, "_log_check"),
+        ):
+            result = safety.check_image(
+                encoded.getvalue(),
+                validate_human_semantics=True,
+            )
+
+        self.assertEqual(result.human_face_count, 0)
+        self.assertFalse(result.blocked)
 
 
 if __name__ == "__main__":

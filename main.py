@@ -2635,9 +2635,9 @@ async def flux_image_to_image(
 #
 # The blocklist lives on the network volume at /workspace/blocklist/ — one
 # image per blocked identity, filename (minus extension) is the identity
-# name returned in block responses. Hot-reloaded by safety.py on every
-# face-filter check, so changes take effect immediately for the pod AND
-# for any serverless workers mounted on the same volume.
+# name returned in block responses. Each admin mutation explicitly reloads
+# the in-memory filter after changing the shared files, so pod and serverless
+# workers can update without putting network-volume scans on user requests.
 #
 # Auth: every admin endpoint requires `Authorization: Bearer <ADMIN_TOKEN>`.
 # ADMIN_TOKEN is read from the env at request time, so rotating it doesn't
@@ -3474,8 +3474,7 @@ async def admin_clear_blocklist(
     confirm the wipe took effect.
 
     Reloads the in-memory filter immediately so check_image() sees the
-    empty blocklist on the very next request (no waiting for the
-    mtime-based auto-reload).
+    empty blocklist on the very next request.
 
     Does NOT touch the logo blocklist (/workspace/blocklist_logos) —
     that has its own DELETE endpoint family. Each blocklist is wiped
