@@ -49,7 +49,7 @@ class FilterResult(NamedTuple):
 # ─────────────────────────────────────────────
 
 _FILTER = None
-_FILTER_BLOCKLIST_MTIME: float = 0.0
+_FILTER_BLOCKLIST_SIGNATURE: tuple = ()
 _FILTER_INIT_ERROR: Optional[str] = None
 
 
@@ -57,32 +57,35 @@ def _blocklist_dir() -> Path:
     return Path(os.environ.get("BLOCKLIST_DIR", "/workspace/blocklist"))
 
 
-def _blocklist_mtime() -> float:
-    """Return the most recent mtime across the blocklist dir and its
-    contents. We need both because adding/removing files updates the
-    directory's mtime; replacing an existing file with new content does
-    not (the dir mtime stays the same), but the file's own mtime updates."""
+def _blocklist_signature() -> tuple:
+    """Return a stable manifest for hot-reload change detection.
+
+    Network-volume directory mtimes can move even when no image changed,
+    which previously forced a 63-image embedding rebuild during requests.
+    Names detect additions/removals; size + file mtime detect replacements.
+    """
     d = _blocklist_dir()
     if not d.is_dir():
-        return 0.0
-    latest = d.stat().st_mtime
+        return ()
+    entries = []
     for f in d.iterdir():
         if f.is_file():
-            latest = max(latest, f.stat().st_mtime)
-    return latest
+            stat = f.stat()
+            entries.append((f.name, stat.st_size, stat.st_mtime_ns))
+    return tuple(sorted(entries))
 
 
 def _maybe_reload():
     """If the blocklist on disk has changed since we built _FILTER, rebuild it.
     Cheap: one stat() per directory entry — negligible vs face-detection cost."""
-    global _FILTER, _FILTER_BLOCKLIST_MTIME
-    current_mtime = _blocklist_mtime()
-    if _FILTER is not None and current_mtime != _FILTER_BLOCKLIST_MTIME:
+    global _FILTER, _FILTER_BLOCKLIST_SIGNATURE
+    current_signature = _blocklist_signature()
+    if _FILTER is not None and current_signature != _FILTER_BLOCKLIST_SIGNATURE:
         # Drop the cached filter so the next check_image rebuilds it. We
         # keep the InsightFace model loaded — it's expensive to re-init.
         _FILTER = None
     _build_filter()
-    _FILTER_BLOCKLIST_MTIME = current_mtime
+    _FILTER_BLOCKLIST_SIGNATURE = current_signature
 
 
 _CACHED_APP = None  # InsightFace FaceAnalysis instance — survives blocklist reloads
@@ -715,17 +718,18 @@ def force_reload_filter() -> dict:
     Returns a dict the admin endpoint can echo back so the caller sees the
     new threshold + identity count and knows the reload actually took.
     """
-    global _FILTER, _FILTER_BLOCKLIST_MTIME
+    global _FILTER, _FILTER_BLOCKLIST_SIGNATURE
     # Force the next _maybe_reload to fall through to _build_filter even if
     # the blocklist dir mtime hasn't moved.
     _FILTER = None
-    _FILTER_BLOCKLIST_MTIME = 0.0
+    _FILTER_BLOCKLIST_SIGNATURE = ()
     _build_filter()
     if _FILTER is None:
         return {
             "ok": False,
             "error": _FILTER_INIT_ERROR or "filter rebuild produced no state",
         }
+    _FILTER_BLOCKLIST_SIGNATURE = _blocklist_signature()
     skipped = _FILTER.get("skipped_files", [])
     return {
         "ok": True,
