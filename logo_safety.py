@@ -216,7 +216,10 @@ def check_image(image_bytes: bytes) -> LogoFilterResult:
 def _subject_text_features():
     """Build the two cached human/animal CLIP class embeddings once."""
     global _CACHED_SUBJECT_TEXT_FEATURES
-    _maybe_reload()
+    # Human/animal classification only needs the resident CLIP model. Do not
+    # poll the logo blocklist network volume on a user request.
+    if _FILTER is None:
+        _build_filter()
     if _FILTER is None:
         raise RuntimeError(_FILTER_INIT_ERROR or "subject classifier unavailable")
     if _CACHED_SUBJECT_TEXT_FEATURES is not None:

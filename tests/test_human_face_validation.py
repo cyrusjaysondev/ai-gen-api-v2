@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
+import logo_safety
 import safety
 
 
@@ -149,6 +150,21 @@ class HumanFaceValidationTests(unittest.TestCase):
 
         self.assertEqual(result.human_face_count, 0)
         self.assertFalse(result.blocked)
+
+    def test_cached_subject_classifier_does_not_poll_logo_volume(self):
+        cached_features = object()
+
+        with (
+            patch.object(logo_safety, "_FILTER", {"model": object()}),
+            patch.object(logo_safety, "_CACHED_SUBJECT_TEXT_FEATURES", cached_features),
+            patch.object(logo_safety, "_maybe_reload", side_effect=AssertionError(
+                "subject classification must not poll the logo blocklist"
+            )),
+            patch.object(logo_safety, "_build_filter", side_effect=AssertionError(
+                "resident CLIP model must not be rebuilt"
+            )),
+        ):
+            self.assertIs(logo_safety._subject_text_features(), cached_features)
 
 
 if __name__ == "__main__":
