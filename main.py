@@ -1490,7 +1490,10 @@ def _validate_face_upload(endpoint: str, job_id: str, image_bytes: bytes,
             "reason": "Face validation is temporarily unavailable.",
         })
     try:
-        result = face_safety.check_image(image_bytes)
+        result = face_safety.check_image(
+            image_bytes,
+            validate_human_semantics=require_human,
+        )
     except RuntimeError:
         raise HTTPException(503, detail={
             "error": "server_busy",
@@ -1528,7 +1531,11 @@ def _require_detectable_face(endpoint: str, enabled: bool,
         })
     for image_index, (img_bytes, label) in enumerate(images_with_names):
         try:
-            face_count = face_safety.detect_human_face_count(img_bytes)
+            result = face_safety.check_image(
+                img_bytes,
+                validate_human_semantics=True,
+            )
+            face_count = result.human_face_count
         except RuntimeError:
             raise HTTPException(503, detail={
                 "error": "server_busy",

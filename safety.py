@@ -519,16 +519,13 @@ MIN_HUMAN_FACE_AREA_RATIO = float(os.environ.get(
 ))
 
 
-def _count_significant_faces(faces, img_area: int,
-                             minimum_det_score: float = 0.0,
-                             image_shape: Optional[tuple[int, int]] = None,
-                             minimum_bbox_inside_ratio: float = 0.0,
-                             minimum_area_ratio: float = MIN_FACE_AREA_RATIO) -> int:
-    """Count faces whose bbox covers at least MIN_FACE_AREA_RATIO of the
-    image. Filters out background noise that the permissive detector
-    sometimes catches. Returns 0 if `faces` is empty.
-    """
-    n = 0
+def _significant_faces(faces, img_area: int,
+                       minimum_det_score: float = 0.0,
+                       image_shape: Optional[tuple[int, int]] = None,
+                       minimum_bbox_inside_ratio: float = 0.0,
+                       minimum_area_ratio: float = MIN_FACE_AREA_RATIO) -> list:
+    """Return detections that pass confidence, framing, and area floors."""
+    accepted = []
     for f in faces:
         if float(getattr(f, "det_score", 0.0)) < minimum_det_score:
             continue
@@ -539,8 +536,99 @@ def _count_significant_faces(faces, img_area: int,
         x1, y1, x2, y2 = f.bbox
         area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
         if img_area > 0 and (area / img_area) >= minimum_area_ratio:
-            n += 1
-    return n
+            accepted.append(f)
+    return accepted
+
+
+def _count_significant_faces(faces, img_area: int,
+                             minimum_det_score: float = 0.0,
+                             image_shape: Optional[tuple[int, int]] = None,
+                             minimum_bbox_inside_ratio: float = 0.0,
+                             minimum_area_ratio: float = MIN_FACE_AREA_RATIO) -> int:
+    """Count detections that pass confidence, framing, and area floors."""
+    return len(_significant_faces(
+        faces,
+        img_area,
+        minimum_det_score=minimum_det_score,
+        image_shape=image_shape,
+        minimum_bbox_inside_ratio=minimum_bbox_inside_ratio,
+        minimum_area_ratio=minimum_area_ratio,
+    ))
+
+
+_COORDINATE_PRESERVING_FALLBACKS = {
+    None,
+    "autocontrast",
+    "autocontrast+sharpen",
+    "clahe",
+    "gamma_0.7_dark",
+    "gamma_1.4_bright",
+    "2x_upscale",
+    "clahe+2x_upscale",
+    "4x_autocontrast",
+}
+
+
+def _subject_face_crop(pil_image, faces, detect_h: int, detect_w: int,
+                       fallback_used: Optional[str]):
+    """Crop the strongest face when fallback coordinates map to the source.
+
+    Padding and center-crop fallbacks change the coordinate origin, so those
+    uncommon cases classify the full upload instead of risking a wrong crop.
+    """
+    if not faces or fallback_used not in _COORDINATE_PRESERVING_FALLBACKS:
+        return pil_image
+
+    largest = max(
+        faces,
+        key=lambda f: max(0.0, float(f.bbox[2] - f.bbox[0]))
+        * max(0.0, float(f.bbox[3] - f.bbox[1])),
+    )
+    scale_x = pil_image.width / max(1, detect_w)
+    scale_y = pil_image.height / max(1, detect_h)
+    x1, y1, x2, y2 = [float(value) for value in largest.bbox]
+    x1, x2 = x1 * scale_x, x2 * scale_x
+    y1, y2 = y1 * scale_y, y2 * scale_y
+    pad_x = max(1.0, (x2 - x1) * 0.35)
+    pad_y = max(1.0, (y2 - y1) * 0.35)
+    crop_box = (
+        max(0, int(x1 - pad_x)),
+        max(0, int(y1 - pad_y)),
+        min(pil_image.width, int(x2 + pad_x)),
+        min(pil_image.height, int(y2 + pad_y)),
+    )
+    if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+        return pil_image
+    return pil_image.crop(crop_box)
+
+
+def _passes_human_subject_semantic_check(
+    pil_image,
+    faces,
+    detect_h: int,
+    detect_w: int,
+    fallback_used: Optional[str],
+    classifier=None,
+) -> bool:
+    """Use the resident CPU CLIP model to veto animal detector lookalikes."""
+    if not faces:
+        return False
+    if classifier is None:
+        import logo_safety
+        classifier = logo_safety.classify_human_subject
+
+    candidate = _subject_face_crop(
+        pil_image, faces, detect_h, detect_w, fallback_used,
+    )
+    result = classifier(candidate)
+    print(
+        "[subject-validation] "
+        f"is_human={result.is_human} "
+        f"human_probability={result.human_probability:.4f} "
+        f"animal_probability={result.animal_probability:.4f} "
+        f"fallback={fallback_used or 'none'}"
+    )
+    return bool(result.is_human)
 
 
 def _ensure_app():
@@ -755,7 +843,8 @@ def normalize_blocklist_image(image_bytes: bytes) -> tuple[bytes, str]:
     return buf.getvalue(), ".png"
 
 
-def check_image(image_bytes: bytes) -> FilterResult:
+def check_image(image_bytes: bytes,
+                validate_human_semantics: bool = False) -> FilterResult:
     """Detect faces in an image and compare against the blocklist.
 
     Returns FilterResult(blocked, matched_identity, score, face_count,
@@ -791,7 +880,7 @@ def check_image(image_bytes: bytes) -> FilterResult:
     # An empty blocklist means nothing to compare against → never blocks.
     # Log it so an admin reviewing bypass.log can distinguish "filter ran
     # but blocklist empty" from "filter never ran".
-    if not blocklist:
+    if not blocklist and not validate_human_semantics:
         _log_check(outcome="no_blocklist", score=0.0, identity=None, faces=0, fallback=None)
         return FilterResult(False, None, 0.0, 0, 0)
 
@@ -821,7 +910,7 @@ def check_image(image_bytes: bytes) -> FilterResult:
     # Using the original img_area would give wrong ratios when a fallback
     # variant succeeded after upscaling.
     img_area = max(1, detect_h * detect_w)
-    human_face_count = _count_significant_faces(
+    human_faces = _significant_faces(
         raw_faces,
         img_area,
         minimum_det_score=MIN_HUMAN_FACE_DETECTION_SCORE,
@@ -829,6 +918,21 @@ def check_image(image_bytes: bytes) -> FilterResult:
         minimum_bbox_inside_ratio=MIN_HUMAN_FACE_BBOX_INSIDE_RATIO,
         minimum_area_ratio=MIN_HUMAN_FACE_AREA_RATIO,
     )
+    human_face_count = len(human_faces)
+    if validate_human_semantics and human_faces:
+        if not _passes_human_subject_semantic_check(
+            pil,
+            human_faces,
+            detect_h,
+            detect_w,
+            fallback_used,
+        ):
+            human_face_count = 0
+
+    if not blocklist:
+        _log_check(outcome="no_blocklist", score=0.0, identity=None,
+                   faces=len(raw_faces), fallback=fallback_used)
+        return FilterResult(False, None, 0.0, len(raw_faces), human_face_count)
 
     # MIN_FACE_AREA_RATIO_QUERY (0.5%) is permissive enough to catch
     # distant subjects in group shots while still filtering true noise

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import io
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, Optional
@@ -42,6 +43,12 @@ class LogoFilterResult(NamedTuple):
     score: float
 
 
+class SubjectClassificationResult(NamedTuple):
+    is_human: bool
+    human_probability: float
+    animal_probability: float
+
+
 # ─────────────────────────────────────────────
 # Module-level singleton, lazy load, hot-reload via blocklist mtime
 # ─────────────────────────────────────────────
@@ -51,6 +58,21 @@ _FILTER_BLOCKLIST_MTIME: float = 0.0
 _FILTER_INIT_ERROR: Optional[str] = None
 _CACHED_MODEL = None       # open_clip model + preprocess + device — survives reloads
 _CACHED_THRESHOLD = 0.0
+_CACHED_SUBJECT_TEXT_FEATURES = None
+_SUBJECT_CACHE_LOCK = threading.Lock()
+
+_HUMAN_SUBJECT_PROMPTS = (
+    "a photograph of a real human face",
+    "a portrait photograph of a human person",
+    "the face of a man or woman",
+    "a human head with normal human facial features",
+)
+_ANIMAL_SUBJECT_PROMPTS = (
+    "a photograph of an animal face",
+    "the face of a cat, dog, or other animal",
+    "a non-human animal head",
+    "a pet or wild animal",
+)
 
 
 def _blocklist_dir() -> Path:
@@ -189,6 +211,87 @@ def check_image(image_bytes: bytes) -> LogoFilterResult:
 
     blocked = best_score > threshold
     return LogoFilterResult(blocked, best_id, best_score)
+
+
+def _subject_text_features():
+    """Build the two cached human/animal CLIP class embeddings once."""
+    global _CACHED_SUBJECT_TEXT_FEATURES
+    _maybe_reload()
+    if _FILTER is None:
+        raise RuntimeError(_FILTER_INIT_ERROR or "subject classifier unavailable")
+    if _CACHED_SUBJECT_TEXT_FEATURES is not None:
+        return _CACHED_SUBJECT_TEXT_FEATURES
+
+    with _SUBJECT_CACHE_LOCK:
+        if _CACHED_SUBJECT_TEXT_FEATURES is not None:
+            return _CACHED_SUBJECT_TEXT_FEATURES
+
+        try:
+            import open_clip
+
+            model = _FILTER["model"]
+            device = _FILTER["device"]
+            torch = _FILTER["torch"]
+            tokenizer = open_clip.get_tokenizer("ViT-B-32-quickgelu")
+            prompts = _HUMAN_SUBJECT_PROMPTS + _ANIMAL_SUBJECT_PROMPTS
+            tokens = tokenizer(list(prompts)).to(device)
+            with torch.no_grad():
+                features = model.encode_text(tokens)
+                features = features / features.norm(dim=-1, keepdim=True)
+
+            human = features[:len(_HUMAN_SUBJECT_PROMPTS)].mean(dim=0)
+            animal = features[len(_HUMAN_SUBJECT_PROMPTS):].mean(dim=0)
+            human = human / human.norm()
+            animal = animal / animal.norm()
+            _CACHED_SUBJECT_TEXT_FEATURES = torch.stack((human, animal), dim=0)
+        except Exception as e:
+            raise RuntimeError(f"failed to initialize subject classifier: {e}") from e
+
+    return _CACHED_SUBJECT_TEXT_FEATURES
+
+
+def classify_human_subject(image) -> SubjectClassificationResult:
+    """Classify one already-detected face crop as human or animal.
+
+    This reuses the CPU OpenCLIP model already resident for logo safety. Only
+    one 224px image embedding is computed; text embeddings are cached after
+    the first call. The threshold remains configurable for production
+    calibration without a code deployment.
+    """
+    features = _subject_text_features()
+    if _FILTER is None:
+        raise RuntimeError(_FILTER_INIT_ERROR or "subject classifier unavailable")
+
+    try:
+        from PIL import Image
+
+        if isinstance(image, (bytes, bytearray)):
+            image = Image.open(io.BytesIO(image))
+        image = image.convert("RGB")
+    except Exception as e:
+        raise RuntimeError(f"could not decode subject image: {e}") from e
+
+    model = _FILTER["model"]
+    preprocess = _FILTER["preprocess"]
+    device = _FILTER["device"]
+    torch = _FILTER["torch"]
+    minimum_probability = float(os.environ.get(
+        "HUMAN_SUBJECT_MIN_PROBABILITY", "0.60"
+    ))
+
+    tensor = preprocess(image).unsqueeze(0).to(device)
+    with torch.no_grad():
+        embedding = model.encode_image(tensor)
+        embedding = embedding / embedding.norm(dim=-1, keepdim=True)
+        probabilities = (100.0 * embedding @ features.T).softmax(dim=-1)[0]
+
+    human_probability = float(probabilities[0].item())
+    animal_probability = float(probabilities[1].item())
+    return SubjectClassificationResult(
+        human_probability >= minimum_probability,
+        human_probability,
+        animal_probability,
+    )
 
 
 # ─────────────────────────────────────────────
