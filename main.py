@@ -18,7 +18,9 @@ from workflows import (
     LTX_ASPECT_RATIOS,
     LTX_DEFAULT_NEGATIVE,
     LTX_PRESETS,
+    MULTI_FACE_SWAP_ORDERS,
     build_flux_i2i_workflow,
+    build_flux_multi_face_swap_workflow,
     build_t2i_workflow,
     build_ltx_i2v_workflow,
     build_ltx_lipdub_workflow,
@@ -55,7 +57,7 @@ except ImportError:
 
 app = FastAPI(title="AI Gen API v2")
 
-API_VERSION = "2.2.0"
+API_VERSION = "2.3.0"
 
 # Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
 # can call /admin/blocklist directly across the multi-pod registry. We
@@ -1054,6 +1056,13 @@ WORKFLOW_CATALOG = [
         "inputs": ["target.png", "face.png"],
     },
     {
+        "id": "multi-face-swap",
+        "label": "FLUX multi-person face swap",
+        "endpoint": "/flux/multi-face-swap",
+        "media": "image",
+        "inputs": ["target.png", "face-1.png", "face-2.png (optional)"],
+    },
+    {
         "id": "image-to-image",
         "label": "FLUX image editing",
         "endpoint": "/flux/i2i",
@@ -1097,6 +1106,12 @@ def _sample_workflow(workflow_id: str) -> dict:
             "target.png", "face.png", seed,
             megapixels=1.0, steps=4, cfg=1.0, guidance=4.0,
             lora_strength=1.0,
+        )
+    if workflow_id == "multi-face-swap":
+        return build_flux_multi_face_swap_workflow(
+            "target.png", ["face-1.png", "face-2.png"], seed,
+            face_order="left-to-right", megapixels=1.0, steps=4,
+            cfg=1.0, guidance=4.0, lora_strength=1.0,
         )
     if workflow_id == "image-to-image":
         return build_flux_i2i_workflow(
@@ -1477,7 +1492,7 @@ def _apply_face_filter(endpoint: str, job_id: str, face_filter: bool,
 
 def _validate_face_upload(endpoint: str, job_id: str, image_bytes: bytes,
                           label: str, require_human: bool,
-                          face_filter: bool) -> None:
+                          face_filter: bool, image_index: int = 0) -> None:
     """Validate one user face with a single InsightFace detector pass."""
     if not require_human and not face_filter:
         if face_safety is not None:
@@ -1505,7 +1520,7 @@ def _validate_face_upload(endpoint: str, job_id: str, image_bytes: bytes,
             "error": "unsupported_subject",
             "error_code": "no_human_subject",
             "reason": f"{label} does not contain a valid human subject.",
-            "image_index": 0,
+            "image_index": image_index,
         })
     if face_filter and result.blocked:
         raise HTTPException(400, detail={
@@ -1514,7 +1529,7 @@ def _validate_face_upload(endpoint: str, job_id: str, image_bytes: bytes,
             "reason": f"{label} matches blocked face identity",
             "matched_identity": result.matched_identity,
             "score": round(result.score, 4),
-            "image_index": 0,
+            "image_index": image_index,
         })
 
 
@@ -2379,6 +2394,132 @@ async def flux_face_swap(
         preserve_body=preserve_body, preserve_body_template=target_path,
     )
     return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", **_job_links(job_id)}
+
+
+# ─────────────────────────────────────────────
+# FLUX.2 Klein 9B Multi-Person Face Swap
+# One template + one or two independently mapped user identities.
+# ─────────────────────────────────────────────
+
+@app.post("/flux/multi-face-swap")
+async def flux_multi_face_swap(
+    background_tasks: BackgroundTasks,
+    target_image: UploadFile = File(..., description="Base/template image containing the people to personalize"),
+    face_images: list[UploadFile] = File(..., description="One or two source face photos, repeated in mapping order"),
+    face_order: str = Form("left-to-right", description="Target-person ordering: left-to-right | right-to-left | top-to-bottom | bottom-to-top | largest-first"),
+    prompt: str | None = Form(None, description="Optional template-specific instruction appended to the protected identity-mapping prompt"),
+    seed: int = Form(-1),
+    megapixels: float = Form(2.0, description="Total output resolution in megapixels (0.5–4.0)"),
+    aspect_ratio: str = Form("original", description="Output aspect ratio: original | 1:1 | 16:9 | 9:16 | 4:3 | 3:4 | 3:2 | 2:3 | 21:9 | 9:21"),
+    steps: int = Form(4),
+    cfg: float = Form(1.0),
+    guidance: float = Form(4.0),
+    lora_strength: float = Form(1.0),
+    face_filter: bool = Form(True, description="Reject blocked identities in user uploads and the generated output"),
+    logo_filter: bool = Form(True, description="Reject blocked logos/flags in the generated output"),
+    watermark: str | None = Form(None, description="Deprecated for image outputs. Legacy text watermarks are ignored."),
+    watermark_image: bool = Form(True, description="Compatibility input. Production image outputs always use the Metfone GenAI logo."),
+    require_detectable_face: bool = Form(True, description="Reject every face_images upload that does not contain a clear human face"),
+):
+    if len(face_images) not in (1, 2):
+        raise HTTPException(422, detail={
+            "error": "invalid_face_count",
+            "reason": f"face_images must contain 1 or 2 files; received {len(face_images)}.",
+            "received": len(face_images),
+            "minimum": 1,
+            "maximum": 2,
+        })
+    if face_order not in MULTI_FACE_SWAP_ORDERS:
+        raise HTTPException(400, detail={
+            "error": "invalid_face_order",
+            "reason": f"Invalid face_order '{face_order}'.",
+            "valid_values": list(MULTI_FACE_SWAP_ORDERS),
+        })
+    if aspect_ratio != "original" and aspect_ratio not in ASPECT_RATIOS:
+        raise HTTPException(400, f"Invalid aspect_ratio '{aspect_ratio}'. Valid values: original, {', '.join(ASPECT_RATIOS)}")
+    if not 0.5 <= megapixels <= 4.0:
+        raise HTTPException(400, "megapixels must be between 0.5 and 4.0")
+    if prompt is not None and len(prompt) > 2000:
+        raise HTTPException(400, "prompt must be 2000 characters or fewer")
+
+    target_bytes = await target_image.read()
+    face_bytes_list = [await image.read() for image in face_images]
+    if not target_bytes:
+        raise HTTPException(422, detail={"error": "empty_upload", "reason": "target_image is empty."})
+    for index, face_bytes in enumerate(face_bytes_list):
+        if not face_bytes:
+            raise HTTPException(422, detail={
+                "error": "empty_upload",
+                "reason": f"face_images[{index}] is empty.",
+                "image_index": index,
+            })
+
+    job_id = str(uuid.uuid4())
+    for index, face_bytes in enumerate(face_bytes_list):
+        _validate_face_upload(
+            "/flux/multi-face-swap",
+            job_id,
+            face_bytes,
+            f"face_images[{index}]",
+            require_detectable_face,
+            face_filter,
+            image_index=index,
+        )
+
+    if aspect_ratio != "original":
+        w_ratio, h_ratio = ASPECT_RATIOS[aspect_ratio]
+        target_w, target_h = compute_dimensions(w_ratio, h_ratio, megapixels)
+        target_bytes = crop_to_aspect(target_bytes, target_w, target_h)
+
+    target_filename = f"flux_multi_target_{uuid.uuid4().hex}.png"
+    face_filenames = [
+        f"flux_multi_face_{uuid.uuid4().hex}_{index}.png"
+        for index in range(len(face_bytes_list))
+    ]
+    target_path = INPUT_DIR / target_filename
+    face_paths = [INPUT_DIR / filename for filename in face_filenames]
+    target_path.write_bytes(target_bytes)
+    for path, face_bytes in zip(face_paths, face_bytes_list):
+        path.write_bytes(face_bytes)
+
+    workflow = build_flux_multi_face_swap_workflow(
+        target_filename,
+        face_filenames,
+        seed if seed != -1 else uuid.uuid4().int % 2**32,
+        face_order=face_order,
+        prompt=prompt,
+        megapixels=megapixels,
+        steps=steps,
+        cfg=cfg,
+        guidance=guidance,
+        lora_strength=lora_strength,
+    )
+
+    jobs[job_id] = {
+        "status": "queued",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "face_count": len(face_images),
+        "face_order": face_order,
+    }
+    background_tasks.add_task(
+        run_job,
+        job_id,
+        workflow,
+        [str(target_path), *[str(path) for path in face_paths]],
+        None,
+        True,
+        output_face_filter=face_filter,
+        output_logo_filter=logo_filter,
+        output_endpoint="/flux/multi-face-swap",
+    )
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "model": "flux2-klein-9b",
+        "face_count": len(face_images),
+        "face_order": face_order,
+        **_job_links(job_id),
+    }
 
 
 # ─────────────────────────────────────────────

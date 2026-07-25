@@ -14,7 +14,7 @@ Two RunPod serverless endpoints share the same network volume that the pod uses:
 
 | Endpoint | Workflows | Image size | Models loaded from volume |
 |---|---|---|---|
-| **Image** (`serverless/image/`) | `t2i`, `flux/face-swap`, `flux/i2i` | ~6 GB (no weights baked in) | FLUX.2 Klein 9B + VAE + Qwen 3 + BFS LoRA |
+| **Image** (`serverless/image/`) | `t2i`, `flux/face-swap`, `flux/multi-face-swap`, `flux/i2i` | ~6 GB (no weights baked in) | FLUX.2 Klein 9B + VAE + Qwen 3 + BFS LoRA |
 | **Video** (`serverless/video/`) | `ltx/i2v`, `ltx/t2v` | ~6 GB | LTX-2.3 22B + distilled LoRA + Gemma 12B + Gemma LoRA + upscaler |
 
 `face-animate` is **client-orchestrated**: call image first, then feed the
@@ -139,6 +139,36 @@ curl -X POST "$ENDPOINT" \
   }"
 ```
 
+### Image / flux/multi-face-swap (one or two people)
+
+Supply one or two base64 face photos. With one, only the first target person
+under `face_order` changes. With two, the first two target people receive the
+two identities in array order.
+
+```bash
+TARGET_B64=$(base64 -w0 couple-template.png)
+FACE_A_B64=$(base64 -w0 person-a.png)
+FACE_B_B64=$(base64 -w0 person-b.png)
+
+curl -X POST "$ENDPOINT" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"input\": {
+      \"endpoint\": \"flux/multi-face-swap\",
+      \"target_image_b64\": \"$TARGET_B64\",
+      \"face_images_b64\": [\"$FACE_A_B64\", \"$FACE_B_B64\"],
+      \"face_order\": \"left-to-right\",
+      \"aspect_ratio\": \"original\",
+      \"megapixels\": 2.0
+    }
+  }"
+```
+
+`face_order` accepts `left-to-right`, `right-to-left`, `top-to-bottom`,
+`bottom-to-top`, or `largest-first`. An optional `prompt` adds a
+template-specific instruction without replacing the protected identity mapping.
+
 ### Image / flux/i2i (multi-reference editing, 1–5 images)
 
 Send 1 to 5 base64-encoded images plus an edit prompt. Output canvas
@@ -195,8 +225,8 @@ Response (same shape as t2i + a `ref_count` field):
 
 ### Compliance filters (face + logo, independent)
 
-Both `flux/face-swap` and `flux/i2i` accept **two independent** compliance
-toggles: `face_filter` and `logo_filter`. They run in sequence on every
+`flux/face-swap`, `flux/multi-face-swap`, and `flux/i2i` accept **two
+independent** compliance toggles: `face_filter` and `logo_filter`. They run in sequence on every
 input image. Both default to `false`. The blocklists are managed via the
 pod's `/admin/blocklist` and `/admin/blocklist-logos` admin APIs (see
 top-level `API.md`); serverless workers share the same network volume and
@@ -356,5 +386,5 @@ on the volume may be incomplete; try mounting the volume on a pod and
 running `setup.sh` to re-verify sizes.
 
 **`unknown endpoint 'foo'`** — `input.endpoint` must be exactly one of
-`t2i`, `flux/face-swap`, `flux/i2i` (image worker) or `ltx/i2v`, `ltx/t2v`
+`t2i`, `flux/face-swap`, `flux/multi-face-swap`, `flux/i2i` (image worker) or `ltx/i2v`, `ltx/t2v`
 (video worker). No leading slash.

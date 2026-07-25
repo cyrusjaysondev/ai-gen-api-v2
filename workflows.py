@@ -96,6 +96,54 @@ Match the pose and expression from image 1, including head tilt, rotation, eye d
 Ensure seamless neck and jaw blending, consistent skin tone, realistic shadow contact, natural skin texture, and uniform sharpness.
 Photorealistic, high quality, sharp details, 4K."""
 
+MULTI_FACE_SWAP_ORDERS = {
+    "left-to-right": "Order the people in image 1 from left to right.",
+    "right-to-left": "Order the people in image 1 from right to left.",
+    "top-to-bottom": "Order the people in image 1 from top to bottom.",
+    "bottom-to-top": "Order the people in image 1 from bottom to top.",
+    "largest-first": "Order the people in image 1 by visible face size, largest face first.",
+}
+
+
+def build_multi_face_swap_prompt(face_count: int, face_order: str = "left-to-right",
+                                 extra_prompt: str = None) -> str:
+    """Build an explicit identity-to-person mapping for a group template.
+
+    Image 1 is always the CMS-managed template. Images 2 and 3 are user face
+    references. With one user photo, only the first person in ``face_order`` is
+    changed and every other face is preserved. With two, the first two people
+    receive the two identities in order. This makes the multipart upload order
+    meaningful and gives templates a deterministic mapping convention.
+    """
+    if face_count not in (1, 2):
+        raise ValueError(f"multi-face swap requires 1 or 2 face images, got {face_count}")
+    if face_order not in MULTI_FACE_SWAP_ORDERS:
+        valid = ", ".join(MULTI_FACE_SWAP_ORDERS)
+        raise ValueError(f"invalid face_order '{face_order}'; valid: {valid}")
+
+    if face_count == 1:
+        mapping = (
+            "Replace only the first person's head and face with the identity "
+            "from image 2. Do not change the identity, face, or hair of any "
+            "other person in image 1."
+        )
+    else:
+        mapping = (
+            "Replace the first person's head and face with the identity from "
+            "image 2. Replace the second person's head and face with the "
+            "identity from image 3. Keep the two source identities separate: "
+            "never blend, average, merge, or swap them with each other."
+        )
+
+    prompt = f"""group_head_swap: Image 1 is the base/template image. Preserve its exact composition, environment, background, camera perspective, framing, body positions, clothing, hands, exposure, contrast, and lighting.
+{MULTI_FACE_SWAP_ORDERS[face_order]} {mapping}
+For every replaced person, preserve the source identity's facial structure, eyes, nose, mouth, skin details, and hair. Match the target person's original head size, face-to-body ratio, neck thickness, shoulder alignment, head pose, expression, gaze, and camera distance.
+Adapt each inserted head independently to image 1's light direction, intensity, softness, color temperature, shadows, and highlights. Ensure seamless neck and jaw blending, realistic shadow contact, natural skin texture, and uniform sharpness.
+Do not add or remove people. Do not change bodies, poses, clothing, accessories, hands, or the background. Photorealistic, high quality, sharp details, 4K."""
+    if extra_prompt and extra_prompt.strip():
+        prompt = f"{prompt}\nTemplate-specific instruction: {extra_prompt.strip()}"
+    return prompt
+
 
 def get_flux_face_swap_workflow(target_filename: str, face_filename: str, seed: int,
                                 prompt: str = None, megapixels: float = 2.0,
@@ -236,6 +284,34 @@ def build_flux_i2i_workflow(image_filenames: list, prompt: str, seed: int,
     }}
 
     return nodes
+
+
+def build_flux_multi_face_swap_workflow(target_filename: str, face_filenames: list,
+                                        seed: int, face_order: str = "left-to-right",
+                                        prompt: str = None, megapixels: float = 2.0,
+                                        steps: int = 4, cfg: float = 1.0,
+                                        guidance: float = 4.0,
+                                        lora_strength: float = 1.0) -> dict:
+    """Build a 1-or-2-person face-swap workflow using FLUX multi-reference.
+
+    The target is reference image 1 and user face photos are images 2–3. The
+    BFS head-swap LoRA remains enabled, while the general multi-reference
+    workflow lets FLUX condition two distinct identities in one render.
+    """
+    face_count = len(face_filenames)
+    mapped_prompt = build_multi_face_swap_prompt(face_count, face_order, prompt)
+    workflow = build_flux_i2i_workflow(
+        [target_filename, *face_filenames],
+        mapped_prompt,
+        seed,
+        megapixels=megapixels,
+        steps=steps,
+        cfg=cfg,
+        guidance=guidance,
+        lora_strength=lora_strength,
+    )
+    workflow["70"]["inputs"]["filename_prefix"] = f"images/flux_multi_face_swap_{seed}"
+    return workflow
 
 
 # ─────────────────────────────────────────────

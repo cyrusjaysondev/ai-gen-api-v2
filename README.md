@@ -1,7 +1,7 @@
 # AI Gen API v2
 
 API on RunPod for:
-- **FLUX.2 Klein 9B** — text-to-image, head/face swap, multi-reference image editing (1–5 input images)
+- **FLUX.2 Klein 9B** — text-to-image, one- or two-person face swap, multi-reference image editing (1–5 input images)
 - **LTX 2.3 22B** — image-to-video, text-to-video, face-animate pipeline
 
 Two ways to run it:
@@ -9,7 +9,7 @@ Two ways to run it:
   FastAPI on `:7860`, models on `/workspace`. Pay per pod-second.
 - **Serverless mode** ([SERVERLESS_SETUP.md](SERVERLESS_SETUP.md) for step-by-step
   deploy, [serverless/README.md](serverless/README.md) for the API reference) —
-  split into an **image endpoint** (`t2i`, `flux/face-swap`, `flux/i2i`) and a **video
+  split into an **image endpoint** (`t2i`, `flux/face-swap`, `flux/multi-face-swap`, `flux/i2i`) and a **video
   endpoint** (`ltx/i2v`, `ltx/t2v`). Same models, mounted from the same network
   volume the pod uses. Pay per request, scale to zero.
 
@@ -160,6 +160,33 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/face-swap \
 | `lora_strength` | 1.0 | Head swap LoRA strength (0.0-1.5) |
 | `watermark` | `null` | Optional bottom-right text overlay (e.g. `"AI"`). See [Output watermark](#output-watermark). |
 
+### Multi-Person Face Swap (FLUX)
+
+Upload the template first, then repeat `face_images` once or twice. One upload
+replaces only the first person in `face_order`; two uploads replace the first
+two people with distinct identities in the same order.
+
+```bash
+curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/multi-face-swap \
+  -F "target_image=@couple_template.png" \
+  -F "face_images=@person_a.png" \
+  -F "face_images=@person_b.png" \
+  -F "face_order=left-to-right"
+```
+
+**Parameters:**
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `target_image` | required | Template containing the people to personalize |
+| `face_images` | required | Repeat 1–2 times; upload order maps to target order |
+| `face_order` | `left-to-right` | `left-to-right`, `right-to-left`, `top-to-bottom`, `bottom-to-top`, or `largest-first` |
+| `prompt` | empty | Optional template-specific instruction appended to the protected mapping prompt |
+| `aspect_ratio` | `original` | Preserve the template ratio or select a supported output ratio |
+| `megapixels` | `2.0` | Total output resolution (0.5–4.0 MP) |
+| `steps` / `cfg` / `guidance` | `4` / `1.0` / `4.0` | FLUX inference controls |
+| `lora_strength` | `1.0` | BFS head-swap LoRA strength |
+
 ### Multi-reference Image Editing (FLUX)
 Send 1 to 5 reference images plus a prompt. The prompt drives the edit; the
 images supply style, identity, objects, composition cues. Output canvas
@@ -275,7 +302,7 @@ curl -o result.png "$URL"
 
 ## Output watermark
 
-Every generation endpoint (`/t2i`, `/flux/face-swap`, `/flux/i2i`, `/ltx/i2v`,
+Every generation endpoint (`/t2i`, `/flux/face-swap`, `/flux/multi-face-swap`, `/flux/i2i`, `/ltx/i2v`,
 `/ltx/t2v`, `/face-animate`) accepts an optional `watermark` parameter that
 overlays text on the bottom-right of the result.
 

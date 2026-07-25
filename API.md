@@ -13,6 +13,7 @@ Interactive docs (Swagger UI): `https://YOUR_POD_ID-7860.proxy.runpod.net/docs`
 | GET | `/health` | Health check |
 | POST | `/t2i` | Text to image (FLUX.2 Klein 9B) |
 | POST | `/flux/face-swap` | Head / face swap (FLUX.2 Klein 9B) |
+| POST | `/flux/multi-face-swap` | One- or two-person face swap (FLUX.2 Klein 9B) |
 | POST | `/flux/i2i` | Multi-reference image editing — 1 to 5 input images (FLUX.2 Klein 9B) |
 | GET | `/admin/blocklist` | List blocked face identities (admin auth) |
 | POST | `/admin/blocklist` | Upload a face to block |
@@ -135,7 +136,7 @@ curl https://YOUR_POD_ID-7860.proxy.runpod.net/ltx/presets
 ## Watermarks
 
 Video endpoints accept both optional watermark parameters. Production image
-endpoints (`/t2i`, `/flux/face-swap`, and `/flux/i2i`) always ignore legacy
+endpoints (`/t2i`, `/flux/face-swap`, `/flux/multi-face-swap`, and `/flux/i2i`) always ignore legacy
 text watermarks and apply the Metfone GenAI image watermark.
 
 | Field | Type | Default | Description |
@@ -271,6 +272,61 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/face-swap \
   -F "aspect_ratio=9:16" \
   -F "megapixels=2.0"
 ```
+
+---
+
+## POST /flux/multi-face-swap — One- or Two-Person Face Swap
+
+Personalize a group/couple template with one or two user face photos. The
+template is image 1 internally; repeated `face_images` uploads become images
+2–3. Upload order maps to the selected `face_order`.
+
+With one upload, only the first mapped person changes and all other identities
+are explicitly preserved. With two uploads, the first two mapped people receive
+separate identities. To use the same identity for both people, upload the same
+photo twice.
+
+### Parameters
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `target_image` | file | **required** | Template containing the people to personalize |
+| `face_images` | file[] | **required** | One or two files; repeat the multipart field in target mapping order |
+| `face_order` | string | `left-to-right` | `left-to-right`, `right-to-left`, `top-to-bottom`, `bottom-to-top`, or `largest-first` |
+| `prompt` | string \| null | `null` | Optional template-specific instruction, appended after the protected mapping/preservation prompt; max 2,000 characters |
+| `aspect_ratio` | string | `original` | Output aspect ratio; same options as `/flux/face-swap` |
+| `megapixels` | float | `2.0` | Total output resolution in megapixels (0.5–4.0) |
+| `seed` | int | `-1` (random) | Set for reproducible results |
+| `steps` | int | `4` | Inference steps |
+| `cfg` | float | `1.0` | CFG scale |
+| `guidance` | float | `4.0` | FLUX guidance strength |
+| `lora_strength` | float | `1.0` | BFS head-swap LoRA strength |
+| `require_detectable_face` | bool | `true` | Every `face_images` file must contain a clear human face |
+| `face_filter` | bool | `true` | Reject blocked identities in uploads and output |
+| `logo_filter` | bool | `true` | Reject blocked logos/flags in output |
+
+### Two-person example
+
+```bash
+curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/multi-face-swap \
+  -F "target_image=@couple_template.jpg" \
+  -F "face_images=@left_person.jpg" \
+  -F "face_images=@right_person.jpg" \
+  -F "face_order=left-to-right" \
+  -F "aspect_ratio=9:16"
+```
+
+### One-person example
+
+```bash
+curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/multi-face-swap \
+  -F "target_image=@couple_template.jpg" \
+  -F "face_images=@replacement.jpg" \
+  -F "face_order=right-to-left"
+```
+
+The second example replaces only the rightmost person because that person is
+first under `right-to-left`.
 
 ---
 
@@ -765,11 +821,12 @@ done
 ## Compliance Filters
 
 Face-presence validation is opt-in and separate from identity blocking. Set
-`require_detectable_face=true` on `/flux/face-swap`, `/flux/i2i`, `/ltx/i2v`,
-`/ltx/motion`, or `/face-animate` to reject user images that contain no
+`require_detectable_face=true` on `/flux/face-swap`, `/flux/multi-face-swap`,
+`/flux/i2i`, `/ltx/i2v`, `/ltx/motion`, or `/face-animate` to reject user images that contain no
 significant detectable face. It defaults to `false` for backward compatibility.
 
-`/flux/face-swap` and `/flux/i2i` accept two **independent** compliance toggles:
+`/flux/face-swap`, `/flux/multi-face-swap`, and `/flux/i2i` accept two
+**independent** compliance toggles:
 
 | Parameter | Default | Detector | Blocklist dir | What it catches |
 |---|---|---|---|---|
