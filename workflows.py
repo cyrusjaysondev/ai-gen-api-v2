@@ -96,7 +96,7 @@ DEFAULT_FLUX_PROMPT = """head_swap: Use image 1 as the base image, preserving it
 Match the original head size, face-to-body ratio, neck thickness, shoulder alignment, and camera distance so proportions remain natural and unchanged.
 Adapt the inserted head to the lighting of image 1 by matching light direction, intensity, softness, color temperature, shadows, and highlights, with no independent relighting.
 Preserve the identity of image 2, including hair texture, eye color, nose structure, facial proportions, and skin details.
-Match the pose and expression from image 1, including head tilt, rotation, eye direction, gaze, micro-expressions, and lip position.
+Match the pose and expression from image 1, including head tilt, rotation, eye direction, gaze, micro-expressions, and lip position. When image 1 and image 2 show the same side-view or three-quarter angle, preserve that matching angle exactly: keep the source person's profile silhouette, visible-eye count, nose and chin contour, ear placement, and hairline. Never rotate a side-view reference into a front-facing face, mirror it, or invent features hidden by the camera angle.
 Ensure seamless neck and jaw blending, consistent skin tone, realistic shadow contact, natural skin texture, and uniform sharpness.
 Photorealistic, high quality, sharp details, 4K."""
 
@@ -150,6 +150,7 @@ def build_multi_face_swap_prompt(face_count: int, face_order: str = "left-to-rig
     prompt = f"""group_head_swap: Image 1 is the base/template image. Preserve its exact composition, environment, background, camera perspective, framing, body positions, clothing, hands, exposure, contrast, and lighting.
 {MULTI_FACE_SWAP_ORDERS[face_order]} {mapping}
 For every replaced person, preserve the source identity's facial structure, eyes, nose, mouth, skin details, and hair. Match the target person's original head size, face-to-body ratio, neck thickness, shoulder alignment, head pose, expression, gaze, and camera distance.
+Treat the target person's camera-facing angle as mandatory. When a source photo matches a target side-view or three-quarter angle, preserve that angle exactly, including the profile silhouette, visible-eye count, nose and chin contour, ear placement, and hairline. Do not frontalize, mirror, or reveal facial features hidden by the target camera angle.
 Adapt each inserted head independently to image 1's light direction, intensity, softness, color temperature, shadows, and highlights. Ensure seamless neck and jaw blending, realistic shadow contact, natural skin texture, and uniform sharpness.
 Do not add or remove people. Do not change bodies, poses, clothing, accessories, hands, or the background. Photorealistic, high quality, sharp details, 4K."""
     if extra_prompt and extra_prompt.strip():

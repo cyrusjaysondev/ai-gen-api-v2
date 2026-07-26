@@ -25,6 +25,8 @@ class MultiFaceSwapWorkflowTests(unittest.TestCase):
         self.assertIn("Replace only the second person's head and face", prompt)
         self.assertIn("identity from image 2", prompt)
         self.assertIn("Do not change the identity, face, or hair of any other person", prompt)
+        self.assertIn("preserve that angle exactly", prompt)
+        self.assertIn("Do not frontalize, mirror", prompt)
 
     def test_two_faces_have_separate_ordered_identity_mapping(self):
         prompt = build_multi_face_swap_prompt(
