@@ -71,6 +71,7 @@ from workflows import (
     get_flux_face_swap_workflow,
 )
 from image_output import optimize_image_file
+from face_targeting import normalize_target_face_indices, preserve_selected_faces
 try:
     import safety as face_safety
 except ImportError:
@@ -455,6 +456,10 @@ async def run_flux_multi_face_swap(inp: dict, job_id: str) -> dict:
             f"invalid face_order '{face_order}'; valid: "
             f"{', '.join(MULTI_FACE_SWAP_ORDERS)}"
         )
+    target_face_indices = normalize_target_face_indices(
+        inp.get("target_face_indices"),
+        len(faces_b64),
+    )
     aspect_ratio = str(inp.get("aspect_ratio", "original"))
     if aspect_ratio != "original" and aspect_ratio not in ASPECT_RATIOS:
         raise ValueError(
@@ -527,11 +532,24 @@ async def run_flux_multi_face_swap(inp: dict, job_id: str) -> dict:
             cfg=float(inp.get("cfg", 1.0)),
             guidance=float(inp.get("guidance", 4.0)),
             lora_strength=float(inp.get("lora_strength", 1.0)),
+            target_face_indices=target_face_indices,
         )
 
         started = time.time()
         filename, src = await submit_and_wait(workflow)
         dest = _stage_output_to_volume(filename, src, job_id)
+        if face_safety is None or not hasattr(face_safety, "get_face_bboxes"):
+            raise RuntimeError("face detector unavailable for selected-person preservation")
+        preserved, preserve_message = preserve_selected_faces(
+            dest,
+            target_path,
+            face_order=face_order,
+            target_face_indices=target_face_indices,
+            detect_face_bboxes=face_safety.get_face_bboxes,
+        )
+        if not preserved:
+            dest.unlink(missing_ok=True)
+            raise RuntimeError(preserve_message)
         wm_err = _apply_watermark(
             dest,
             inp.get("watermark"),
@@ -546,6 +564,7 @@ async def run_flux_multi_face_swap(inp: dict, job_id: str) -> dict:
             "seed": seed,
             "face_count": len(face_bytes_list),
             "face_order": face_order,
+            "target_face_indices": target_face_indices,
             "duration_seconds": round(time.time() - started, 2),
         }
         if wm_err:

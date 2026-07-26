@@ -279,12 +279,13 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/face-swap \
 
 Personalize a group/couple template with one or two user face photos. The
 template is image 1 internally; repeated `face_images` uploads become images
-2–3. Upload order maps to the selected `face_order`.
+2–3. Each upload maps to the same-position entry in `target_face_indices`.
 
-With one upload, only the first mapped person changes and all other identities
-are explicitly preserved. With two uploads, the first two mapped people receive
-separate identities. To use the same identity for both people, upload the same
-photo twice.
+Target slot `0` is the first person under `face_order`; slot `1` is the second.
+Either slot can be used alone. The delivered image is composited over the
+original template so unselected people and all pixels outside selected head
+regions remain unchanged. To use the same identity for both people, upload the
+same photo twice.
 
 ### Parameters
 
@@ -293,6 +294,7 @@ photo twice.
 | `target_image` | file | **required** | Template containing the people to personalize |
 | `face_images` | file[] | **required** | One or two files; repeat the multipart field in target mapping order |
 | `face_order` | string | `left-to-right` | `left-to-right`, `right-to-left`, `top-to-bottom`, `bottom-to-top`, or `largest-first` |
+| `target_face_indices` | comma-separated ints | upload order (`0` or `0,1`) | One distinct `0` or `1` per `face_images` upload; use `1` to replace only the second person |
 | `prompt` | string \| null | `null` | Optional template-specific instruction, appended after the protected mapping/preservation prompt; max 2,000 characters |
 | `aspect_ratio` | string | `original` | Output aspect ratio; same options as `/flux/face-swap` |
 | `megapixels` | float | `2.0` | Total output resolution in megapixels (0.5–4.0) |
@@ -313,6 +315,7 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/multi-face-swap \
   -F "face_images=@left_person.jpg" \
   -F "face_images=@right_person.jpg" \
   -F "face_order=left-to-right" \
+  -F "target_face_indices=0,1" \
   -F "aspect_ratio=9:16"
 ```
 
@@ -322,11 +325,12 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/multi-face-swap \
 curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/multi-face-swap \
   -F "target_image=@couple_template.jpg" \
   -F "face_images=@replacement.jpg" \
-  -F "face_order=right-to-left"
+  -F "face_order=left-to-right" \
+  -F "target_face_indices=1"
 ```
 
-The second example replaces only the rightmost person because that person is
-first under `right-to-left`.
+The second example replaces only the second (rightmost) person and preserves
+the first person exactly.
 
 ---
 

@@ -33,6 +33,7 @@ from workflows import (
     get_flux_face_swap_workflow,
     ltx_base_nodes,
 )
+from face_targeting import normalize_target_face_indices, preserve_selected_faces
 
 # Compliance face filter (loaded lazily on first face_filter=true request).
 # Module exists even if insightface is uninstalled — it'll raise a clear
@@ -659,6 +660,33 @@ async def _preserve_body_inplace(image_path, template_path: str, *, job_id: str)
         return False
 
 
+async def _preserve_selected_faces_inplace(
+    image_path,
+    template_path: str,
+    *,
+    job_id: str,
+    face_order: str,
+    target_face_indices: list[int],
+) -> bool:
+    """Keep every unselected person and all non-head pixels exactly unchanged."""
+    if face_safety is None or not hasattr(face_safety, "get_face_bboxes"):
+        print(f"[{job_id}] preserve-selected-faces: detector unavailable")
+        return False
+    try:
+        preserved, message = preserve_selected_faces(
+            image_path,
+            template_path,
+            face_order=face_order,
+            target_face_indices=target_face_indices,
+            detect_face_bboxes=face_safety.get_face_bboxes,
+        )
+        print(f"[{job_id}] preserve-selected-faces: {message}")
+        return preserved
+    except Exception as exc:
+        print(f"[{job_id}] preserve-selected-faces failed: {exc}")
+        return False
+
+
 async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                   watermark_text: str | None = None,
                   watermark_image: bool = False,
@@ -680,7 +708,11 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                   refine_guidance: float = 4.0,
                   refine_lora: float = 1.0,
                   preserve_body: bool = False,
-                  preserve_body_template: str | None = None):
+                  preserve_body_template: str | None = None,
+                  preserve_face_selection: bool = False,
+                  preserve_face_template: str | None = None,
+                  preserve_face_order: str = "left-to-right",
+                  preserve_face_indices: list[int] | None = None):
     """Generic ComfyUI job runner.
 
     ── output_face_filter / output_logo_filter ──
@@ -779,6 +811,34 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                                 await _preserve_body_inplace(path, preserve_body_template, job_id=job_id)
                             except Exception as _pb:
                                 print(f"[{job_id}] preserve-body call raised (ignored): {_pb}")
+
+                        # ── MULTI-FACE POSITION LOCK ────────────────
+                        # FLUX regenerates the full frame, which can subtly
+                        # change an unselected person's identity. For group
+                        # templates, deliver only explicitly selected heads
+                        # over the original template. If face isolation fails,
+                        # fail the job instead of returning the wrong person.
+                        if preserve_face_selection and is_image_output and preserve_face_template:
+                            selected_indices = preserve_face_indices or [0]
+                            preserved = await _preserve_selected_faces_inplace(
+                                path,
+                                preserve_face_template,
+                                job_id=job_id,
+                                face_order=preserve_face_order,
+                                target_face_indices=selected_indices,
+                            )
+                            if not preserved:
+                                try:
+                                    path.unlink()
+                                except Exception:
+                                    pass
+                                jobs[job_id] = {
+                                    **jobs[job_id],
+                                    "status": "failed",
+                                    "error": "Could not isolate the selected template face. Please try another template.",
+                                    "failed_at": datetime.now(timezone.utc).isoformat(),
+                                }
+                                return
 
                         # ── OUTPUT-SIDE FACE FILTER ──────────────────
                         # Scan the generated image against the blocklist
@@ -2407,6 +2467,7 @@ async def flux_multi_face_swap(
     target_image: UploadFile = File(..., description="Base/template image containing the people to personalize"),
     face_images: list[UploadFile] = File(..., description="One or two source face photos, repeated in mapping order"),
     face_order: str = Form("left-to-right", description="Target-person ordering: left-to-right | right-to-left | top-to-bottom | bottom-to-top | largest-first"),
+    target_face_indices: str = Form("", description="Comma-separated zero-based target slots aligned with face_images, e.g. 1 for the second person or 0,1 for both"),
     prompt: str | None = Form(None, description="Optional template-specific instruction appended to the protected identity-mapping prompt"),
     seed: int = Form(-1),
     megapixels: float = Form(2.0, description="Total output resolution in megapixels (0.5–4.0)"),
@@ -2435,6 +2496,16 @@ async def flux_multi_face_swap(
             "reason": f"Invalid face_order '{face_order}'.",
             "valid_values": list(MULTI_FACE_SWAP_ORDERS),
         })
+    try:
+        parsed_target_indices = normalize_target_face_indices(
+            target_face_indices,
+            len(face_images),
+        )
+    except ValueError as exc:
+        raise HTTPException(422, detail={
+            "error": "invalid_target_face_indices",
+            "reason": str(exc),
+        }) from exc
     if aspect_ratio != "original" and aspect_ratio not in ASPECT_RATIOS:
         raise HTTPException(400, f"Invalid aspect_ratio '{aspect_ratio}'. Valid values: original, {', '.join(ASPECT_RATIOS)}")
     if not 0.5 <= megapixels <= 4.0:
@@ -2493,6 +2564,7 @@ async def flux_multi_face_swap(
         cfg=cfg,
         guidance=guidance,
         lora_strength=lora_strength,
+        target_face_indices=parsed_target_indices,
     )
 
     jobs[job_id] = {
@@ -2500,6 +2572,7 @@ async def flux_multi_face_swap(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "face_count": len(face_images),
         "face_order": face_order,
+        "target_face_indices": parsed_target_indices,
     }
     background_tasks.add_task(
         run_job,
@@ -2511,6 +2584,10 @@ async def flux_multi_face_swap(
         output_face_filter=face_filter,
         output_logo_filter=logo_filter,
         output_endpoint="/flux/multi-face-swap",
+        preserve_face_selection=True,
+        preserve_face_template=str(target_path),
+        preserve_face_order=face_order,
+        preserve_face_indices=parsed_target_indices,
     )
     return {
         "job_id": job_id,
@@ -2518,6 +2595,7 @@ async def flux_multi_face_swap(
         "model": "flux2-klein-9b",
         "face_count": len(face_images),
         "face_order": face_order,
+        "target_face_indices": parsed_target_indices,
         **_job_links(job_id),
     }
 

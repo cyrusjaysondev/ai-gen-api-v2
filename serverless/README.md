@@ -141,9 +141,10 @@ curl -X POST "$ENDPOINT" \
 
 ### Image / flux/multi-face-swap (one or two people)
 
-Supply one or two base64 face photos. With one, only the first target person
-under `face_order` changes. With two, the first two target people receive the
-two identities in array order.
+Supply one or two base64 face photos and an aligned `target_face_indices`
+array. Slot `0` is the first person under `face_order`; slot `1` is the
+second, so either person can be replaced alone. Unselected people are restored
+from the original template before delivery.
 
 ```bash
 TARGET_B64=$(base64 -w0 couple-template.png)
@@ -158,6 +159,7 @@ curl -X POST "$ENDPOINT" \
       \"endpoint\": \"flux/multi-face-swap\",
       \"target_image_b64\": \"$TARGET_B64\",
       \"face_images_b64\": [\"$FACE_A_B64\", \"$FACE_B_B64\"],
+      \"target_face_indices\": [0, 1],
       \"face_order\": \"left-to-right\",
       \"aspect_ratio\": \"original\",
       \"megapixels\": 2.0

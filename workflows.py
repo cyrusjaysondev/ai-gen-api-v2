@@ -10,9 +10,13 @@ Keep this file dependency-light: stdlib + Pillow only. No FastAPI, no runpod SDK
 no httpx — those are imported by the callers.
 """
 
+from __future__ import annotations
+
 import io
 import math
 from PIL import Image
+
+from face_targeting import normalize_target_face_indices
 
 
 # ─────────────────────────────────────────────
@@ -106,7 +110,8 @@ MULTI_FACE_SWAP_ORDERS = {
 
 
 def build_multi_face_swap_prompt(face_count: int, face_order: str = "left-to-right",
-                                 extra_prompt: str = None) -> str:
+                                 extra_prompt: str = None,
+                                 target_face_indices: list[int] | None = None) -> str:
     """Build an explicit identity-to-person mapping for a group template.
 
     Image 1 is always the CMS-managed template. Images 2 and 3 are user face
@@ -121,17 +126,24 @@ def build_multi_face_swap_prompt(face_count: int, face_order: str = "left-to-rig
         valid = ", ".join(MULTI_FACE_SWAP_ORDERS)
         raise ValueError(f"invalid face_order '{face_order}'; valid: {valid}")
 
+    target_indices = normalize_target_face_indices(target_face_indices, face_count)
+    ordinal = ("first", "second")
+
     if face_count == 1:
+        target = ordinal[target_indices[0]]
         mapping = (
-            "Replace only the first person's head and face with the identity "
+            f"Replace only the {target} person's head and face with the identity "
             "from image 2. Do not change the identity, face, or hair of any "
             "other person in image 1."
         )
     else:
+        assignments = " ".join(
+            f"Replace the {ordinal[target_index]} person's head and face "
+            f"with the identity from image {source_index + 2}."
+            for source_index, target_index in enumerate(target_indices)
+        )
         mapping = (
-            "Replace the first person's head and face with the identity from "
-            "image 2. Replace the second person's head and face with the "
-            "identity from image 3. Keep the two source identities separate: "
+            f"{assignments} Keep the two source identities separate: "
             "never blend, average, merge, or swap them with each other."
         )
 
@@ -291,7 +303,8 @@ def build_flux_multi_face_swap_workflow(target_filename: str, face_filenames: li
                                         prompt: str = None, megapixels: float = 2.0,
                                         steps: int = 4, cfg: float = 1.0,
                                         guidance: float = 4.0,
-                                        lora_strength: float = 1.0) -> dict:
+                                        lora_strength: float = 1.0,
+                                        target_face_indices: list[int] | None = None) -> dict:
     """Build a 1-or-2-person face-swap workflow using FLUX multi-reference.
 
     The target is reference image 1 and user face photos are images 2–3. The
@@ -299,7 +312,12 @@ def build_flux_multi_face_swap_workflow(target_filename: str, face_filenames: li
     workflow lets FLUX condition two distinct identities in one render.
     """
     face_count = len(face_filenames)
-    mapped_prompt = build_multi_face_swap_prompt(face_count, face_order, prompt)
+    mapped_prompt = build_multi_face_swap_prompt(
+        face_count,
+        face_order,
+        prompt,
+        target_face_indices,
+    )
     workflow = build_flux_i2i_workflow(
         [target_filename, *face_filenames],
         mapped_prompt,

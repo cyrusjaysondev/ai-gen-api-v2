@@ -162,16 +162,18 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/face-swap \
 
 ### Multi-Person Face Swap (FLUX)
 
-Upload the template first, then repeat `face_images` once or twice. One upload
-replaces only the first person in `face_order`; two uploads replace the first
-two people with distinct identities in the same order.
+Upload the template first, then repeat `face_images` once or twice. Pair each
+upload with its zero-based template slot in `target_face_indices`; either
+person can be replaced alone. Unselected people are composited from the
+original template so their identities stay unchanged.
 
 ```bash
 curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/multi-face-swap \
   -F "target_image=@couple_template.png" \
   -F "face_images=@person_a.png" \
   -F "face_images=@person_b.png" \
-  -F "face_order=left-to-right"
+  -F "face_order=left-to-right" \
+  -F "target_face_indices=0,1"
 ```
 
 **Parameters:**
@@ -181,6 +183,7 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/multi-face-swap \
 | `target_image` | required | Template containing the people to personalize |
 | `face_images` | required | Repeat 1–2 times; upload order maps to target order |
 | `face_order` | `left-to-right` | `left-to-right`, `right-to-left`, `top-to-bottom`, `bottom-to-top`, or `largest-first` |
+| `target_face_indices` | upload order | Comma-separated target slots aligned with uploads: `0`, `1`, `0,1`, or `1,0` |
 | `prompt` | empty | Optional template-specific instruction appended to the protected mapping prompt |
 | `aspect_ratio` | `original` | Preserve the template ratio or select a supported output ratio |
 | `megapixels` | `2.0` | Total output resolution (0.5–4.0 MP) |

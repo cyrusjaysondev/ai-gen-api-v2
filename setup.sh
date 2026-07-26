@@ -555,7 +555,7 @@ log "  (VHS install details: tail -200 $VHS_LOG)"
 log "[4/4] Setting up API..."
 mkdir -p /workspace/api
 
-# Always fetch latest main.py + workflows.py + safety.py from repo
+# Always fetch the API modules from the repo.
 wget -q -O /workspace/api/main.py "${API_REPO}/main.py"
 if [ ! -s "/workspace/api/main.py" ]; then
   log "  ERROR: Failed to download main.py"
@@ -564,6 +564,11 @@ fi
 wget -q -O /workspace/api/workflows.py "${API_REPO}/workflows.py"
 if [ ! -s "/workspace/api/workflows.py" ]; then
   log "  ERROR: Failed to download workflows.py (shared with serverless workers)"
+  exit 1
+fi
+wget -q -O /workspace/api/face_targeting.py "${API_REPO}/face_targeting.py"
+if [ ! -s "/workspace/api/face_targeting.py" ]; then
+  log "  ERROR: Failed to download face_targeting.py"
   exit 1
 fi
 wget -q -O /workspace/api/image_output.py "${API_REPO}/image_output.py"
@@ -740,7 +745,7 @@ source /workspace/api/config.env
 log "Installing pip deps..."
 $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | tail -1
 
-# Fetch latest main.py + workflows.py + safety.py + logo_safety.py + watermark.py from repo
+# Fetch the latest API modules from the repo.
 # Defined as a function so the supervisor loop below can call it BEFORE
 # every uvicorn restart. Without that, killing uvicorn (e.g. via the
 # /admin/install-comfy-node pkill) only restarts the OLD code — to deploy
@@ -748,7 +753,7 @@ $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | 
 # the loop turns a uvicorn-only restart into a real code deploy.
 fetch_api_code() {
   log "Fetching latest API code..."
-  for f in main.py workflows.py image_output.py safety.py logo_safety.py watermark.py; do
+  for f in main.py workflows.py face_targeting.py image_output.py safety.py logo_safety.py watermark.py; do
     wget -q -O "/workspace/api/$f.new" "${API_REPO}/$f"
     if [ -s "/workspace/api/$f.new" ]; then
       mv "/workspace/api/$f.new" "/workspace/api/$f"

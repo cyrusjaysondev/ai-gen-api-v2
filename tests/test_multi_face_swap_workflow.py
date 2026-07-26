@@ -15,6 +15,17 @@ class MultiFaceSwapWorkflowTests(unittest.TestCase):
         self.assertIn("Do not change the identity, face, or hair of any other person", prompt)
         self.assertNotIn("image 3", prompt)
 
+    def test_one_face_can_target_second_person(self):
+        prompt = build_multi_face_swap_prompt(
+            1,
+            "left-to-right",
+            target_face_indices=[1],
+        )
+
+        self.assertIn("Replace only the second person's head and face", prompt)
+        self.assertIn("identity from image 2", prompt)
+        self.assertIn("Do not change the identity, face, or hair of any other person", prompt)
+
     def test_two_faces_have_separate_ordered_identity_mapping(self):
         prompt = build_multi_face_swap_prompt(
             2,
@@ -45,6 +56,7 @@ class MultiFaceSwapWorkflowTests(unittest.TestCase):
             seed=42,
             face_order="left-to-right",
             megapixels=1.0,
+            target_face_indices=[0, 1],
         )
 
         self.assertEqual(workflow["200"]["inputs"]["image"], "couple-template.png")
