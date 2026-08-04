@@ -379,7 +379,7 @@ def _mux_reference_audio(video_path: Path, audio_source: Path) -> tuple[bool, st
     return True, "ok"
 
 
-_MOTION_CLEAN_FRACTION = 0.40  # empirically clean IC-LoRA conditioning window
+_MOTION_CLEAN_FRACTION = 0.50  # v32 value — IC-LoRA conditioning window
 
 
 def _trim_first_half(video_path: Path) -> tuple[bool, str]:
@@ -1072,7 +1072,7 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                         if trim_warning:
                             completed["trim_warning"] = trim_warning
                         elif trim_first_half:
-                            completed["trimmed"] = "clean_motion_region_40_percent"
+                            completed["trimmed"] = "first_half_only"
                         if jobs.get(job_id, {}).get("status") != "cancelled":
                             jobs[job_id] = completed
                         return
@@ -2046,10 +2046,10 @@ async def ltx_motion_control(
     audio_source_path = raw_video_path if audio else None
     # trim_first_half is ALWAYS true for /ltx/motion — see the
     # comment on node 330 in workflows.py:
-    # the IC-LoRA Union-Control guide only keeps the first ~40% of the
-    # decoded output reliably clean. The remainder eventually
-    # free-generates to colored noise. Trimming gives the user a fully
-    # coherent clip rather than returning the unstable tail.
+    # the IC-LoRA Union-Control guide conditions only the first ~50%
+    # of output latent slices, the second half free-generates to
+    # colored noise. Trimming gives the user a coherent ~half-length
+    # clip rather than a half-broken full-length one.
     background_tasks.add_task(
         run_job, job_id, workflow, cleanup_paths, watermark, watermark_image,
         audio_source_path, True,  # trim_first_half=True
@@ -2060,7 +2060,7 @@ async def ltx_motion_control(
         "workflow_path": "vhs" if use_vhs else "frame-extract",
         "ref_video_normalized_to": {"width": width, "height": height, "fps": fps, "max_frames": length},
         "audio_source": "reference" if audio else "none",
-        "note": "Output trimmed to the first ~40% clean IC-LoRA motion region.",
+        "note": "Output trimmed to first ~50% (IC-LoRA conditioning limit). Request 2× the desired duration in `length`.",
     }
 
 
