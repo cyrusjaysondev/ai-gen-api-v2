@@ -54,6 +54,17 @@ class ServerlessPackagingTests(unittest.TestCase):
         dockerfile = (REPO_ROOT / "serverless/image/Dockerfile").read_text()
         self.assertIn("COPY face_targeting.py /app/face_targeting.py", dockerfile)
 
+    def test_video_containers_copy_startup_imports(self):
+        for filename in ("Dockerfile", "Dockerfile.release"):
+            with self.subTest(filename=filename):
+                dockerfile = (
+                    REPO_ROOT / "serverless/video" / filename
+                ).read_text()
+                self.assertIn(
+                    "COPY face_targeting.py /app/face_targeting.py",
+                    dockerfile,
+                )
+
 
 class ServerlessVideoComplianceTests(unittest.TestCase):
     def test_i2v_blocks_a_matching_identity(self):
