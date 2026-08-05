@@ -31,6 +31,10 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # Shared workflow builders (also used by pod-mode main.py)
 COPY workflows.py /app/workflows.py
 COPY image_output.py /app/image_output.py
+# Selected-person restoration for multi-face swaps. The image handler imports
+# this module at process startup, so omitting it prevents every worker from
+# becoming ready (including workers that only serve t2i requests).
+COPY face_targeting.py /app/face_targeting.py
 
 # Face-blocklist filter — imported lazily by the handler when face_filter=true.
 # Model weights (~280 MB) are NOT baked into the image — they download once

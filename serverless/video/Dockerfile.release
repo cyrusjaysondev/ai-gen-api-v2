@@ -1,0 +1,15 @@
+# Fast, reproducible production release layered on the last validated worker.
+# The digest freezes the ComfyUI runtime, Python dependencies, and KJNodes
+# custom node while allowing handler/workflow fixes to ship as a small image.
+FROM cyruseryx/ai-gen-video@sha256:ce117994b120ac5a35402ecfe5ae0eeab2610db09ffb09624ed695eeb7cfd830
+
+COPY workflows.py /app/workflows.py
+COPY safety.py /app/safety.py
+COPY watermark.py /app/watermark.py
+COPY assets/metfone_genai_watermark_500.png /workspace/assets/metfone_genai_watermark_500.png
+COPY serverless/video/handler.py /app/handler.py
+COPY serverless/video/start.sh /start_serverless.sh
+RUN chmod +x /start_serverless.sh
+
+WORKDIR /app
+CMD ["/start_serverless.sh"]

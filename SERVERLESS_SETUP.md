@@ -115,6 +115,22 @@ docker build -f serverless/video/Dockerfile -t <user>/ai-gen-video:latest .
 docker push   <user>/ai-gen-video:latest
 ```
 
+For a small production hotfix layered on the last immutable, validated worker
+runtime, use `serverless/image/Dockerfile.release` and
+`serverless/video/Dockerfile.release`. These files pin the base images by
+digest and replace all application-owned handler, workflow, safety, and
+watermark files. Use an immutable release tag; do not publish `latest`:
+
+```bash
+docker buildx build --platform linux/amd64 --push \
+  -f serverless/image/Dockerfile.release \
+  -t <user>/ai-gen-image:<release-tag> .
+
+docker buildx build --platform linux/amd64 --push \
+  -f serverless/video/Dockerfile.release \
+  -t <user>/ai-gen-video:<release-tag> .
+```
+
 Each image is ~6 GB (mostly the `runpod/worker-comfyui` base; no model
 weights). First build downloads the base layer; second build reuses it.
 

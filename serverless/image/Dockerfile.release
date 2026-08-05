@@ -1,0 +1,18 @@
+# Fast, reproducible production release layered on the last validated worker.
+# The digest freezes the ComfyUI runtime, Python dependencies, and LanPaint
+# custom node while allowing handler/workflow fixes to ship as a small image.
+FROM cyruseryx/ai-gen-image@sha256:0cffc039f015637b724f5499a02e901106ec6c835a878d87b2508268e2203f5d
+
+COPY workflows.py /app/workflows.py
+COPY image_output.py /app/image_output.py
+COPY face_targeting.py /app/face_targeting.py
+COPY safety.py /app/safety.py
+COPY logo_safety.py /app/logo_safety.py
+COPY watermark.py /app/watermark.py
+COPY assets/metfone_genai_watermark_500.png /workspace/assets/metfone_genai_watermark_500.png
+COPY serverless/image/handler.py /app/handler.py
+COPY serverless/image/start.sh /start_serverless.sh
+RUN chmod +x /start_serverless.sh
+
+WORKDIR /app
+CMD ["/start_serverless.sh"]

@@ -123,6 +123,15 @@ class FaceValidationUnavailable(Exception):
     pass
 
 
+class FilterBlocked(Exception):
+    """The source image matched an identity in the shared face blocklist."""
+
+    def __init__(self, matched_identity: str, score: float):
+        self.matched_identity = matched_identity
+        self.score = score
+        super().__init__(f"image matches blocked face '{matched_identity}'")
+
+
 def _as_bool(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -140,6 +149,22 @@ def _require_detectable_face(enabled: bool, image_bytes: bytes) -> None:
         raise FaceValidationUnavailable(str(exc)) from exc
     if face_count < 1:
         raise DetectableFaceRequired("image does not contain a clearly detectable face")
+
+
+def _apply_face_filter(endpoint: str, job_id: str, enabled: bool, image_bytes: bytes) -> None:
+    """Apply the same shared-volume face blocklist policy as the image worker."""
+    if not enabled:
+        if face_safety is not None:
+            face_safety.log_bypass(job_id, endpoint, note="face_filter=false, 1 image")
+        return
+    if face_safety is None:
+        raise FaceValidationUnavailable("face filter module is unavailable")
+    try:
+        result = face_safety.check_image(image_bytes)
+    except RuntimeError as exc:
+        raise FaceValidationUnavailable(str(exc)) from exc
+    if result.blocked:
+        raise FilterBlocked(result.matched_identity or "unknown", result.score)
 
 
 def wait_for_comfyui(timeout_s: int = 300) -> None:
@@ -255,6 +280,9 @@ async def run_ltx_i2v(inp: dict, job_id: str) -> dict:
     _require_detectable_face(
         _as_bool(inp.get("require_detectable_face", False)), img_bytes,
     )
+    _apply_face_filter(
+        "ltx/i2v", job_id, _as_bool(inp.get("face_filter", True)), img_bytes,
+    )
     img_filename = f"ltx_i2v_{uuid.uuid4().hex}.png"
     img_path = INPUT_DIR / img_filename
     img_path.write_bytes(img_bytes)
@@ -359,6 +387,15 @@ async def handler(event):
     job_id = event.get("id") or str(uuid.uuid4())
     try:
         return await ENDPOINTS[endpoint](inp, job_id)
+    except FilterBlocked as exc:
+        return {
+            "error": "blocked",
+            "filter": "face",
+            "reason": "image matches blocked face",
+            "matched_identity": exc.matched_identity,
+            "score": round(exc.score, 4),
+            "image_index": 0,
+        }
     except DetectableFaceRequired:
         return {
             "error": "unsupported_subject",
