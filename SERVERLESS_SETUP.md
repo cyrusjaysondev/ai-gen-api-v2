@@ -134,6 +134,11 @@ docker buildx build --platform linux/amd64 --push \
 Each image is ~6 GB (mostly the `runpod/worker-comfyui` base; no model
 weights). First build downloads the base layer; second build reuses it.
 
+Fetching application files from a public GitHub commit in `dockerStartCmd`
+is acceptable for an isolated smoke test, but it is not the production
+release mechanism. Production endpoints must use an immutable image tag (or
+RunPod's GitHub builder) so startup does not depend on GitHub availability.
+
 > **Note:** The base image is `runpod/worker-comfyui:5.4.1-base`. If you
 > want to pin a different version, edit `FROM` in both Dockerfiles. The
 > base must ship **ComfyUI ≥ 0.18** so the built-in LTX 2.3 nodes
@@ -168,8 +173,9 @@ rebuild the image — workers don't pull nodes at runtime.
 3. **Workers:**
    - Min: `0` (scale to zero — pay nothing when idle)
    - Max: `3` (or however much concurrency you need)
-   - Idle Timeout: `5 seconds` (kill cold workers fast; raise if you want
-     warmer workers to handle bursts)
+   - Scaler: **Queue delay**, value `1 second`
+   - Idle Timeout: `300 seconds` (keep a worker warm for the next five
+     minutes, then return to zero)
 4. **Network Volume:** select your volume.
    **Region must match the volume's region** from prerequisites step 2.
    If your volume's region isn't listed, RunPod doesn't have serverless
@@ -195,10 +201,25 @@ Same as Step 3 with these differences:
   or H100). LTX-2.3 22B in fp8 (~24 GB) plus Gemma 12B encoder (~9 GB)
   plus activations is tight on 24 GB cards and may OOM on long clips.
 - **Container Disk:** `20 GB`
+- **Workers:** Min `0`, Max `2`, Queue delay `1 second`, Idle Timeout
+  `300 seconds`.
 - **Environment Variables:**
   - `VOLUME_OUTPUTS` (optional) — where to stage generated videos on the
     volume. Defaults to `/runpod-volume/outputs`. Override only if you
-    want a different path.
+  want a different path.
+
+### Endpoint and pool topology
+
+Start with one autoscaling image endpoint and one autoscaling video endpoint
+per region. A RunPod worker is one container on one GPU; `Max Workers: 3`
+means up to three independent image GPUs, not three pods sharing one GPU.
+Adding a second endpoint with the same region, models, and GPU list does not
+increase a single endpoint's capacity and makes routing and releases harder.
+
+Use another endpoint pool only for a real isolation boundary: a different
+model/VRAM class, a separate cost/SLA tier, or regional failover. Regional
+failover also requires a copy of the model volume in that region. Give every
+endpoint its own template so a staging release cannot restart another pool.
 
 ---
 
@@ -339,7 +360,9 @@ For one-off downloads, spin up a CPU pod with the volume mounted, then
 ## Optional — Keep workers warm
 
 By default workers scale to zero. The cost: every cold call pays a 60–90 s
-(image) or 2–3 min (video) startup penalty.
+(image) or 2–3 min (video) startup penalty. The recommended 300-second idle
+timeout keeps a flex worker available for a short burst without paying for an
+always-on worker.
 
 To eliminate cold starts at the cost of paying for idle GPU time:
 
@@ -347,8 +370,11 @@ To eliminate cold starts at the cost of paying for idle GPU time:
 - Set **Min Workers** to `1` (or more)
 - Save
 
-Warm workers stay loaded with weights in VRAM and respond in seconds. Use
-this for production traffic; leave at `0` for development.
+Warm workers stay loaded with weights in VRAM and respond in seconds. Use a
+scheduled `Min Workers: 1` during a known traffic peak when a strict latency
+SLA matters; return to `0` outside the peak. Verify actual retention with two
+back-to-back jobs because GPU eviction and regional scarcity can still force
+a cold start.
 
 ---
 
