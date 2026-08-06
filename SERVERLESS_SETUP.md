@@ -174,8 +174,9 @@ rebuild the image — workers don't pull nodes at runtime.
    - Min: `0` (scale to zero — pay nothing when idle)
    - Max: `3` (or however much concurrency you need)
    - Scaler: **Queue delay**, value `1 second`
-   - Idle Timeout: `300 seconds` (keep a worker warm for the next five
-     minutes, then return to zero)
+   - Idle Timeout: `5 seconds` (the worker returns to zero almost
+     immediately after the job; increase this only when warm-start latency is
+     worth the additional idle billing)
 4. **Network Volume:** select your volume.
    **Region must match the volume's region** from prerequisites step 2.
    If your volume's region isn't listed, RunPod doesn't have serverless
@@ -201,8 +202,10 @@ Same as Step 3 with these differences:
   or H100). LTX-2.3 22B in fp8 (~24 GB) plus Gemma 12B encoder (~9 GB)
   plus activations is tight on 24 GB cards and may OOM on long clips.
 - **Container Disk:** `20 GB`
-- **Workers:** Min `0`, Max `2`, Queue delay `1 second`, Idle Timeout
-  `300 seconds`.
+- **Workers:** Min `0`, Max according to the account's worker quota,
+  Request count scaler with value `1`, Idle Timeout `5 seconds`. Request-count
+  scaling is appropriate for these long jobs because each queued request asks
+  for one worker immediately; the max remains the concurrency and cost cap.
 - **Environment Variables:**
   - `VOLUME_OUTPUTS` (optional) — where to stage generated videos on the
     volume. Defaults to `/runpod-volume/outputs`. Override only if you
@@ -220,6 +223,34 @@ Use another endpoint pool only for a real isolation boundary: a different
 model/VRAM class, a separate cost/SLA tier, or regional failover. Regional
 failover also requires a copy of the model volume in that region. Give every
 endpoint its own template so a staging release cannot restart another pool.
+
+### Live production reference (2026-08-06)
+
+- Video endpoint: `okdyeqg5kzldbs`
+- Network volume: `5whtegipzz` (`EU-RO-1`)
+- Scaling: min `0`, max `6`, request count `1`, idle timeout `5s`
+- GPU fallback list: RTX 4090, RTX 5090, RTX PRO 6000 Server/Workstation,
+  L4, A100 80GB PCIe, and A100 SXM 80GB
+- Supabase routing: Serverless weight `100`; persistent RTX 4090 pod weight
+  `1`. The persistent pod remains enabled and untouched.
+- Account worker quota: `10`. The image endpoints reserve four
+  slots and the video endpoint reserves six. Raise the account quota before
+  increasing these limits; adding another same-region endpoint does not bypass
+  the account quota.
+
+Validated results:
+
+| Test | Queue | Execution | End-to-end | Result |
+| --- | ---: | ---: | ---: | --- |
+| Direct cold video, 768x448, 49 frames | 8.854s | 189.748s | 198.602s | H.264 MP4, 49 frames |
+| Production Supabase route, 576x320, 25 frames | 6.486s | 166.734s | 173.220s | Public proxied MP4 URL |
+| Three concurrent 384x224, 9-frame jobs | 1.291-10.842s | 4.253-189.958s | 10.526-200.621s | 3/3 completed, 0 retries |
+
+The long concurrency sample cold-resumed a worker; the two FlashBoot samples
+completed in 10-15 seconds end-to-end. All workers returned to `EXITED` after
+the five-second idle timeout. RunPod's same-day billing feed had not posted at
+validation time, so use worker lifecycle time and `costPerHr` for the immediate
+estimate, then reconcile against the billing export the following day.
 
 ---
 
